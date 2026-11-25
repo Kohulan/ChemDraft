@@ -1917,7 +1917,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.25.14.55-opus";
+const CURRENT_BUILD_STAMP = "11.25.15.20-opus";
 
 const NUMERIC_ENTRY_DURING_DRAG_STATUS = "Finish the current drag, then enter a value";
 
@@ -4565,6 +4565,8 @@ export function MainWindow({
       selectionTransformChemistry(undefined, independent), undoLabel);
     if (refusal) {
       withNumericInputWrite(() => installDocumentHistory((history) => history.present === startDocument ? history : { ...history, present: startDocument }));
+      // A Save at the refused preview recorded the preview, not the start document restored here.
+      reconcileSavedDocumentDirtyState();
       reportChemistryRefusal(refusal);
       return false;
     }
@@ -4586,7 +4588,7 @@ export function MainWindow({
     if (!changed) return false;
     markDocumentDirty();
     return true;
-  }, [atomLabelHistorySnapshot, installDocumentHistory, markDocumentDirty, reportChemistryRefusal]);
+  }, [atomLabelHistorySnapshot, installDocumentHistory, markDocumentDirty, reconcileSavedDocumentDirtyState, reportChemistryRefusal]);
 
   useEffect(() => {
     if (!bondToolActive) {
@@ -10529,7 +10531,12 @@ export function MainWindow({
       graphicMarkerDragRef.current ?? graphicGradientDragRef.current ?? freehandArtDragRef.current ??
       mechanismHandleDragRef.current ?? objectRotateDragRef.current ?? projectedPlaneTiltDragRef.current ??
       objectResizeDragRef.current ?? groupTransformDragRef.current ?? textResizeRef.current;
-    if (preview) withNumericInputWrite(() => replacePresentDocument(preview.startDocument));
+    if (preview) {
+      withNumericInputWrite(() => replacePresentDocument(preview.startDocument));
+      // Still the outgoing tab here (both callers run before the switch), so this settles the flag
+      // its snapshot records: a Save at a live preview recorded the preview, not this start document.
+      reconcileSavedDocumentDirtyState();
+    }
     updateRotationInput(undefined);
     updateObjectResizeInput(undefined);
     cancelObjectStylePreview();
@@ -10588,7 +10595,7 @@ export function MainWindow({
     resetFreehandArtPreviewPath(freehandArtPreviewPathRef.current);
     selectionClipboardPasteStateRef.current = undefined;
   }, [cancelMoleculeInspectorPreview, cancelObjectStylePreview, cancelSpin3dSession, clearObjectTransformPreview,
-    releaseGesturePointer, replacePresentDocument, updateObjectResizeInput, updateRotationInput]);
+    reconcileSavedDocumentDirtyState, releaseGesturePointer, replacePresentDocument, updateObjectResizeInput, updateRotationInput]);
 
   const clearDocumentInteractionState = useCallback((options: { clearSpin3dModelCache?: boolean } = {}) => {
     cancelSpin3dSession(undefined, { clearModelCache: options.clearSpin3dModelCache });
@@ -18791,6 +18798,8 @@ export function MainWindow({
       // so keeping it changes nothing instead of keeping the last valid preview.
       liveInputMarkMovesRef.current = undefined;
       withNumericInputWrite(() => replacePresentDocument(nextInput.startDocument));
+      // A Save during the preview recorded the preview; the start document may differ from it.
+      reconcileSavedDocumentDirtyState();
       setObjectRotateReadout(undefined);
       setProjectedPlaneTiltReadout(undefined);
       setStatus(nextInput.kind === "z" ? "Enter a valid Z rotation" : "Enter valid X and Y rotations");
@@ -18801,6 +18810,8 @@ export function MainWindow({
       : resolveElectronMarksInSelectionTransform(nextInput.startDocument, result.document, result.kind === "z" ? { motion: "turn" } : {});
     liveInputMarkMovesRef.current = edit ? { startDocument: nextInput.startDocument, markIds: edit.independentlyMovedMarkIds } : undefined;
     withNumericInputWrite(() => replacePresentDocument(edit?.document ?? result.document));
+    // Home, a typed 0, or any value after a Save at an earlier preview: the flag follows the content.
+    reconcileSavedDocumentDirtyState();
     if (result.kind === "xy") {
       showProjectedPlaneTiltReadout(nextInput.objectId, result.tiltXRad, result.tiltYRad, result.clamped, false);
     } else {
@@ -18810,7 +18821,7 @@ export function MainWindow({
     else if (warnings.length > 0) setStatus([...new Set(warnings)].join(" "));
     else if (nextInput.rotationRefusal) setStatus("");
     return { warnings, rotationRefusal };
-  }, [replacePresentDocument, rotationInputDocumentFromDraft, showProjectedPlaneTiltReadout, updateRotationInput]);
+  }, [reconcileSavedDocumentDirtyState, replacePresentDocument, rotationInputDocumentFromDraft, showProjectedPlaneTiltReadout, updateRotationInput]);
 
   const handleRotationInputHome = useCallback((input: RotationInputState) => {
     const nextInput: RotationInputState = input.kind === "z"
@@ -18826,12 +18837,13 @@ export function MainWindow({
     if (input && input !== rotationInputRef.current) return;
     if (session) {
       withNumericInputWrite(() => replacePresentDocument(session.startDocument));
+      reconcileSavedDocumentDirtyState();
     }
     updateRotationInput(undefined);
     setObjectRotateReadout(undefined);
     setProjectedPlaneTiltReadout(undefined);
     setStatus("Rotation entry canceled");
-  }, [replacePresentDocument, updateRotationInput]);
+  }, [reconcileSavedDocumentDirtyState, replacePresentDocument, updateRotationInput]);
 
   const handleRotationInputKeep = useCallback((input?: RotationInputState) => {
     const session = input ?? rotationInputRef.current;
@@ -18929,6 +18941,7 @@ export function MainWindow({
       // As for rotation: an unparseable draft shows, and keeps, the start document.
       liveInputMarkMovesRef.current = undefined;
       withNumericInputWrite(() => replacePresentDocument(nextInput.startDocument));
+      reconcileSavedDocumentDirtyState();
       setObjectResizeReadout(undefined);
       setStatus("Enter valid X and Y stretch percentages");
       return;
@@ -18937,11 +18950,14 @@ export function MainWindow({
     const edit = resolveElectronMarksInSelectionTransform(nextInput.startDocument, result.document);
     liveInputMarkMovesRef.current = { startDocument: nextInput.startDocument, markIds: edit.independentlyMovedMarkIds };
     withNumericInputWrite(() => replacePresentDocument(edit.document));
+    // As for rotation: a typed 100% returns to the start, which a Save at a preview may not match.
+    reconcileSavedDocumentDirtyState();
     showObjectResizeReadout(nextInput.objectId, result.targetScale, false);
-  }, [objectResizeInputDocumentFromDraft, replacePresentDocument, showObjectResizeReadout, updateObjectResizeInput]);
+  }, [objectResizeInputDocumentFromDraft, reconcileSavedDocumentDirtyState, replacePresentDocument, showObjectResizeReadout, updateObjectResizeInput]);
 
   const handleObjectResizeInputHome = useCallback((input: ObjectResizeInputState) => {
     withNumericInputWrite(() => replacePresentDocument(input.startDocument));
+    reconcileSavedDocumentDirtyState();
     updateObjectResizeInput({
       ...input,
       draftXPercent: input.homeXPercent,
@@ -18949,18 +18965,19 @@ export function MainWindow({
     });
     setObjectResizeReadout(undefined);
     setStatus("Stretch restored home");
-  }, [replacePresentDocument, updateObjectResizeInput]);
+  }, [reconcileSavedDocumentDirtyState, replacePresentDocument, updateObjectResizeInput]);
 
   const handleObjectResizeInputCancel = useCallback((input?: ObjectResizeInputState) => {
     const session = input ?? objectResizeInputRef.current;
     if (input && input !== objectResizeInputRef.current) return;
     if (session) {
       withNumericInputWrite(() => replacePresentDocument(session.startDocument));
+      reconcileSavedDocumentDirtyState();
     }
     updateObjectResizeInput(undefined);
     setObjectResizeReadout(undefined);
     setStatus("Stretch entry canceled");
-  }, [replacePresentDocument, updateObjectResizeInput]);
+  }, [reconcileSavedDocumentDirtyState, replacePresentDocument, updateObjectResizeInput]);
 
   const handleObjectResizeInputKeep = useCallback((input?: ObjectResizeInputState) => {
     const session = input ?? objectResizeInputRef.current;

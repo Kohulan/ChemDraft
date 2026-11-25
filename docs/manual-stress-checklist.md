@@ -1938,8 +1938,10 @@ Run under KDE Plasma (Wayland session, so the app uses XWayland) and on GNOME.
   switch back to 1680x1050: within about a second it returns to the exact spot and size it had
   before (toolbar-state.json still holds that frame throughout). Repeat, but this time drag it a
   little while at 1024x768: back at 1680x1050 it stays where you dropped it. The same holds for
-  the Main toolbar on Linux: at 1024 it starts at the left edge, and back at 1680 it returns to
-  its saved position. Quit at 1024x768 and relaunch at 1680x1050: palettes open at their 1680
+  the Main toolbar on Linux: at 1024 it keeps its natural width and stays at its saved spot while
+  at least 48 px of its title is still on the screen; only a Main saved farther right than that is
+  moved, to the work area's left edge (running off the right edge). Back at 1680 it returns to its
+  saved position. Quit at 1024x768 and relaunch at 1680x1050: palettes open at their 1680
   positions, not the squeezed ones.
 - Document menu bar stays clickable (Linux and Windows; macOS has the global menu bar and is
   unchanged): start from a fresh profile (delete toolbar-state.json) so every palette takes its
