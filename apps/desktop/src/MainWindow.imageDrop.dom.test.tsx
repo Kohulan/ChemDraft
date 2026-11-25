@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createImageGraphicObject, serializeDocument, type ChemDraftDocument, type GraphicObject } from "@chemdraft/chem-core";
 import { MainWindow, objectResizeStretches } from "./MainWindow";
 import { createPhase4Document } from "./documentWorkflow";
-import { browserRasterToPng } from "./imageDrop/rasterDecode";
+import { browserDecodeCheck, browserRasterToPng } from "./imageDrop/rasterDecode";
 import { jpegHeader, pngBytes, svgBytes } from "./imageDrop/testFixtures";
 import { picturePngBase64 } from "./testSupport/imageFixture";
 import { MemoryStorage } from "./testSupport/memoryStorage";
@@ -77,7 +77,10 @@ const documentFile = (title: string) => {
 
 const SVG = svgBytes('<svg xmlns="http://www.w3.org/2000/svg" width="40" height="20"><script>alert(1)</script><rect width="40" height="20" fill="red"/></svg>');
 
-describe("dropping picture files on the document window", () => {
+/** How long a drop may take on a loaded runner before a positive assertion gives up. */
+const DROP_WAIT_MS = 10_000;
+
+describe("dropping picture files on the document window", { timeout: 3 * DROP_WAIT_MS }, () => {
   let container: HTMLDivElement;
   let root: Root;
   const agent = () => window.__CHEMDRAFT_AGENT__!;
@@ -140,6 +143,14 @@ describe("dropping picture files on the document window", () => {
     await act(async () => { for (let index = 0; index < 30; index += 1) await new Promise(resolve => setTimeout(resolve, 0)); });
   }
 
+  /**
+   * Settles until `assertion` holds. A drop finishes on its own clock (the write gate polls on a real
+   * timer while a gesture is live), so a fixed number of ticks is no proof it has finished.
+   */
+  async function eventually(assertion: () => void) {
+    await vi.waitFor(async () => { await settle(); assertion(); }, { timeout: DROP_WAIT_MS, interval: 0 });
+  }
+
   async function browserDrop(files: DropFile[], client?: { x: number; y: number }, target: Element = canvas()) {
     const event = new Event("drop", { bubbles: true, cancelable: true });
     Object.defineProperty(event, "dataTransfer", { value: { files, types: ["Files"] } });
@@ -161,7 +172,7 @@ describe("dropping picture files on the document window", () => {
     const client = agent().resolvePoint({ page: { x: 300, y: 200 } }).client;
     const event = await browserDrop([dropFile("a.png", pngBytes()), dropFile("b.jpg", jpegHeader(8, 8)), dropFile("c.svg", SVG)], client);
     expect(event.defaultPrevented).toBe(true);
-    expect(status()).toBe("Inserted 3 pictures (a.png, b.jpg, c.svg); c.svg: scripts and animation were removed");
+    await eventually(() => expect(status()).toBe("Inserted 3 pictures (a.png, b.jpg, c.svg); c.svg: scripts and animation were removed"));
     expect(vi.mocked(browserRasterToPng)).toHaveBeenCalledTimes(1);
     const inserted = pictures();
     expect(inserted.map(object => object.data.image!.mimeType)).toEqual(["image/png", "image/png", "image/svg+xml"]);
@@ -185,6 +196,7 @@ describe("dropping picture files on the document window", () => {
   it("puts a drop over a toolbar at the nearest visible page point and keeps the picture on the page", async () => {
     await mount();
     await browserDrop([dropFile("edge.png", pngBytes())], { x: -50, y: -80 }, container.querySelector("main") ?? canvas());
+    await eventually(() => expect(pictures()).toHaveLength(1));
     const [picture] = pictures();
     expect(picture).toMatchObject({ x: 0, y: 0, width: 1, height: 1 });
   });
@@ -196,6 +208,7 @@ describe("dropping picture files on the document window", () => {
     // Over the top ruler (32 px), then over the bottom scrollbar (the last 15 px).
     await browserDrop([dropFile("ruler.png", pngBytes())], { x: 300, y: 5 });
     await browserDrop([dropFile("scrollbar.png", pngBytes())], { x: 400, y: 695 });
+    await eventually(() => expect(pictures()).toHaveLength(2));
     expect(pictures().map(centre)).toEqual([{ x: 300, y: 32 }, { x: 400, y: 685 }]);
   });
 
@@ -210,6 +223,10 @@ describe("dropping picture files on the document window", () => {
     let release!: () => void;
     const gate = new Promise<void>(resolve => { release = resolve; });
     const slow: DropFile = { name: "slow.png", size: pngBytes().length, arrayBuffer: async () => { await gate; return pngBytes().buffer as ArrayBuffer; } };
+    // The decode check is the drop's last asynchronous step: once it has returned, the commit is
+    // queued at the write gate within the same microtask run.
+    let decoded = false;
+    vi.mocked(browserDecodeCheck).mockImplementationOnce(async () => { decoded = true; return { width: 1, height: 1 }; });
     await browserDrop([slow], { x: 400, y: 400 });
     async function pointer(target: Element, type: string, x: number, y: number) {
       const event = new MouseEvent(type, { button: 0, buttons: type === "pointerup" ? 0 : 1, clientX: x, clientY: y, bubbles: true, cancelable: true });
@@ -222,14 +239,14 @@ describe("dropping picture files on the document window", () => {
     await pointer(page, "pointermove", 220, 175);
     // The picture is read and decoded while the resize is still live: nothing is written yet.
     release();
+    await eventually(() => expect(decoded).toBe(true));
     await settle();
     expect(pictures()).toHaveLength(0);
     await pointer(page, "pointermove", 260, 200);
     await pointer(page, "pointerup", 260, 200);
-    await settle();
+    await eventually(() => expect(status()).toMatch(/^Inserted picture slow\.png/));
     const [picture] = pictures();
     expect(picture).toBeDefined();
-    expect(status()).toMatch(/^Inserted picture slow\.png/);
     const resized = snapshot().pages[0]!.objects.find(object => object.id === "rect-a") as GraphicObject;
     expect(resized.width).toBeGreaterThan(80);
     // Two entries: the picture on top of the resize, each undone on its own.
@@ -246,31 +263,31 @@ describe("dropping picture files on the document window", () => {
     const big = dropFile("huge.png", pngBytes(), 20 * 1024 * 1024 + 1);
     const fake = dropFile("fake.jpg", new TextEncoder().encode("not a picture"));
     await browserDrop([bmp, big, fake, dropFile("ok.png", pngBytes())], { x: 100, y: 100 });
-    expect(bmp.reads()).toBe(0);
-    expect(big.reads()).toBe(0);
-    expect(status()).toBe([
+    await eventually(() => expect(status()).toBe([
       "Inserted picture ok.png",
       "Couldn't drop \"scan.bmp\": BMP and TIFF pictures can't be dropped yet; save it as PNG or JPEG first",
       "Couldn't drop \"huge.png\": it is just over 20.0 MB; a dropped picture can be at most 20.0 MB",
       "Couldn't drop \"fake.jpg\": its contents are not a PNG, JPEG, GIF, WebP or SVG picture."
-    ].join("; "));
+    ].join("; ")));
+    // Checked once the drop has finished, so no later read could still be on its way.
+    expect(bmp.reads()).toBe(0);
+    expect(big.reads()).toBe(0);
     expect(pictures()).toHaveLength(1);
   });
 
   it("still opens a dropped document exactly as before, and does both for a mixed drop", async () => {
     await mount();
     await browserDrop([documentFile("Only document")]);
-    expect(snapshot().title).toBe("Only document");
+    await eventually(() => expect(snapshot().title).toBe("Only document"));
     expect(tabs()).toHaveLength(1);
 
     await browserDrop([dropFile("mixed.png", pngBytes()), documentFile("Mixed document")], { x: 200, y: 200 });
     // The picture went into the tab under the drop; the document then opened in a tab of its own.
-    expect(status()).toMatch(/^Inserted picture mixed\.png/);
-    expect(snapshot().title).toBe("Mixed document");
+    await eventually(() => expect(status()).toMatch(/^Inserted picture mixed\.png/));
+    await eventually(() => expect(snapshot().title).toBe("Mixed document"));
     expect(tabs()).toHaveLength(2);
     await act(async () => { tabs()[0]!.click(); });
-    await settle();
-    expect(snapshot().title).toBe("Only document");
+    await eventually(() => expect(snapshot().title).toBe("Only document"));
     expect(pictures()).toHaveLength(1);
   });
 
@@ -282,10 +299,9 @@ describe("dropping picture files on the document window", () => {
     await browserDrop([slow], { x: 100, y: 100 });
     // The blank tab is reused by this open: same tab, different document.
     await browserDrop([documentFile("Replacement")]);
-    expect(snapshot().title).toBe("Replacement");
+    await eventually(() => expect(snapshot().title).toBe("Replacement"));
     release();
-    await settle();
-    expect(status()).toBe("The dropped pictures were not inserted: the document they were dropped on is no longer the active tab; drop them again.");
+    await eventually(() => expect(status()).toBe("The dropped pictures were not inserted: the document they were dropped on is no longer the active tab; drop them again."));
     expect(pictures()).toHaveLength(0);
     expect(tabs()).toHaveLength(1);
   });
@@ -302,7 +318,7 @@ describe("dropping picture files on the document window", () => {
     expect(outside.defaultPrevented).toBe(false);
     const files = await browserDrop([documentFile("From the tab strip")], undefined, container.querySelector('[role="tablist"]') ?? document.body);
     expect(files.defaultPrevented).toBe(true);
-    expect(snapshot().title).toBe("From the tab strip");
+    await eventually(() => expect(snapshot().title).toBe("From the tab strip"));
   });
 
   describe("desktop drag-drop event", () => {
@@ -317,9 +333,9 @@ describe("dropping picture files on the document window", () => {
       native.files.set("/Users/me/Pictures/mol.png", pngBytes());
       native.stat.mockImplementation(async path => ({ size: native.files.get(path)?.length ?? 0 }));
       await mount(createPhase4Document("Desktop"), platform);
+      await eventually(() => expect(native.events.has("tauri://drag-drop")).toBe(true));
       await act(async () => native.events.get("tauri://drag-drop")!({ paths: ["/Users/me/Pictures/mol.png"], position }));
-      await settle();
-      expect(status()).toBe("Inserted picture mol.png");
+      await eventually(() => expect(status()).toBe("Inserted picture mol.png"));
       expect(centre(pictures()[0]!)).toEqual({ x: 300, y: 200 });
     });
 
@@ -328,9 +344,9 @@ describe("dropping picture files on the document window", () => {
       native.files.set("C:\\Drawings\\doc.chemdraft", new TextEncoder().encode(serializeDocument(createPhase4Document("Native document"))));
       native.stat.mockImplementation(async path => ({ size: path.endsWith(".png") ? 21 * 1024 * 1024 : native.files.get(path)!.length }));
       await mount(createPhase4Document("Desktop"), "windows");
+      await eventually(() => expect(native.events.has("tauri://drag-drop")).toBe(true));
       await act(async () => native.events.get("tauri://drag-drop")!({ paths: ["C:\\Pictures\\big.png", "C:\\Drawings\\doc.chemdraft"], position: { x: 10, y: 10 } }));
-      await settle();
-      expect(status()).toBe("No pictures were inserted; Couldn't drop \"big.png\": it is 21.0 MB; a dropped picture can be at most 20.0 MB.");
+      await eventually(() => expect(status()).toBe("No pictures were inserted; Couldn't drop \"big.png\": it is 21.0 MB; a dropped picture can be at most 20.0 MB."));
       expect(snapshot().title).toBe("Native document");
     });
   });
