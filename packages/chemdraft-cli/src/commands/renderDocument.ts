@@ -15,7 +15,7 @@ import { installNodeEngines } from "../engine";
 import { installNodeRendering } from "../nodeRendering";
 import { CliUsageError, cliExitCode, defaultCliIo, handleCliError, writeJsonLine,
   writeProgress, type CliIo } from "../output";
-import { flattenSvgPictures, rasterizeSvgPictureWithResvg } from "../svgPictureRaster";
+import { flattenSvgPictures, headlessSvgPictureWarnings, rasterizeSvgPictureWithResvg } from "../svgPictureRaster";
 import { withPdfDom } from "./export";
 import { perceiveDoubleBondStereo } from "./stereo";
 
@@ -145,7 +145,7 @@ export async function runRenderDocumentCommand(argv: readonly string[], io: CliI
       } else if (format === "pdf") {
         const { exportDocumentToPdf } = await import("@chemdraft/export-engine/pdf");
         const pdf = await withPdfDom((domParser) => exportDocumentToPdf(document, { domParser, rasterizeSvgPicture: rasterizeSvgPictureWithResvg }));
-        warnings.push(...pdf.warnings);
+        warnings.push(...pdf.warnings, ...await headlessSvgPictureWarnings(document, "pdf"));
         await save(extension === format ? out : `${out}.${format}`, pdf.bytes);
       } else {
         await ensureSvgFontsLoaded(document);
@@ -163,6 +163,7 @@ export async function runRenderDocumentCommand(argv: readonly string[], io: CliI
           const pixelsPerUnit = figure.style === "document" ? DocumentStyleScale.pointsPerUnit * (figure.dpi ?? DocumentStyleScale.defaultDpi) / 72
             : viewBoxWidth > 0 ? width / viewBoxWidth : 1;
           const flattened = await flattenSvgPictures(svg, pixelsPerUnit, warnings);
+          warnings.push(...await headlessSvgPictureWarnings(document, "png"));
           await save(format === "both" ? `${base}.png` : extension === format ? out : `${out}.png`, svgToPng(flattened, width, figure.style, figure.dpi));
         }
       }

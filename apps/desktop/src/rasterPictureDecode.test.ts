@@ -8,7 +8,6 @@ import {
   RasterPictureMaxCount,
   RasterPictureMaxSidePx,
   RasterPictureOverCountHref,
-  rasterPictureCharge,
   rasterPicturePlaceholderHref,
   readPngSize
 } from "./rasterPictureDecode";
@@ -252,40 +251,5 @@ describe("raster picture decoding", () => {
       if (native) Object.defineProperty(prototype, "toBase64", native);
       else delete prototype.toBase64;
     }
-  });
-});
-
-describe("rasterPictureCharge", () => {
-  const uri = (width: number, height: number) => `data:image/png;base64,${pngHeader(width, height)}`;
-
-  it("is the decoded bytes prepareRasterPictures charges for a PNG that fits", () => {
-    expect(rasterPictureCharge(uri(384, 512), RasterPictureDecodedBudgetBytes)).toBe(384 * 512 * 4);
-    expect(rasterPictureCharge(uri(384, 512), 384 * 512 * 4)).toBe(384 * 512 * 4);
-  });
-
-  it("is 0 for a PNG it refuses by size or budget, which still takes a count slot", () => {
-    expect(rasterPictureCharge(uri(384, 512), 384 * 512 * 4 - 1)).toBe(0);
-    expect(rasterPictureCharge(uri(RasterPictureMaxSidePx + 1, 1), RasterPictureDecodedBudgetBytes)).toBe(0);
-    expect(rasterPictureCharge("data:image/png;base64,AAAA", RasterPictureDecodedBudgetBytes)).toBe(0);
-  });
-
-  it("is undefined for an href prepareRasterPictures does not take as a PNG picture", () => {
-    expect(rasterPictureCharge("data:image/svg+xml;base64,AAAA", Infinity)).toBeUndefined();
-    expect(rasterPictureCharge("data:image/jpeg;base64,AAAA", Infinity)).toBeUndefined();
-    expect(rasterPictureCharge("#fragment", Infinity)).toBeUndefined();
-  });
-
-  it("agrees with what prepareRasterPictures charges across a budget", async () => {
-    const budget = 2 * 384 * 512 * 4 - 4;
-    const decode = vi.fn(async (png: Uint8Array) => {
-      const size = readPngSize(png)!;
-      return { ...size, rgba: new Uint8Array(size.width * size.height * 4) };
-    });
-    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">${pngImage(pngHeader(384, 512))}${pngImage(pngHeader(384, 512))}</svg>`;
-    const { pictures } = await prepareRasterPictures(svg, { decode, budgetBytes: budget });
-    let remaining = budget;
-    const charges = [uri(384, 512), uri(384, 512)].map((href) => { const charge = rasterPictureCharge(href, remaining)!; remaining -= charge; return charge; });
-    expect(pictures.map((picture) => "refused" in picture ? 0 : picture.width * picture.height * 4)).toEqual(charges);
-    expect(charges).toEqual([384 * 512 * 4, 0]);
   });
 });

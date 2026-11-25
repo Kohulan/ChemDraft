@@ -1,6 +1,6 @@
 /**
  * Which dropped files are pictures. The extension only decides which files are read as pictures;
- * what a picture actually is comes from its bytes (`imageSniff.ts`). Everything else keeps the
+ * what a picture actually is comes from its bytes (export-engine `svgSafety/imageSniff.ts`). Everything else keeps the
  * document-open path exactly as before, so a dropped .cdxml, .chemdraft, .cdx or .mol still opens.
  */
 

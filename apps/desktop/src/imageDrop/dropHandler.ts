@@ -4,11 +4,12 @@ import {
   droppedFileBaseName, droppedImageSizeError, dropRefusal, formatDropBytes
 } from "./dropFiles";
 import { prepareDroppedImage, type PrepareDroppedImageResult, type PreparedDroppedImage } from "./prepareDroppedImage";
-import { untilAborted, type DroppedImageDecoders } from "./rasterDecode";
+import { untilAborted, type DecodeOptions, type DroppedImageDecoders } from "./rasterDecode";
 
 /**
- * How long one file may take to read back through the webview (decode, and for JPEG, GIF and WebP
- * the PNG encode). A decoder that never settles would otherwise hold every later drop.
+ * How long one file may take: its size from metadata, and separately its read from disk with the
+ * decode through the webview (for JPEG, GIF and WebP the PNG encode too). A filesystem call or a
+ * decoder that never settles would otherwise hold every later drop.
  */
 export const DROPPED_IMAGE_DEADLINE_MS = 30_000;
 
@@ -16,9 +17,12 @@ export const DROPPED_IMAGE_DEADLINE_MS = 30_000;
 export interface DroppedImageSource {
   name: string;
   /** Size from metadata (native stat, `File.size`), before anything is read. */
-  size(): Promise<number>;
-  /** Read the whole file, failing as soon as it is longer than `maxBytes`. */
-  read(maxBytes: number): Promise<Uint8Array>;
+  size(options?: DecodeOptions): Promise<number>;
+  /**
+   * Read the whole file, failing as soon as it is longer than `maxBytes`. When `options.signal`
+   * aborts, rejects at once and closes anything it opened.
+   */
+  read(maxBytes: number, options?: DecodeOptions): Promise<Uint8Array>;
 }
 
 export interface DropRefusalEntry { name: string; reason: string }
@@ -57,17 +61,32 @@ export interface PrepareDropOptions {
   budgetBytes?: number;
 }
 
-/** One file under its deadline: the decoders see the signal, and a result after it is dropped. */
-async function prepareWithDeadline(name: string, bytes: Uint8Array, decoders: DroppedImageDecoders, deadlineMs: number): Promise<PrepareDroppedImageResult> {
+const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
+
+/**
+ * `task` under a deadline: it sees the signal (a reader closes its file, a decoder stops), and
+ * whatever it delivers after the deadline is dropped.
+ */
+async function withDeadline<T>(deadlineMs: number, message: (seconds: number) => string, task: (signal: AbortSignal) => Promise<T>): Promise<T> {
   const controller = new AbortController();
   const seconds = Math.round(deadlineMs / 100) / 10;
-  const timer = setTimeout(() => controller.abort(new Error(`reading it took longer than ${seconds} seconds.`)), deadlineMs);
+  const timer = setTimeout(() => controller.abort(new Error(message(seconds))), deadlineMs);
   try {
-    return await untilAborted(prepareDroppedImage(name, bytes, decoders, { signal: controller.signal }), controller.signal);
-  } catch (error) {
-    return { ok: false, reason: error instanceof Error ? error.message : String(error) };
+    return await untilAborted(task(controller.signal), controller.signal);
   } finally {
     clearTimeout(timer);
+  }
+}
+
+/** One file's read and preparation under one deadline. */
+async function readAndPrepare(source: DroppedImageSource, decoders: DroppedImageDecoders, deadlineMs: number): Promise<PrepareDroppedImageResult> {
+  try {
+    return await withDeadline(deadlineMs, seconds => `reading it took longer than ${seconds} seconds.`, async signal => {
+      const bytes = await source.read(MAX_DROPPED_IMAGE_BYTES, { signal });
+      return prepareDroppedImage(droppedFileBaseName(source.name), bytes, decoders, { signal });
+    });
+  } catch (error) {
+    return { ok: false, reason: errorText(error) };
   }
 }
 
@@ -82,6 +101,7 @@ export async function prepareDroppedImages(
 ): Promise<PreparedDrop> {
   const result: PreparedDrop = { images: [], refusals: [] };
   const refuse = (name: string, reason: string) => result.refusals.push({ name, reason });
+  const deadlineMs = options.deadlineMs ?? DROPPED_IMAGE_DEADLINE_MS;
   let totalBytes = 0;
   const admitted: DroppedImageSource[] = [];
   for (const [index, source] of sources.entries()) {
@@ -91,9 +111,9 @@ export async function prepareDroppedImages(
     }
     let size: number;
     try {
-      size = await source.size();
+      size = await withDeadline(deadlineMs, seconds => `it took longer than ${seconds} seconds`, signal => source.size({ signal }));
     } catch (error) {
-      refuse(source.name, `its size could not be read (${error instanceof Error ? error.message : String(error)}).`);
+      refuse(source.name, `its size could not be read (${errorText(error)}).`);
       continue;
     }
     const sizeError = droppedImageSizeError(size);
@@ -107,14 +127,7 @@ export async function prepareDroppedImages(
   }
   let budget = options.budgetBytes ?? Number.POSITIVE_INFINITY;
   for (const source of admitted) {
-    let bytes: Uint8Array;
-    try {
-      bytes = await source.read(MAX_DROPPED_IMAGE_BYTES);
-    } catch (error) {
-      refuse(source.name, error instanceof Error ? error.message : String(error));
-      continue;
-    }
-    const prepared = await prepareWithDeadline(droppedFileBaseName(source.name), bytes, decoders, options.deadlineMs ?? DROPPED_IMAGE_DEADLINE_MS);
+    const prepared = await readAndPrepare(source, decoders, deadlineMs);
     if (!prepared.ok) { refuse(source.name, prepared.reason); continue; }
     const cost = savedPictureBytes(prepared.image.dataBase64.length);
     if (cost > budget) { refuse(source.name, documentTooLargeReason()); continue; }
@@ -125,6 +138,15 @@ export async function prepareDroppedImages(
 }
 
 const LISTED = 5;
+
+/**
+ * Status parts joined with "; ". A part's own closing period is dropped before a separator, so a
+ * refusal reason never reads "….; Couldn't"; the last part keeps its period.
+ */
+export function joinStatusParts(parts: readonly (string | undefined)[]): string {
+  const shown = parts.filter((part): part is string => !!part);
+  return shown.map((part, index) => index < shown.length - 1 ? part.replace(/\.$/, "") : part).join("; ");
+}
 
 function listNames(names: readonly string[]): string {
   const shown = names.slice(0, LISTED).join(", ");
@@ -152,7 +174,7 @@ export function formatImageDropStatus(outcome: {
   }
   for (const refusal of outcome.refusals.slice(0, LISTED)) parts.push(dropRefusal(refusal.name, refusal.reason));
   if (outcome.refusals.length > LISTED) parts.push(`${outcome.refusals.length - LISTED} more files were refused`);
-  return parts.join("; ");
+  return joinStatusParts(parts);
 }
 
 export type DroppedImageInsertion =
@@ -225,5 +247,5 @@ export async function handleDroppedFiles<T>(files: readonly T[], handler: Droppe
     ? formatImageDropStatus({ inserted: [], refusals: split.refusals, notInserted: `The dropped pictures were not inserted: ${refusedNow}` })
     : await (handler.serialize ? handler.serialize(pictures) : pictures());
   const documentStatus = split.documents.length ? await handler.openDocuments(split.documents) : undefined;
-  handler.setStatus([status, documentStatus].filter(Boolean).join("; "));
+  handler.setStatus(joinStatusParts([status, documentStatus]));
 }

@@ -3,11 +3,11 @@
  * document keeps its one raster type. Only the first frame of an animation is kept, and EXIF
  * orientation is applied by the decoder. Callers check the header size first: nothing over the pixel
  * caps reaches the decoder, and the decoder's own size is checked again before a canvas is made.
- * PNG and SVG are only decoded (`DecodeCheck`), to prove the webview can draw them; their own bytes
- * are kept. Every wait (decode, encode) ends at the file's deadline (`DecodeOptions`).
+ * PNG and SVG, and the bitmaps an SVG embeds, are only decoded (`DecodeCheck`), to prove the webview
+ * can draw them; their own bytes are kept. Every wait (decode, encode) ends at the file's deadline (`DecodeOptions`).
  */
 
-import { dropPixelLimitError } from "./pixelLimits";
+import { pictureSizeLimitError as dropPixelLimitError } from "@chemdraft/export-engine";
 
 export interface RasterPngResult {
   png: Uint8Array;
@@ -34,7 +34,9 @@ export type RasterToPng = (bytes: Uint8Array, mimeType: string, maxPngBytes: num
  * Decode without re-encoding, to prove the webview can draw the picture: resolves to the decoded
  * pixel size (0 × 0 for an SVG without an intrinsic size), rejects when it cannot be decoded.
  */
-export type DecodeCheck = (bytes: Uint8Array, mimeType: "image/png" | "image/svg+xml", options?: DecodeOptions) => Promise<{ width: number; height: number }>;
+export type DecodeCheck = (bytes: Uint8Array, mimeType: DecodeCheckMimeType, options?: DecodeOptions) => Promise<{ width: number; height: number }>;
+/** A dropped PNG or SVG, or a bitmap an SVG embeds. */
+export type DecodeCheckMimeType = "image/png" | "image/svg+xml" | "image/jpeg" | "image/gif" | "image/webp";
 
 export interface DroppedImageDecoders {
   rasterToPng: RasterToPng;

@@ -250,8 +250,8 @@ describe("dropping picture files on the document window", () => {
     expect(big.reads()).toBe(0);
     expect(status()).toBe([
       "Inserted picture ok.png",
-      "Couldn't drop \"scan.bmp\": BMP and TIFF pictures can't be dropped yet; save it as PNG or JPEG first.",
-      "Couldn't drop \"huge.png\": it is just over 20.0 MB; a dropped picture can be at most 20.0 MB.",
+      "Couldn't drop \"scan.bmp\": BMP and TIFF pictures can't be dropped yet; save it as PNG or JPEG first",
+      "Couldn't drop \"huge.png\": it is just over 20.0 MB; a dropped picture can be at most 20.0 MB",
       "Couldn't drop \"fake.jpg\": its contents are not a PNG, JPEG, GIF, WebP or SVG picture."
     ].join("; "));
     expect(pictures()).toHaveLength(1);

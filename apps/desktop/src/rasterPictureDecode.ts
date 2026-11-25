@@ -10,8 +10,9 @@
  * copy made through `<use>` or `<feImage>`, but parses each copy's href afresh, so the copy still
  * names its picture and Rust can report exactly which pictures have copies it could not draw.
  *
- * SVG pictures that embed a bitmap reach this module as PNGs: `svgPicture/rasterEmbeddedBitmaps.ts`
- * rasterises them first, so they take the same path. Pure-vector SVG pictures draw natively.
+ * SVG pictures that embed a bitmap become PNGs here: `svgPicture/rasterEmbeddedBitmaps.ts` rasterises
+ * each one as this pass reaches it (`beforeDecode`), so they take the same path and the same budget.
+ * Pure-vector SVG pictures draw natively.
  *
  * Limits, enforced before decoding and re-checked in Rust: 16384 px a side, 256 MiB of decoded
  * pixels (width × height × 4) across one export call, and 1024 pictures per call. A picture over a
@@ -55,11 +56,19 @@ export interface DecodedPicturePixels {
 
 export type PicturePixelDecoder = (png: Uint8Array<ArrayBuffer>) => Promise<DecodedPicturePixels>;
 
+/**
+ * Runs on each `<image>` this call may still take, in drawing order, before it is read, with the
+ * decoded bytes still unspent; it may replace the href with a PNG of at most that many decoded
+ * bytes (`svgPicture/rasterEmbeddedBitmaps.ts` does, for SVG pictures that embed a bitmap).
+ */
+export type RasterPicturePreStep = (image: Element, remainingBytes: number) => Promise<void>;
+
 export interface PrepareRasterPicturesOptions {
   /** Defaults to the webview's own decoder, `decodePngPixels`. */
   decode?: PicturePixelDecoder;
   /** Decoded bytes allowed across this call; defaults to `RasterPictureDecodedBudgetBytes`. */
   budgetBytes?: number;
+  beforeDecode?: RasterPicturePreStep;
 }
 
 export interface PreparedRasterPictures {
@@ -90,12 +99,15 @@ export function readPngSize(bytes: Uint8Array): { width: number; height: number 
  * Decodes the SVG's top-level PNG pictures for one native raster export. Pictures nested inside SVG
  * pictures, other bitmap types, and `<image>` elements that already carry an id or more than one
  * href are left untouched, so Rust keeps its general omitted-picture warning for them.
+ *
+ * One ledger: a picture is charged its decoded bytes only once it has decoded, and `beforeDecode`
+ * sizes each SVG picture against what is truly left at that point in drawing order.
  */
 export async function prepareRasterPictures(
   svg: string,
-  { decode = decodePngPixels, budgetBytes = RasterPictureDecodedBudgetBytes }: PrepareRasterPicturesOptions = {}
+  { decode = decodePngPixels, budgetBytes = RasterPictureDecodedBudgetBytes, beforeDecode }: PrepareRasterPicturesOptions = {}
 ): Promise<PreparedRasterPictures> {
-  if (!/data:image\/png;base64,/i.test(svg)) return { svg, pictures: [] };
+  if (!/data:image\/png;base64,/i.test(svg) && !(beforeDecode && /data:image\/svg\+xml/i.test(svg))) return { svg, pictures: [] };
   const parsed = new DOMParser().parseFromString(svg, "image/svg+xml");
   if (parsed.getElementsByTagName("parsererror").length > 0) return { svg, pictures: [] };
 
@@ -103,6 +115,7 @@ export async function prepareRasterPictures(
   const pictures: NativeRasterPicture[] = [];
   let remainingBytes = budgetBytes;
   for (const image of Array.from(parsed.getElementsByTagNameNS(SvgNamespace, "image"))) {
+    if (beforeDecode && pictures.length < RasterPictureMaxCount) await beforeDecode(image, remainingBytes);
     const href = pngHref(image);
     if (!href) continue;
     if (pictures.length >= RasterPictureMaxCount) {
@@ -125,20 +138,6 @@ export async function prepareRasterPictures(
   }
   if (pictures.length === 0) return { svg, pictures };
   return { svg: new XMLSerializer().serializeToString(parsed), pictures };
-}
-
-/**
- * The decoded bytes `prepareRasterPictures` charges for this href when `remainingBytes` are left, if it
- * decodes: 0 for a PNG it refuses by size (it still takes a count slot), undefined for an href it does
- * not take as a PNG picture. Lets the pass that rasterises SVG pictures share this call's one budget.
- */
-export function rasterPictureCharge(href: string, remainingBytes: number): number | undefined {
-  const match = PngDataUri.exec(href);
-  if (!match) return undefined;
-  const size = pngSizeOfBase64(match[1]);
-  if (!size || size.width > RasterPictureMaxSidePx || size.height > RasterPictureMaxSidePx) return 0;
-  const bytes = size.width * size.height * 4;
-  return bytes > remainingBytes ? 0 : bytes;
 }
 
 /** Read the size from the first base64 characters, before decoding anything else. */

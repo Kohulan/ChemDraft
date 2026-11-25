@@ -51,6 +51,30 @@ describe("placeDroppedImages", () => {
   });
 });
 
+describe("placeDroppedImages with mixed sizes", () => {
+  it("gives small pictures their own positions beside one that fills the page", () => {
+    const frames = placeDroppedImages(page, { x: 400, y: 300 }, [page, { width: 40, height: 40 }, { width: 40, height: 40 }]);
+    expect(frames.map(frame => [frame.x, frame.y])).toEqual([
+      [0, 0],
+      [380 + DROP_CASCADE_OFFSET, 280 + DROP_CASCADE_OFFSET],
+      [380 + 2 * DROP_CASCADE_OFFSET, 280 + 2 * DROP_CASCADE_OFFSET]
+    ]);
+  });
+
+  it("keeps each picture within its own room, with distinct positions for every picture that has room", () => {
+    const sizes = [{ width: 790, height: 590 }, ...Array.from({ length: 10 }, () => ({ width: 40, height: 40 })), { width: 600, height: 100 }];
+    const frames = placeDroppedImages(page, { x: 780, y: 580 }, sizes);
+    for (const frame of frames) {
+      expect(frame.x).toBeGreaterThanOrEqual(0);
+      expect(frame.y).toBeGreaterThanOrEqual(0);
+      expect(frame.x + frame.width).toBeLessThanOrEqual(page.width + 1e-9);
+      expect(frame.y + frame.height).toBeLessThanOrEqual(page.height + 1e-9);
+    }
+    const small = frames.slice(1, 11).map(frame => `${frame.x},${frame.y}`);
+    expect(new Set(small).size).toBe(10);
+  });
+});
+
 describe("insertDroppedImages", () => {
   const image = (name: string, overrides: Partial<PreparedDroppedImage> = {}): PreparedDroppedImage =>
     ({ name, mimeType: "image/png", dataBase64: PNG_1X1_BASE64, notes: [], ...overrides });

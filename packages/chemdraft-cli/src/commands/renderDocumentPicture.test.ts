@@ -125,3 +125,20 @@ describe("render-document PDF with SVG pictures", { timeout: 60_000 }, () => {
     expect((await readFile(output)).toString("latin1")).not.toMatch(/\/Subtype \/Image/);
   });
 });
+
+describe("render-document with an SVG picture that embeds WebP", { timeout: 60_000 }, () => {
+  // A real 4 x 4 red lossless WebP: resvg-js leaves it out, so the picture's bitmap is missing headlessly.
+  const webp = "UklGRhwAAABXRUJQVlA4TA8AAAAvA8AAAAcQ/Y/+ByKi/wEA";
+  const source = `<svg xmlns="${SVG}" width="40" height="20"><rect width="40" height="20" fill="#0000ff"/>`
+    + `<image width="10" height="10" href="data:image/webp;base64,${webp}"/></svg>`;
+
+  it.each([["png", "export.png.svg_picture_bitmap_not_drawn"], ["pdf", "export.pdf.svg_picture_bitmap_not_drawn"]])(
+    "draws the rest of the picture in %s and warns that the WebP is not drawn", async (format, code) => {
+      const output = join(directory, `webp.${format}`);
+      const rendered = await run(["render-document", "--document", await pictureDocument(`webp-${format}`, source), "--out", output]);
+      expect(rendered.code, JSON.stringify(rendered.result)).toBe(0);
+      expect(rendered.result.exportWarnings).toContainEqual(expect.objectContaining({ code, objectId: "picture",
+        message: expect.stringContaining("embeds a WebP bitmap") }));
+      expect(rendered.result.exportWarnings.map((warning: { code: string }) => warning.code)).not.toContain(`export.${format}.svg_picture_not_drawn`);
+    });
+});

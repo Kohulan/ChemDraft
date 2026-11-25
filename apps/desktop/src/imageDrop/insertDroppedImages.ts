@@ -11,26 +11,28 @@ export interface PagePointLike { x: number; y: number }
 export interface DropFrame { x: number; y: number; width: number; height: number; scaled: boolean }
 
 /**
- * Centres along one axis for a cascade of `extents` (each no longer than `pageExtent`). The first is
- * at `point`; the rest step towards whichever side of the page has room (down/right by preference),
- * the step shrinks when even that cannot hold the whole cascade, and the batch is then shifted as a
- * unit onto the page. Pictures keep distinct positions whenever the page is longer than the longest.
+ * Centres along one axis for a cascade of `extents` (each no longer than `pageExtent`). Picture `i`
+ * sits `i` steps from `point`, towards whichever side of the page has room (down/right by
+ * preference). Each picture is sized against its own room, not the batch's: its step shrinks only
+ * when its own whole cascade could not fit, and that cascade is shifted as a unit onto the page. So
+ * a picture that fills the page does not pin the small pictures beside it to one spot; every picture
+ * keeps a position of its own whenever it has room on the page.
  */
 function cascadeCentres(point: number, extents: readonly number[], pageExtent: number, cascade: number): number[] {
   const count = extents.length;
-  const longest = Math.max(0, ...extents);
-  const step = count > 1 ? Math.min(cascade, Math.max(0, (pageExtent - longest) / (count - 1))) : 0;
-  const layout = (direction: 1 | -1) => {
-    const centres = extents.map((_, index) => point + direction * index * step);
-    const low = Math.min(...centres.map((centre, index) => centre - extents[index]! / 2));
-    const high = Math.max(...centres.map((centre, index) => centre + extents[index]! / 2));
+  const layout = (direction: 1 | -1) => extents.map((extent, index) => {
+    const room = Math.max(0, pageExtent - extent);
+    const step = count > 1 ? Math.min(cascade, room / (count - 1)) : 0;
+    const last = point + direction * (count - 1) * step;
+    const low = Math.min(point, last) - extent / 2;
+    const high = Math.max(point, last) + extent / 2;
     const shift = low < 0 ? -low : high > pageExtent ? pageExtent - high : 0;
-    return { centres, shift };
-  };
+    return { centre: point + direction * index * step + shift, shift: Math.abs(shift) };
+  });
+  const moved = (centres: ReturnType<typeof layout>) => centres.reduce((total, entry) => total + entry.shift, 0);
   const forward = layout(1);
   const backward = layout(-1);
-  const chosen = Math.abs(backward.shift) < Math.abs(forward.shift) ? backward : forward;
-  return chosen.centres.map(centre => centre + chosen.shift);
+  return (moved(backward) < moved(forward) ? backward : forward).map(entry => entry.centre);
 }
 
 /**

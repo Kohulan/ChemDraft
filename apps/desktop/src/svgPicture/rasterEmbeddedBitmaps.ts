@@ -1,11 +1,5 @@
 import type { SvgPictureRasterRequest } from "@chemdraft/export-engine/pdf";
-import {
-  bytesToBase64,
-  RasterPictureDecodedBudgetBytes,
-  RasterPictureMaxCount,
-  RasterPictureMaxSidePx,
-  rasterPictureCharge
-} from "../rasterPictureDecode";
+import { bytesToBase64, RasterPictureMaxSidePx, type RasterPicturePreStep } from "../rasterPictureDecode";
 
 /**
  * SVG pictures that embed a bitmap, for native raster export (PNG, JPEG, BMP, GIF, TIFF, Copy as PNG).
@@ -17,14 +11,14 @@ import {
  * z-order stay on the `<image>` and its group; only the href changes. Pure-vector SVG pictures are
  * left alone: Rust draws those itself.
  *
- * The raster is made at the size the export draws the picture (frame × the page's user-unit scale ×
- * ancestor scale groups × the export scale, after the same longest-side clamp Rust applies), within
- * the limits `rasterPictureDecode.ts` enforces: 16384 px a side, 256 MiB of decoded pixels across
- * one export and 1024 pictures. The decoded-pixel budget is one budget spent in drawing order: PNG
- * pictures are charged what `prepareRasterPictures` will charge them, and each SVG picture is sized to
- * what is truly left, so it is shrunk rather than discarded by the pass that follows. A picture that
- * cannot get even the smallest useful size, or whose rasterising fails, keeps its href, so it is drawn
- * as before and Rust reports the missing bitmap.
+ * This is a step of `prepareRasterPictures` (`beforeDecode`), run on each picture in drawing order, so
+ * there is one decoded-pixel ledger: pictures before it are charged only once they have decoded, and
+ * this one is sized to what is truly left. The raster is made at the size the export draws the
+ * picture (frame × the page's user-unit scale × ancestor scale groups × the export scale, after the
+ * same longest-side clamp Rust applies), within 16384 px a side, then shrunk to the remaining bytes.
+ * Its final integer size is checked against them before anything is drawn. A picture that cannot get
+ * even the smallest useful size, or whose rasterising fails, keeps its href, so it is drawn as before
+ * and Rust reports the missing bitmap.
  */
 
 export type EmbeddedBitmapRasterizer = (request: SvgPictureRasterRequest) => Promise<Uint8Array>;
@@ -33,8 +27,6 @@ export interface RasterizeEmbeddedBitmapsOptions {
   /** The export's `scale` and `maxDimensionPx`, as sent to `rasterize_svg`. */
   scale?: number;
   maxDimensionPx?: number;
-  /** Decoded bytes the export may spend on pictures; shared with `prepareRasterPictures`. */
-  budgetBytes?: number;
   /** Defaults to the webview rasteriser (`svgPictureRaster.ts`), loaded on first use. */
   rasterize?: EmbeddedBitmapRasterizer;
 }
@@ -49,85 +41,49 @@ const DefaultMaxDimensionPx = 8192;
 /** A picture the remaining budget would shrink below this longest side is not worth drawing; as in the PDF export. */
 const MinRasterSide = 64;
 
-/** The SVG with each embedded-bitmap SVG picture replaced by a PNG of itself; unchanged when none apply. */
-export async function rasterizeEmbeddedBitmapPictures(
-  svg: string,
-  options: RasterizeEmbeddedBitmapsOptions = {}
-): Promise<string> {
-  // The common export has no SVG picture at all: leave before parsing.
-  if (!/data:image\/svg\+xml/i.test(svg)) return svg;
-  const parsed = new DOMParser().parseFromString(svg, "image/svg+xml");
-  if (parsed.getElementsByTagName("parsererror").length > 0) return svg;
-  const root = parsed.documentElement;
-
-  // Every picture `prepareRasterPictures` will take, in drawing order: PNGs with their charge (decided
-  // below, against the true remainder), SVG pictures that embed a bitmap with the markup to rasterise.
-  const entries: ({ png: string } | { image: Element; href: Attr; text: string })[] = [];
-  let count = 0;
-  for (const image of Array.from(parsed.getElementsByTagNameNS(SvgNamespace, "image"))) {
-    const href = singleHref(image);
-    if (!href) continue;
-    // PNG pictures take a slot in `prepareRasterPictures` as well, so they count towards its limit.
-    if (rasterPictureCharge(href.value, Infinity) !== undefined) {
-      if (count < RasterPictureMaxCount) entries.push({ png: href.value });
-      count += 1;
-      continue;
-    }
-    if (!SvgDataUri.test(href.value)) continue;
-    const text = decodeSvgDataUri(href.value);
-    if (text === undefined || !EmbeddedBitmap.test(text)) continue;
-    // Past the count limit nothing is sent; the picture is left to Rust's warning.
-    if (count >= RasterPictureMaxCount) continue;
-    count += 1;
-    entries.push({ image, href, text });
-  }
-  if (!entries.some((entry) => "text" in entry)) return svg;
-
-  const rasterize = options.rasterize ?? (await import("./svgPictureRaster")).rasterizeSvgPicture;
-  const userScale = userUnitScale(root);
-  const exportScale = effectiveExportScale(root, options);
-  let remainingBytes = options.budgetBytes ?? RasterPictureDecodedBudgetBytes;
+/**
+ * The `beforeDecode` step for one export: an SVG picture that embeds a bitmap gets a PNG of itself,
+ * sized to fit `remainingBytes`. Identical pictures at one size are rasterised once.
+ */
+export function embeddedBitmapPictureStep(options: RasterizeEmbeddedBitmapsOptions = {}): RasterPicturePreStep {
   const cache = new Map<string, Promise<string | undefined>>();
-  let changed = false;
-  for (const entry of entries) {
-    if ("png" in entry) {
-      remainingBytes -= rasterPictureCharge(entry.png, remainingBytes) ?? 0;
-      continue;
-    }
-    const { image, href, text } = entry;
+  let scales: { user: number | undefined; export: number } | undefined;
+  return async (image, remainingBytes) => {
+    const href = singleHref(image);
+    if (!href || !SvgDataUri.test(href.value)) return;
+    const text = decodeSvgDataUri(href.value);
+    if (text === undefined || !EmbeddedBitmap.test(text)) return;
+    const root = image.ownerDocument.documentElement;
+    scales ??= { user: userUnitScale(root), export: effectiveExportScale(root, options) };
     const frame = { width: Number(image.getAttribute("width")), height: Number(image.getAttribute("height")) };
     const ancestors = ancestorScale(image);
-    if (!ancestors || !userScale || !(frame.width > 0) || !(frame.height > 0)) continue;
-    let pixelWidth = frame.width * userScale * ancestors.x * exportScale;
-    let pixelHeight = frame.height * userScale * ancestors.y * exportScale;
-    // The same bounds `prepareRasterPictures` applies to the PNG it decodes next.
+    if (!ancestors || !scales.user || !(frame.width > 0) || !(frame.height > 0)) return;
+    let pixelWidth = frame.width * scales.user * ancestors.x * scales.export;
+    let pixelHeight = frame.height * scales.user * ancestors.y * scales.export;
+    // The same side bound `prepareRasterPictures` applies to the PNG it decodes next.
     const fitSide = Math.min(1, RasterPictureMaxSidePx / Math.max(pixelWidth, pixelHeight));
     pixelWidth *= fitSide;
     pixelHeight *= fitSide;
     const fitBudget = Math.min(1, Math.sqrt(Math.max(remainingBytes, 0) / (4 * pixelWidth * pixelHeight)));
-    if (fitBudget < 1 && Math.max(pixelWidth, pixelHeight) * fitBudget < MinRasterSide) continue;
+    if (fitBudget < 1 && Math.max(pixelWidth, pixelHeight) * fitBudget < MinRasterSide) return;
     const size = {
       pixelWidth: Math.max(1, Math.floor(pixelWidth * fitBudget)),
       pixelHeight: Math.max(1, Math.floor(pixelHeight * fitBudget))
     };
-    // Each picture is decoded, and so charged, on its own, even when it shares a raster with another.
-    remainingBytes -= size.pixelWidth * size.pixelHeight * 4;
+    // What the decode pass will charge: the final integer size must fit what is left.
+    if (size.pixelWidth * size.pixelHeight * 4 > remainingBytes) return;
     const key = `${frame.width}x${frame.height}@${size.pixelWidth}x${size.pixelHeight}:${href.value}`;
     let pending = cache.get(key);
     if (!pending) {
-      pending = rasterizeToDataUri(rasterize, { svg: text, ...frame, ...size });
+      pending = (async () => {
+        const rasterize = options.rasterize ?? (await import("./svgPictureRaster")).rasterizeSvgPicture;
+        return rasterizeToDataUri(rasterize, { svg: text, ...frame, ...size });
+      })();
       cache.set(key, pending);
     }
     const png = await pending;
-    if (png === undefined) {
-      // Nothing was drawn for it, so the pass that follows will not charge it either.
-      remainingBytes += size.pixelWidth * size.pixelHeight * 4;
-      continue;
-    }
-    href.value = png;
-    changed = true;
-  }
-  return changed ? new XMLSerializer().serializeToString(parsed) : svg;
+    if (png !== undefined) href.value = png;
+  };
 }
 
 async function rasterizeToDataUri(

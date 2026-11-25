@@ -2010,7 +2010,18 @@ lossy and a lossless WebP, an SVG with gradients and `<use href="#id">`, a BMP, 
   (watch the network log in the web build), and Save + reopen keeps the cleaned picture. An SVG with a
   `<style>` holding `/*` inside a quoted string before a `url(https://…)` loses that declaration
   too. An SVG embedding a JPEG labelled `data:image/png`, or a bitmap over 16384 pixels on a side,
-  is refused with that reason.
+  is refused with that reason; so is one embedding a PNG whose header is intact but whose data is
+  damaged ("an embedded PNG picture could not be decoded"). Several refusals read "…first; Couldn't
+  drop …", never "….; Couldn't".
+- Real SVG producers: drop an SVG saved by a vector editor (with its own namespaces and metadata), a
+  plotting library (text drawn as glyph `<use>`s, clip paths), a diagram editor (HTML labels) and a
+  chemistry toolkit. Gradients, glyph text and styles look as in a browser; the diagram's labels
+  show as plain SVG text. Export each to PDF and PNG in the app and with `chemdraft render-document`:
+  they draw the same, and an SVG embedding a WebP bitmap warns that headless export leaves it out.
+- Mixed sizes: drop a page-sized picture together with two small ones: the small ones sit at their
+  own cascaded positions, not on top of each other.
+- Stalled disk: drop a picture from a network share, then disconnect it mid-read: after 30 seconds
+  the status names the file, and a later drop works.
 - Tabs and guards: start a drop of the large JPEG and switch tabs before it appears: it is not
   inserted anywhere and the status says so. Drops during a text, label or table-cell edit, with
   a dialog open or while quitting are refused with a reason, shown at once (before the file is read).

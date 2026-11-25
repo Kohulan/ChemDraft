@@ -1,5 +1,5 @@
 import { prepareRasterPictures } from "./rasterPictureDecode";
-import { rasterizeEmbeddedBitmapPictures } from "./svgPicture/rasterEmbeddedBitmaps";
+import { embeddedBitmapPictureStep } from "./svgPicture/rasterEmbeddedBitmaps";
 
 export type NativeRasterExportFormat = "png" | "jpeg" | "bmp" | "gif" | "tiff";
 
@@ -53,11 +53,12 @@ export async function rasterizeSvgNative(
   // PNG pictures are decoded here, in the webview, and reach Rust as checked RGBA pixels: native
   // code never decodes a bitmap (see rasterPictureDecode.ts). Base64 fields keep the request JSON;
   // the command's argument shape is unchanged when a drawing has no PNG pictures. An SVG picture that
-  // embeds a bitmap is first rasterised to a PNG here too, as the renderer cannot draw its bitmap.
-  const flattened = await rasterizeEmbeddedBitmapPictures(svg, {
-    scale: options.scale, maxDimensionPx: options.maxDimensionPx, budgetBytes: options.pictureBudgetBytes
+  // embeds a bitmap is rasterised to a PNG here too, in drawing order against the same pixel budget,
+  // as the renderer cannot draw its bitmap.
+  const prepared = await prepareRasterPictures(svg, {
+    budgetBytes: options.pictureBudgetBytes,
+    beforeDecode: embeddedBitmapPictureStep({ scale: options.scale, maxDimensionPx: options.maxDimensionPx })
   });
-  const prepared = await prepareRasterPictures(flattened, { budgetBytes: options.pictureBudgetBytes });
   const response = await invoke<NativeRasterExportResponse>("rasterize_svg", {
     request: {
       svg: prepared.svg,

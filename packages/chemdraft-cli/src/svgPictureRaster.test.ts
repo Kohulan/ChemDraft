@@ -3,7 +3,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Resvg } from "@resvg/resvg-js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { rasterizeSvgPictureWithResvg } from "./svgPictureRaster";
+import type { ExportWarning } from "@chemdraft/export-engine";
+import { DIAGRAM_SAMPLE, EDITOR_SAMPLE, PLOT_SAMPLE, TOOLKIT_SAMPLE } from "../../export-engine/src/svgSafety/benignSamples";
+import { jpegHeader, pngWithSize } from "../../export-engine/src/svgSafety/testFixtures";
+import { flattenSvgPictures, rasterizeSvgPictureWithResvg } from "./svgPictureRaster";
 
 const decode = (png: Uint8Array, width: number, height: number) => {
   const image = new Resvg(`<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}"><image width="${width}" height="${height}" href="data:image/png;base64,${Buffer.from(png).toString("base64")}"/></svg>`).render();
@@ -96,7 +99,6 @@ describe("rasterizeSvgPictureWithResvg refuses host files", () => {
     ["a file URL", (_m, url) => svgWith(`<image width="4" height="4" href="${url}"/>`)],
     ["a path through an internal entity", (m) => `<?xml version="1.0"?><!DOCTYPE svg [<!ENTITY p "${m}">]><svg xmlns="${SVG}" width="4" height="4"><image width="4" height="4" href="&p;"/></svg>`],
     ["an external entity", (m) => `<!DOCTYPE svg [<!ENTITY p SYSTEM "${m}">]><svg xmlns="${SVG}" width="4" height="4"><text>&p;</text></svg>`],
-    ["a DOCTYPE with no entity", () => `<!DOCTYPE svg><svg xmlns="${SVG}" width="4" height="4"/>`],
     ["a CSS url() in a style attribute", (m) => svgWith(`<rect width="4" height="4" style="fill:url(${m})"/>`)],
     ["a CSS url() in a presentation attribute", (m) => svgWith(`<rect width="4" height="4" fill="url(${m})"/>`)],
     ["a CSS url() in a style block", (m) => svgWith(`<style>rect{fill:url('${m}')}</style><rect width="4" height="4"/>`)],
@@ -123,12 +125,111 @@ describe("rasterizeSvgPictureWithResvg refuses host files", () => {
   it("names the reason: outside the picture, nested SVG, or unreadable", async () => {
     await expect(rasterizeSvgPictureWithResvg(request(svgWith(`<image href="${marker}"/>`)))).rejects.toThrow("outside the picture");
     await expect(rasterizeSvgPictureWithResvg(request(svgWith(`<image href="data:image/svg+xml;base64,${markerData}"/>`)))).rejects.toThrow("nests another SVG");
-    await expect(rasterizeSvgPictureWithResvg(request("<svg"))).rejects.toThrow("can't be read");
+    await expect(rasterizeSvgPictureWithResvg(request("<svg"))).rejects.toThrow("not well-formed");
   });
 
   it("rejects instead of throwing synchronously", () => {
     const pending = rasterizeSvgPictureWithResvg(request(svgWith(`<image href="${marker}"/>`)));
     expect(pending).toBeInstanceOf(Promise);
     return expect(pending).rejects.toThrow();
+  });
+});
+
+const base64 = (bytes: Uint8Array) => Buffer.from(bytes).toString("base64");
+const pngSize = (dataUri: string) => {
+  const bytes = Buffer.from(dataUri.replace(/^data:image\/png;base64,/, ""), "base64");
+  return [bytes.readUInt32BE(16), bytes.readUInt32BE(20)];
+};
+
+describe("rasterizeSvgPictureWithResvg uses the shared SVG safety check", { timeout: 30_000 }, () => {
+  const svgWith = (body: string) => `<svg xmlns="${SVG}" xmlns:xlink="${XLINK}" width="4" height="4">${body}</svg>`;
+
+  it("refuses a fragment on <image> or <feImage>, which resvg's resolver could read as a relative file name", async () => {
+    for (const body of ['<rect id="a" width="4" height="4"/><image width="4" height="4" href="#a"/>',
+      '<rect id="a" width="4" height="4"/><image width="4" height="4" xlink:href="#a"/>',
+      '<rect id="a" width="4" height="4"/><filter id="f"><feImage href="#a"/></filter><rect width="4" height="4" filter="url(#f)"/>']) {
+      await expect(rasterizeSvgPictureWithResvg(request(svgWith(body), 4, 4)), body).rejects.toThrow("outside the picture");
+    }
+  });
+
+  it("draws a <use> of an element in the picture, and a dangling one draws nothing instead of being read elsewhere", async () => {
+    const svg = svgWith('<defs><rect id="r" width="4" height="4" fill="#ff0000"/></defs><use href="#r"/><use href="#missing"/>');
+    const image = decode(await rasterizeSvgPictureWithResvg(request(svg, 4, 4)), 4, 4);
+    expect(pixel(image, 2, 2)).toEqual([255, 0, 0, 255]);
+  });
+
+  it("checks inline bitmaps by their bytes and header size before any Resvg is built", async () => {
+    await expect(rasterizeSvgPictureWithResvg(request(svgWith(`<image width="4" height="4" href="data:image/png;base64,${base64(jpegHeader(4, 4))}"/>`), 4, 4)))
+      .rejects.toThrow("labelled image/png but its contents are JPEG");
+    await expect(rasterizeSvgPictureWithResvg(request(svgWith(`<image width="4" height="4" href="data:image/png;base64,${base64(pngWithSize(20_000, 1))}"/>`), 4, 4)))
+      .rejects.toThrow("20000 × 1 pixels; the limit is 16384 pixels on a side");
+  });
+
+  it("reads CSS with the shared forward-only tokenizer: a style full of url() takes linear time", async () => {
+    const svg = svgWith(`<style>rect{--x:${"url(#a) ".repeat(90_000)}}</style><rect id="a" width="4" height="4" fill="#00ff00"/>`);
+    const started = performance.now();
+    const image = decode(await rasterizeSvgPictureWithResvg(request(svg, 4, 4)), 4, 4);
+    expect(performance.now() - started).toBeLessThan(10_000);
+    expect(pixel(image, 2, 2)).toEqual([0, 255, 0, 255]);
+  });
+
+  it("reads only <style>, style= and reference-bearing presentation attributes as CSS", async () => {
+    const svg = svgWith('<desc>@import url(/etc/hosts)</desc><rect width="4" height="4" fill="#0000ff" aria-label="see url(/etc/hosts) and @import"/>'
+      + '<text x="0" y="3" font-size="1" fill="#0000ff">url(file:///etc/hosts)</text>');
+    const image = decode(await rasterizeSvgPictureWithResvg(request(svg, 4, 4)), 4, 4);
+    expect(pixel(image, 2, 2)).toEqual([0, 0, 255, 255]);
+  });
+
+  it("draws a DOCTYPE with no internal subset, which the check drops", async () => {
+    const svg = `<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd"><svg xmlns="${SVG}" width="4" height="4"><rect width="4" height="4" fill="#ff0000"/></svg>`;
+    expect(pixel(decode(await rasterizeSvgPictureWithResvg(request(svg, 4, 4)), 4, 4), 2, 2)).toEqual([255, 0, 0, 255]);
+  });
+
+  it("draws the benign samples, the diagram's text fallback included", async () => {
+    for (const sample of [EDITOR_SAMPLE, PLOT_SAMPLE, DIAGRAM_SAMPLE, TOOLKIT_SAMPLE]) {
+      expect((await rasterizeSvgPictureWithResvg(request(sample, 80, 40))).length).toBeGreaterThan(8);
+    }
+  });
+
+  it("control: resvg-js leaves out a WebP an SVG embeds, which is why render-document warns about it", () => {
+    // A real, decodable 4 x 4 opaque red lossless WebP.
+    const webp = "UklGRhwAAABXRUJQVlA4TA8AAAAvA8AAAAcQ/Y/+ByKi/wEA";
+    const image = new Resvg(svgWith(`<image width="4" height="4" href="data:image/webp;base64,${webp}"/>`)).render();
+    expect([...image.pixels.subarray(0, 4)]).toEqual([0, 0, 0, 0]);
+  });
+});
+
+describe("flattenSvgPictures", { timeout: 30_000 }, () => {
+  const picture = (id: string, width: number, height: number, body = `<rect width="40" height="20" fill="#ff0000"/>`) =>
+    `<g data-object-id="${id}"><image x="0" y="0" width="${width}" height="${height}" preserveAspectRatio="none" `
+    + `href="data:image/svg+xml;base64,${Buffer.from(`<svg xmlns="${SVG}" width="40" height="20">${body}</svg>`).toString("base64")}"/></g>`;
+  const page = (...items: string[]) => `<svg xmlns="${SVG}" width="400" height="300" viewBox="0 0 400 300">${items.join("")}</svg>`;
+  const hrefs = (svg: string) => [...svg.matchAll(/href="(data:image\/png;base64,[^"]*)"/g)].map((match) => match[1]!);
+
+  it("rasterises each picture at the size the output draws it, not at a 300 dpi minimum", async () => {
+    const warnings: ExportWarning[] = [];
+    const flattened = await flattenSvgPictures(page(picture("p", 40, 20)), 1.5, warnings);
+    expect(warnings).toEqual([]);
+    expect(hrefs(flattened).map(pngSize)).toEqual([[60, 30]]);
+  });
+
+  it("keeps every flattened picture of one export within one pixel budget, and names the picture it could not draw", async () => {
+    const warnings: ExportWarning[] = [];
+    // The first picture takes 40 x 20 = 800 pixels; 1000 leaves too little for the second to be worth drawing.
+    const flattened = await flattenSvgPictures(page(picture("first", 40, 20), picture("second", 40, 20)), 1, warnings, 1000);
+    expect(hrefs(flattened).map(pngSize)).toEqual([[40, 20]]);
+    expect(warnings).toEqual([expect.objectContaining({ code: "export.png.svg_picture_not_drawn", objectId: "second",
+      message: expect.stringContaining("too many SVG pictures") })]);
+    // With room for a smaller copy, a later picture is shrunk rather than dropped.
+    const shrunk = await flattenSvgPictures(page(picture("first", 200, 100), picture("second", 200, 100)), 1, [], 20000 + 5000);
+    const [, second] = hrefs(shrunk).map(pngSize);
+    expect(second![0]! * second![1]!).toBeLessThanOrEqual(5000);
+  });
+
+  it("names the picture's own object from the parsed tree, not an earlier object's id nearby in the text", async () => {
+    const warnings: ExportWarning[] = [];
+    const refused = picture("pic", 40, 20, '<image width="4" height="4" href="/etc/hosts"/>');
+    await flattenSvgPictures(page('<g data-object-id="mol1"><path d="M0 0"/></g>', refused), 1, warnings);
+    expect(warnings).toEqual([expect.objectContaining({ objectId: "pic", message: expect.stringContaining("SVG picture pic was not drawn") })]);
   });
 });

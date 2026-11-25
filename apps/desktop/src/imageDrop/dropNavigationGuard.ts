@@ -34,7 +34,9 @@ export function isEditableDropTarget(target: EventTarget | null): boolean {
     if (element instanceof HTMLTextAreaElement) return !element.disabled && !element.readOnly;
     const state = element.getAttribute("contenteditable");
     if (state === null) continue;
-    const normalized = state.trim().toLowerCase();
+    // An enumerated attribute: matched ASCII case-insensitively and never trimmed, so " false " is
+    // an invalid value that inherits, as the browser reads it.
+    const normalized = state.replace(/[A-Z]/g, letter => letter.toLowerCase());
     if (normalized === "false") return false;
     if (normalized === "" || normalized === "true" || normalized === "plaintext-only") return true;
   }

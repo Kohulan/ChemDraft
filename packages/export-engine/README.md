@@ -63,6 +63,12 @@ size, bounded per picture and per document): the desktop app uses its webview ra
 `export.pdf.svg_picture_not_drawn` warning. A PNG picture jsPDF cannot embed (a corrupt data chunk)
 is skipped with an `export.pdf.picture_not_drawn` warning rather than failing the export.
 
+SVG picture safety (`src/svgSafety/`, exported from the package index, so it loads without jsPDF) is
+the one sanitiser for untrusted SVG pictures: the desktop drop path removes what reaches outside a
+picture, and `chemdraft-cli` refuses such a picture before resvg sees it. The DOMParser and
+XMLSerializer are injected; CSS is read by one forward-only tokenizer with token and size budgets;
+embedded bitmaps are checked by their magic bytes and header sizes and returned for a decoder.
+
 Filled-ring label halos use the shared SVG composite paint (paper plus clipped ring fills).
 PDF converts that paint to a tiling pattern and applies it through a glyph soft mask, preserving
 gradients and opacity without a white outline. These documents use PDF 1.4 transparency; unfilled

@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { afterEach, describe, expect, it } from "vitest";
-import { installDropNavigationGuard } from "./dropNavigationGuard";
+import { installDropNavigationGuard, isEditableDropTarget } from "./dropNavigationGuard";
 
 function dragEvent(type: "dragover" | "drop", types: string[]) {
   const event = new Event(type, { bubbles: true, cancelable: true });
@@ -63,6 +63,34 @@ describe("installDropNavigationGuard", () => {
     const text = dragEvent("drop", ["text/plain"]);
     checkbox.dispatchEvent(text.event);
     expect(text.event.defaultPrevented).toBe(true);
+  });
+
+  it("reads contenteditable as the browser does: case-insensitive, never trimmed", () => {
+    const host = document.createElement("div");
+    host.setAttribute("contenteditable", "TRUE");
+    // " false " is not "false": an invalid value, so it inherits the editable host.
+    const padded = document.createElement("span");
+    padded.setAttribute("contenteditable", " false ");
+    const closed = document.createElement("span");
+    closed.setAttribute("contenteditable", "False");
+    // The empty string and plaintext-only (in any case) are editable states of their own.
+    const empty = document.createElement("span");
+    empty.setAttribute("contenteditable", "");
+    const plain = document.createElement("span");
+    plain.setAttribute("contenteditable", "PlainText-Only");
+    closed.append(empty, plain);
+    host.append(padded, closed);
+    expect(isEditableDropTarget(host)).toBe(true);
+    expect(isEditableDropTarget(padded)).toBe(true);
+    expect(isEditableDropTarget(closed)).toBe(false);
+    expect(isEditableDropTarget(empty)).toBe(true);
+    expect(isEditableDropTarget(plain)).toBe(true);
+    const island = document.createElement("span");
+    island.setAttribute("contenteditable", "false");
+    const reopened = document.createElement("span");
+    reopened.setAttribute("contenteditable", " true");
+    island.append(reopened);
+    expect(isEditableDropTarget(reopened)).toBe(false);
   });
 
   it("uses the nearest editing boundary and lets only text-compatible drags edit", () => {

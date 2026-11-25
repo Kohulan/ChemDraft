@@ -105,6 +105,31 @@ describe("prepareDroppedImage", () => {
       .toEqual({ ok: false, reason: "the SVG could not be drawn: the webview could not decode it." });
   });
 
+  it("decodes every bitmap an SVG embeds under the file's deadline, and refuses the SVG naming one that fails", async () => {
+    const png = btoa(String.fromCharCode(...pngBytes()));
+    const jpeg = btoa(String.fromCharCode(...jpegHeader(2, 2)));
+    const svg = svgBytes(`<svg ${NS} width="4" height="4"><image href="data:image/png;base64,${png}" width="2" height="2"/>`
+      + `<image href="data:image/png;base64,${png}" width="2" height="2"/><image href="data:image/jpeg;base64,${jpeg}" width="2" height="2"/></svg>`);
+    const check = fakeCheck({ width: 2, height: 2 });
+    const signal = new AbortController().signal;
+    expect((await prepareDroppedImage("a.svg", svg, decoders(fakeRaster(), check), { signal })).ok).toBe(true);
+    // Each distinct bitmap once, then the SVG itself, all with the file's signal.
+    expect(check.calls).toEqual([["image/png", signal], ["image/jpeg", signal], ["image/svg+xml", signal]]);
+    const failsJpeg: DecodeCheck = async (_bytes, mimeType) => {
+      if (mimeType === "image/jpeg") throw new Error("the webview could not decode it.");
+      return { width: 2, height: 2 };
+    };
+    expect(await prepareDroppedImage("b.svg", svg, decoders(fakeRaster(), failsJpeg)))
+      .toEqual({ ok: false, reason: "an embedded JPEG picture could not be decoded: the webview could not decode it." });
+    const empty: DecodeCheck = async (_bytes, mimeType) => mimeType === "image/png" ? { width: 0, height: 0 } : { width: 2, height: 2 };
+    expect(await prepareDroppedImage("c.svg", svg, decoders(fakeRaster(), empty)))
+      .toEqual({ ok: false, reason: "an embedded PNG picture could not be decoded: the webview could not decode it." });
+    // A decoder that never settles on the embedded bitmap ends at the deadline like any other.
+    const hangs: DecodeCheck = (_bytes, mimeType) => mimeType === "image/png" ? new Promise(() => {}) : Promise.resolve({ width: 2, height: 2 });
+    const result = await prepareDroppedImages([memorySource("d.svg", svg)], decoders(fakeRaster(), hangs), { deadlineMs: 50 });
+    expect(result.refusals).toEqual([{ name: "d.svg", reason: "reading it took longer than 0.1 seconds." }]);
+  });
+
   it("re-encodes JPEG, GIF and WebP through the injected decoder after a header check", async () => {
     for (const [name, bytes] of [["a.jpg", jpegHeader(8, 8)], ["a.gif", gifHeader(8, 8)], ["a.webp", webpVp8Header(8, 8)]] as const) {
       const raster = vi.fn(fakeRaster());
@@ -260,6 +285,46 @@ describe("deadlines", () => {
   });
 });
 
+describe("deadlines cover the filesystem too", () => {
+  it("ends a stat that never returns at the deadline and goes on with the next file", async () => {
+    const stuck: DroppedImageSource = { name: "stuck.png", size: () => new Promise(() => {}), read: async () => pngBytes() };
+    const result = await prepareDroppedImages([stuck, memorySource("ok.png", pngBytes())], decoders(), { deadlineMs: 50 });
+    expect(result.images.map(image => image.name)).toEqual(["ok.png"]);
+    expect(result.refusals).toEqual([{ name: "stuck.png", reason: "its size could not be read (it took longer than 0.1 seconds)." }]);
+  });
+
+  it("ends a read that never returns at the deadline, tells the reader through its signal, and goes on", async () => {
+    let seen: AbortSignal | undefined;
+    const stalled: DroppedImageSource = {
+      name: "stalled.png", size: async () => 10,
+      read: (_max, options) => { seen = options?.signal; return new Promise(() => {}); }
+    };
+    const result = await prepareDroppedImages([stalled, memorySource("ok.png", pngBytes())], decoders(), { deadlineMs: 50 });
+    expect(seen?.aborted).toBe(true);
+    expect(result.images.map(image => image.name)).toEqual(["ok.png"]);
+    expect(result.refusals).toEqual([{ name: "stalled.png", reason: "reading it took longer than 0.1 seconds." }]);
+  });
+
+  it("closes a native file whose read stalls, as soon as the deadline aborts it", async () => {
+    vi.resetModules();
+    const close = vi.fn(async () => {});
+    vi.doMock("@tauri-apps/plugin-fs", () => ({
+      stat: () => new Promise(() => {}),
+      open: async () => ({ read: () => new Promise(() => {}), close })
+    }));
+    const { nativeDroppedImageSource: fresh } = await import("./readDroppedFile");
+    const source = fresh("/tmp/stalled.png");
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(new Error("late")), 20);
+    await expect(source.read(100, { signal: controller.signal })).rejects.toThrow("late");
+    expect(close).toHaveBeenCalledTimes(1);
+    const statController = new AbortController();
+    setTimeout(() => statController.abort(new Error("slow stat")), 20);
+    await expect(source.size({ signal: statController.signal })).rejects.toThrow("slow stat");
+    vi.doUnmock("@tauri-apps/plugin-fs");
+  });
+});
+
 describe("the document size limit", () => {
   const png = btoa(String.fromCharCode(...pngBytes()));
   const cost = savedPictureBytes(png.length);
@@ -296,7 +361,7 @@ describe("the document size limit", () => {
     expect(inserted).toEqual([["one.png"]]);
     expect(status.at(-1)).toBe([
       "Inserted picture one.png",
-      "Couldn't drop \"two.png\": it would make the document larger than 64.0 MB, the most ChemDraft can open.",
+      "Couldn't drop \"two.png\": it would make the document larger than 64.0 MB, the most ChemDraft can open",
       "Couldn't drop \"three.png\": it would make the document larger than 64.0 MB, the most ChemDraft can open."
     ].join("; "));
   });
@@ -338,8 +403,8 @@ describe("handleDroppedFiles", () => {
     expect(calls.opened).toEqual([["a.cdxml"]]);
     expect(calls.status.at(-1)).toBe([
       "Inserted 2 pictures (one.png, two.png)",
-      "Couldn't drop \"bad.bmp\": BMP and TIFF pictures can't be dropped yet; save it as PNG or JPEG first.",
-      "Couldn't drop \"fake.jpg\": its contents are not a PNG, JPEG, GIF, WebP or SVG picture.",
+      "Couldn't drop \"bad.bmp\": BMP and TIFF pictures can't be dropped yet; save it as PNG or JPEG first",
+      "Couldn't drop \"fake.jpg\": its contents are not a PNG, JPEG, GIF, WebP or SVG picture",
       "Opened 1 document"
     ].join("; "));
   });
@@ -348,7 +413,7 @@ describe("handleDroppedFiles", () => {
     const { calls, handler } = harness("refuse");
     await handleDroppedFiles([file("one.png"), file("a.mol")], handler);
     expect(calls.opened).toEqual([["a.mol"]]);
-    expect(calls.status.at(-1)).toBe("The dropped pictures were not inserted: the document tab changed while they were read; drop them again.; Opened 1 document");
+    expect(calls.status.at(-1)).toBe("The dropped pictures were not inserted: the document tab changed while they were read; drop them again; Opened 1 document");
   });
 
   it("tells a guard refusal at drop time, before reading anything, and still opens the documents", async () => {
@@ -358,7 +423,7 @@ describe("handleDroppedFiles", () => {
       insertRefusal: () => "finish editing the text first." });
     expect(source.reads).toBe(0);
     expect(calls.inserted).toEqual([]);
-    expect(calls.status.at(-1)).toBe("The dropped pictures were not inserted: finish editing the text first.; Opened 1 document");
+    expect(calls.status.at(-1)).toBe("The dropped pictures were not inserted: finish editing the text first; Opened 1 document");
   });
 
   it("commits only when the canvas is idle, and reports a canvas that stayed busy", async () => {
@@ -410,6 +475,11 @@ describe("formatImageDropStatus", () => {
       .toBe("Inserted 7 pictures (p0.png, p1.png, p2.png, p3.png, p4.png and 2 more); scaled to fit the page: p1.png");
     expect(formatImageDropStatus({ inserted: [], refusals: [{ name: "C:\\a\\x.tif", reason: "r." }] }))
       .toBe("No pictures were inserted; Couldn't drop \"x.tif\": r.");
+  });
+
+  it("drops a reason's own period before the separator, keeping only the last one", () => {
+    expect(formatImageDropStatus({ inserted: [], refusals: [{ name: "a.png", reason: "first." }, { name: "b.png", reason: "second." }] }))
+      .toBe("No pictures were inserted; Couldn't drop \"a.png\": first; Couldn't drop \"b.png\": second.");
   });
 });
 

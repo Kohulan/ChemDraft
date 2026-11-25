@@ -1,9 +1,21 @@
 /**
- * One forward-only CSS tokenizer (CSS Syntax Level 3, §4) for dropped SVG. The sanitizer validates
+ * One forward-only CSS tokenizer (CSS Syntax Level 3, §4) for untrusted SVG. The sanitizer validates
  * and writes out the same tokens, so what is checked is exactly what is kept: a comment-like run
  * inside a string or an unquoted url() is part of that token, as a browser reads it, and an escape
- * is decoded wherever it would be. Every step consumes input, so the work is linear in the text.
+ * is decoded wherever it would be. Every step consumes input, so the work is linear in the text,
+ * and the token count is checked before each token is made, so the memory is bounded too.
  */
+
+/** Tokens one stylesheet or attribute value may make; past it the whole SVG is refused. */
+export const MAX_CSS_TOKENS = 200_000;
+
+/** Thrown when a text would make more than its token budget; nothing past the budget is allocated. */
+export class CssTokenBudgetError extends Error {
+  constructor(maxTokens: number) {
+    super(`a style sheet or style attribute in the SVG has more than ${maxTokens.toLocaleString("en-US")} CSS tokens.`);
+    this.name = "CssTokenBudgetError";
+  }
+}
 
 export type CssTokenType =
   | "ws" | "comment" | "string" | "url" | "function" | "at-keyword" | "hash" | "ident" | "number" | "delim"
@@ -35,7 +47,7 @@ const SIMPLE: Readonly<Record<string, CssTokenType>> = {
   "(": "(", ")": ")", "[": "[", "]": "]", "{": "{", "}": "}", ";": ";", ":": ":", ",": ","
 };
 
-export function tokenizeCss(css: string): CssToken[] {
+export function tokenizeCss(css: string, maxTokens = MAX_CSS_TOKENS): CssToken[] {
   const tokens: CssToken[] = [];
   const length = css.length;
   let index = 0;
@@ -148,6 +160,7 @@ export function tokenizeCss(css: string): CssToken[] {
     }
   };
   const push = (type: CssTokenType, start: number, value = "", bad = false) => {
+    if (tokens.length >= maxTokens) throw new CssTokenBudgetError(maxTokens);
     tokens.push(bad ? { type, start, end: index, value, bad } : { type, start, end: index, value });
   };
 

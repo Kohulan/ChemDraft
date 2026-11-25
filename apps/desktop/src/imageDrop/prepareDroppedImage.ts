@@ -1,12 +1,13 @@
 import {
   MAX_IMAGE_OBJECT_BYTES, isSvgImageSource, readPngInfo, validatePngImage, validateSvgImage, type ImageObjectData
 } from "@chemdraft/chem-core";
+import {
+  SVG_PICTURE_FORMAT_LABEL, pictureSizeLimitError as dropPixelLimitError, readRasterHeaderSize, sanitizeSvgPicture,
+  sniffBinaryImageFormat, type EmbeddedSvgBitmap, type SniffedImageFormat
+} from "@chemdraft/export-engine";
 import { formatDropBytes, rewordPictureError } from "./dropFiles";
-import { readRasterHeaderSize, sniffBinaryImageFormat, type SniffedImageFormat } from "./imageSniff";
-import { dropPixelLimitError } from "./pixelLimits";
 import type { DecodeOptions, DroppedImageDecoders } from "./rasterDecode";
 import { decodeSvgBytes, encodeSvgText } from "./svgText";
-import { sanitizeDroppedSvg } from "./svgSanitizer";
 
 /** A picture ready to become a native image object; built at commit time, not here. */
 export interface PreparedDroppedImage {
@@ -44,7 +45,6 @@ export function bytesToBase64(bytes: Uint8Array): string {
   return btoa(chunks.join(""));
 }
 
-export { dropPixelLimitError };
 
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
 
@@ -52,6 +52,21 @@ function payloadSizeError(bytes: number): string | undefined {
   return bytes > MAX_IMAGE_OBJECT_BYTES
     ? `it is ${formatDropBytes(bytes)} as stored; the picture limit is ${formatDropBytes(MAX_IMAGE_OBJECT_BYTES)}.`
     : undefined;
+}
+
+/** Decode one bitmap an SVG embeds, under the file's deadline; the reason it fails, if it does. */
+async function embeddedBitmapDecodeError(bitmap: EmbeddedSvgBitmap, decoders: DroppedImageDecoders, options: DecodeOptions): Promise<string | undefined> {
+  const label = SVG_PICTURE_FORMAT_LABEL[bitmap.format];
+  let decoded;
+  try {
+    decoded = await decoders.decodeCheck(bitmap.bytes, bitmap.mimeType, options);
+  } catch (error) {
+    if (options.signal?.aborted) throw error;
+    return `an embedded ${label} picture could not be decoded: ${errorText(error)}`;
+  }
+  if (!(decoded.width > 0 && decoded.height > 0)) return `an embedded ${label} picture could not be decoded: the webview could not decode it.`;
+  const limit = dropPixelLimitError(decoded.width, decoded.height);
+  return limit ? `an embedded picture ${limit.replace(/^it /, "")}` : undefined;
 }
 
 /**
@@ -124,8 +139,13 @@ export async function prepareDroppedImage(
   if (!isSvgImageSource(decoded.text)) {
     return { ok: false, reason: "its contents are not a PNG, JPEG, GIF, WebP or SVG picture." };
   }
-  const sanitized = sanitizeDroppedSvg(decoded.text);
+  const sanitized = sanitizeSvgPicture(decoded.text);
   if (!sanitized.ok) return { ok: false, reason: sanitized.error };
+  // The headers were checked; each bitmap must also decode, or the picture would draw without it.
+  for (const bitmap of sanitized.embeddedBitmaps) {
+    const failure = await embeddedBitmapDecodeError(bitmap, decoders, options);
+    if (failure) return { ok: false, reason: failure };
+  }
   const validated = validateSvgImage(sanitized.svg);
   if (validated.error) return { ok: false, reason: rewordPictureError(validated.error) };
   const svgBytes = encodeSvgText(sanitized.svg);
