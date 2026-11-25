@@ -44,11 +44,31 @@ pub(crate) const AFTER_MAP_WAIT: Duration = Duration::from_millis(500);
 /// A physical position or frame size, in pixels.
 type Pixels = (i32, i32);
 
-/// A target ChemDraft moved a pinned palette away from, with the outer frame size it had there.
-#[derive(Debug, Clone, Copy)]
+/// A target ChemDraft moved a pinned palette away from, with every outer frame size it had there
+/// (empty when none was known).
+#[derive(Debug, Clone)]
 struct SupersededTarget {
     position: Pixels,
-    size: Option<Pixels>,
+    sizes: Vec<Pixels>,
+}
+
+/// A palette closed while pinned: the position saved for it, and every outer frame size its pin
+/// target had (empty when the saved position was not the target). A reopen of the same hidden
+/// window that still sits at the clamp of any of those frames starts from `position`: a content
+/// fit in place may have shrunk the frame after the window manager clamped the one it mapped.
+#[derive(Debug, Clone)]
+pub(crate) struct ClosedPin {
+    pub(crate) position: Pixels,
+    sizes: Vec<Pixels>,
+}
+
+impl From<Pixels> for ClosedPin {
+    fn from(position: Pixels) -> Self {
+        Self {
+            position,
+            sizes: Vec::new(),
+        }
+    }
 }
 
 /// A monitor's work area, in the same physical pixels as the outer positions.
@@ -95,6 +115,11 @@ struct Pin {
     position: (i32, i32),
     /// The outer frame size last seen while `position` was the target, if any was.
     size: Option<(i32, i32)>,
+    /// Every outer frame size seen while `position` was the target, `size` included unless it was
+    /// only carried over from an earlier target. A content fit in place can shrink the frame
+    /// before the window manager's clamp of the frame it mapped is handled: that clamp is still
+    /// predicted with the size it was made for, not only with the size the frame has now.
+    sizes: Vec<(i32, i32)>,
     until: Instant,
     corrections: u8,
     /// Earlier targets ChemDraft moved the palette away from while it was pinned, each with the
@@ -120,9 +145,10 @@ enum Spot {
 #[derive(Default)]
 pub(crate) struct MapPins {
     pins: HashMap<String, Pin>,
-    /// Palettes closed while pinned, with the position saved for them: a reopen of the same hidden
-    /// window pins that position, not the clamp the hidden window may still sit at.
-    closed: HashMap<String, (i32, i32)>,
+    /// Palettes closed while pinned, with the position saved for them and the frame sizes their
+    /// target had: a reopen of the same hidden window pins that position, not the clamp the hidden
+    /// window may still sit at.
+    closed: HashMap<String, ClosedPin>,
 }
 
 fn near(a: (i32, i32), b: (i32, i32)) -> bool {
@@ -205,21 +231,34 @@ fn is_clamp_of(
 }
 
 impl Pin {
+    /// Remember that the target's frame has had `size`.
+    fn record_size(&mut self, size: (i32, i32)) {
+        self.size = Some(size);
+        if !self.sizes.contains(&size) {
+            self.sizes.push(size);
+        }
+    }
+
     fn spot(&self, position: (i32, i32), layout: &Layout<'_>) -> Spot {
-        if is_clamp_of(self.position, layout.size, position, layout.work_areas) {
+        let clamp = std::iter::once(layout.size)
+            .chain(self.sizes.iter().copied())
+            .any(|size| is_clamp_of(self.position, size, position, layout.work_areas));
+        if clamp {
             return Spot::Clamp;
         }
         if near(position, self.position) {
             return Spot::Target;
         }
         let superseded = self.superseded.iter().any(|old| {
-            near(position, old.position)
-                || is_clamp_of(
-                    old.position,
-                    old.size.unwrap_or(layout.size),
-                    position,
-                    layout.work_areas,
-                )
+            if near(position, old.position) {
+                return true;
+            }
+            if old.sizes.is_empty() {
+                return is_clamp_of(old.position, layout.size, position, layout.work_areas);
+            }
+            old.sizes
+                .iter()
+                .any(|size| is_clamp_of(old.position, *size, position, layout.work_areas))
         });
         if superseded {
             Spot::Superseded
@@ -234,34 +273,37 @@ impl MapPins {
         self.pins.retain(|_, pin| now < pin.until);
     }
 
-    /// Hold `label` at `position` through the map that is about to happen. `size` is its outer
+    /// Hold `label` at `target` through the map that is about to happen. `size` is its outer
     /// frame, when known.
     pub(crate) fn pin(
         &mut self,
         label: &str,
-        position: (i32, i32),
+        target: impl Into<ClosedPin>,
         size: Option<(i32, i32)>,
         now: Instant,
     ) {
         self.prune(now);
         self.closed.remove(label);
-        self.pins.insert(
-            label.to_string(),
-            Pin {
-                position,
-                size,
-                until: now + PIN_DURATION,
-                corrections: 0,
-                superseded: Vec::new(),
-            },
-        );
+        let ClosedPin { position, sizes } = target.into();
+        let mut pin = Pin {
+            position,
+            size: None,
+            sizes,
+            until: now + PIN_DURATION,
+            corrections: 0,
+            superseded: Vec::new(),
+        };
+        if let Some(size) = size {
+            pin.record_size(size);
+        }
+        self.pins.insert(label.to_string(), pin);
     }
 
     /// ChemDraft moved a pinned palette itself (content fit, off-screen recovery): hold it there.
     /// `size` is the outer frame it moved the palette with, when known. The old target is
-    /// superseded, with the frame size it had: a correction or clamp still on its way to it is
-    /// ignored, and the new target gets its own moves back. Every target keeps its own size, so a
-    /// target replaced before any Moved event reached it is still judged with its own frame.
+    /// superseded, with every frame size it had: a correction or clamp still on its way to it is
+    /// ignored, and the new target gets its own moves back. Every target keeps its own sizes, so a
+    /// target replaced before any Moved event reached it is still judged with its own frames.
     pub(crate) fn moved_by_chemdraft(
         &mut self,
         label: &str,
@@ -274,26 +316,32 @@ impl MapPins {
             if pin.position != position {
                 let old = std::mem::replace(&mut pin.position, position);
                 let old_size = pin.size;
+                let mut old_sizes = std::mem::replace(&mut pin.sizes, size.into_iter().collect());
+                if old_sizes.is_empty() {
+                    // Only a size carried over from an earlier target, if that.
+                    old_sizes.extend(old_size);
+                }
                 pin.size = size.or(old_size);
                 pin.superseded.push(SupersededTarget {
                     position: old,
-                    size: old_size,
+                    sizes: old_sizes,
                 });
                 pin.corrections = 0;
-            } else if size.is_some() {
-                pin.size = size;
+            } else if let Some(size) = size {
+                pin.record_size(size);
             }
         }
     }
 
     /// ChemDraft resized a pinned palette without moving it (a content fit in place): the target
-    /// stays, but it now has this outer frame, so a later retarget archives it with the frame it
-    /// really had. The target is left alone even when the palette sits at its clamp: only the size
-    /// changed.
+    /// stays, but it now has this outer frame as well, so a later retarget archives it with the
+    /// frames it really had. The target is left alone even when the palette sits at its clamp:
+    /// only the size changed. The frames it had before stay known, so a clamp the window manager
+    /// made of the earlier frame, reported after the resize, is still recognised as its clamp.
     pub(crate) fn resized_by_chemdraft(&mut self, label: &str, size: (i32, i32), now: Instant) {
         self.prune(now);
         if let Some(pin) = self.pins.get_mut(label) {
-            pin.size = Some(size);
+            pin.record_size(size);
         }
     }
 
@@ -306,12 +354,24 @@ impl MapPins {
     /// The palette is being closed: its pin ends. `kept` is the position saved for it when it was
     /// pinned as the close began (the caller's one look at the pin, so an expiry during the close
     /// changes nothing); a reopen of the same hidden window then starts from `kept`
-    /// ([`Self::reopen_position`]). `None` leaves no record.
+    /// ([`Self::reopen_position`]). `None` leaves no record. When `kept` is the pin's target, the
+    /// record keeps every frame size the target had, so the clamp of the frame it was mapped with
+    /// is still recognised after a content fit has resized it.
     pub(crate) fn close(&mut self, label: &str, kept: Option<(i32, i32)>) {
-        self.pins.remove(label);
+        let pin = self.pins.remove(label);
         match kept {
             Some(kept) => {
-                self.closed.insert(label.to_string(), kept);
+                let sizes = pin
+                    .filter(|pin| near(pin.position, kept))
+                    .map(|pin| pin.sizes)
+                    .unwrap_or_default();
+                self.closed.insert(
+                    label.to_string(),
+                    ClosedPin {
+                        position: kept,
+                        sizes,
+                    },
+                );
             }
             None => {
                 self.closed.remove(label);
@@ -321,21 +381,23 @@ impl MapPins {
 
     /// Where to pin a palette closed while pinned as it is shown again: the position saved at the
     /// close, as long as its hidden window (`live`) is still there or at that position's clamp,
-    /// where a close before the move back landed left it. Anything else moved it since, and `None`
-    /// leaves the caller to its live frame. Consumes the record.
-    pub(crate) fn reopen_position(
+    /// where a close before the move back landed left it. The clamp is predicted with the frame
+    /// the window has now and with every frame the pin target had before the close. Anything else
+    /// moved it since, and `None` leaves the caller to its live frame. Consumes the record.
+    pub(crate) fn take_closed_pin(
         &mut self,
         label: &str,
         live: Option<(i32, i32)>,
         layout: &Layout<'_>,
-    ) -> Option<(i32, i32)> {
-        let kept = self.closed.remove(label)?;
-        match live {
-            None => Some(kept),
-            Some(live) => (near(live, kept)
-                || is_clamp_of(kept, layout.size, live, layout.work_areas))
-            .then_some(kept),
-        }
+    ) -> Option<ClosedPin> {
+        let closed = self.closed.remove(label)?;
+        let still_at_pin = live.is_none_or(|live| {
+            near(live, closed.position)
+                || std::iter::once(layout.size)
+                    .chain(closed.sizes.iter().copied())
+                    .any(|size| is_clamp_of(closed.position, size, live, layout.work_areas))
+        });
+        still_at_pin.then_some(closed)
     }
 
     /// Whether `label` was closed while pinned and has not been shown again since.
@@ -407,7 +469,7 @@ impl MapPins {
         let target = pin.position;
         match pin.spot(position, layout) {
             Spot::Target => {
-                pin.size = Some(layout.size);
+                pin.record_size(layout.size);
                 // Before any move back, the window manager's placement may still be on its way
                 // (GTK reports the requested position first). Once a move back has landed, it is
                 // done.
@@ -422,7 +484,7 @@ impl MapPins {
                 MovedDecision::Moved
             }
             Spot::Clamp => {
-                pin.size = Some(layout.size);
+                pin.record_size(layout.size);
                 if !(layout.title_reachable)(target) {
                     self.pins.remove(label);
                     return MovedDecision::Unreachable(target);
@@ -895,14 +957,67 @@ mod tests {
             size: (700, 80),
             ..vm()
         };
-        // A late clamp of 450 is predicted with the 1250-px frame it had (430), not the 1311-px
-        // one (369).
+        // A late clamp of 450 is predicted with every frame it had: the 1250-px one (430), and
+        // the 1311-px one it was mapped with (369).
         assert_eq!(
             pins.moved(MAIN, (430, 315), &narrower, now),
             MovedDecision::Superseded
         );
         assert_eq!(
             pins.moved(MAIN, (369, 315), &narrower, now),
+            MovedDecision::Superseded
+        );
+        // Anywhere else is a real move.
+        assert_eq!(
+            pins.moved(MAIN, (400, 315), &narrower, now),
+            MovedDecision::Moved
+        );
+    }
+
+    #[test]
+    fn a_clamp_of_the_mapped_frame_reported_after_a_resize_in_place_is_still_its_clamp() {
+        // The 1311-px frame pinned at 450 is clamped to 1680 - 1311 = 369 as it maps, and a
+        // content fit shrinks it in place to 1200 px before that clamp's Moved event is handled.
+        // At 1200 px the target fits (450 + 1200 = 1650), so the current frame alone predicts no
+        // clamp; the Moved event the resize produces at 369 must still not end the pin.
+        let now = Instant::now();
+        let mut pins = MapPins::default();
+        pins.pin(MAIN, (450, 315), Some(MAIN_SIZE), now);
+        pins.resized_by_chemdraft(MAIN, (1200, 80), now);
+        let fitted = Layout {
+            size: (1200, 80),
+            ..vm()
+        };
+        assert_eq!(predicted_clamp((450, 315), (1200, 80), &SCREEN), None);
+        // Closing or hiding now keeps the pin, not the clamp.
+        assert_eq!(
+            pins.position_to_keep(MAIN, Some((369, 315)), Some(&fitted), now),
+            Some((450, 315))
+        );
+        // A palette shown at that clamp is moved back at once, and the Moved event at the clamp
+        // is the window manager's placement: moved back, never saved.
+        assert_eq!(
+            pins.correction_due(MAIN, (369, 315), &fitted, now),
+            Some((450, 315))
+        );
+        assert_eq!(
+            pins.moved(MAIN, (369, 315), &fitted, now + Duration::from_millis(20)),
+            MovedDecision::Reassert((450, 315))
+        );
+        assert_eq!(pins.target(MAIN, now), Some((450, 315)));
+        // The move back lands with the fitted frame; the pin is done.
+        assert_eq!(
+            pins.moved(MAIN, (450, 315), &fitted, now + Duration::from_millis(40)),
+            MovedDecision::AtPin
+        );
+        assert_eq!(pins.target(MAIN, now), None);
+
+        // A real move elsewhere during such a pin still ends it.
+        let mut pins = MapPins::default();
+        pins.pin(MAIN, (450, 315), Some(MAIN_SIZE), now);
+        pins.resized_by_chemdraft(MAIN, (1200, 80), now);
+        assert_eq!(
+            pins.moved(MAIN, (300, 315), &fitted, now),
             MovedDecision::Moved
         );
     }
@@ -1076,26 +1191,86 @@ mod tests {
         assert_eq!(pins.target(MAIN, now), None);
         // The hidden window is still at the clamp: reopen from the saved position, once.
         assert_eq!(
-            pins.reopen_position(MAIN, Some((369, 315)), &vm()),
+            pins.take_closed_pin(MAIN, Some((369, 315)), &vm())
+                .map(|pin| pin.position),
             Some((450, 315))
         );
-        assert_eq!(pins.reopen_position(MAIN, Some((369, 315)), &vm()), None);
+        assert!(pins
+            .take_closed_pin(MAIN, Some((369, 315)), &vm())
+            .is_none());
 
         // Moved elsewhere while hidden: its live frame, not the old record.
         pins.pin(MAIN, (450, 315), Some(MAIN_SIZE), now);
         pins.close(MAIN, Some((450, 315)));
-        assert_eq!(pins.reopen_position(MAIN, Some((100, 100)), &vm()), None);
+        assert!(pins
+            .take_closed_pin(MAIN, Some((100, 100)), &vm())
+            .is_none());
         // Closed with no pin: the caller passes nothing, and nothing is recorded.
         pins.close(MAIN, None);
-        assert_eq!(pins.reopen_position(MAIN, Some((369, 315)), &vm()), None);
+        assert!(pins
+            .take_closed_pin(MAIN, Some((369, 315)), &vm())
+            .is_none());
         // A destroyed window, or a new pin, drops the record.
         pins.pin(MAIN, (450, 315), Some(MAIN_SIZE), now);
         pins.close(MAIN, Some((450, 315)));
         pins.forget(MAIN);
-        assert_eq!(pins.reopen_position(MAIN, Some((369, 315)), &vm()), None);
+        assert!(pins
+            .take_closed_pin(MAIN, Some((369, 315)), &vm())
+            .is_none());
         pins.pin(MAIN, (450, 315), Some(MAIN_SIZE), now);
         pins.close(MAIN, Some((450, 315)));
         pins.pin(MAIN, (450, 315), Some(MAIN_SIZE), now);
-        assert_eq!(pins.reopen_position(MAIN, Some((369, 315)), &vm()), None);
+        assert!(pins
+            .take_closed_pin(MAIN, Some((369, 315)), &vm())
+            .is_none());
+    }
+
+    #[test]
+    fn a_palette_resized_in_place_and_closed_reopens_at_its_pin() {
+        // Main's 1311-px frame pinned at 450 is clamped to 1680 - 1311 = 369 as it maps; a content
+        // fit then shrinks it in place to 1200 px, which would fit at 450 (450 + 1200 = 1650).
+        // Closed before the move back landed, the hidden window still sits at 369.
+        let now = Instant::now();
+        let mut pins = MapPins::default();
+        pins.pin(MAIN, (450, 315), Some(MAIN_SIZE), now);
+        pins.resized_by_chemdraft(MAIN, (1200, 80), now);
+        let fitted = Layout {
+            size: (1200, 80),
+            ..vm()
+        };
+        assert_eq!(predicted_clamp((450, 315), (1200, 80), &SCREEN), None);
+        let kept = pins.position_to_keep(MAIN, Some((369, 315)), Some(&fitted), now);
+        assert_eq!(kept, Some((450, 315)));
+        pins.close(MAIN, kept);
+        // Reopened with the 1200-px frame: 369 is the clamp of the 1311-px frame the target had,
+        // so the saved position wins, once.
+        let closed = pins
+            .take_closed_pin(MAIN, Some((369, 315)), &fitted)
+            .unwrap();
+        pins.pin(MAIN, closed, Some(fitted.size), now);
+        assert_eq!(
+            pins.correction_due(MAIN, (369, 315), &fitted, now),
+            Some((450, 315))
+        );
+        assert!(pins
+            .take_closed_pin(MAIN, Some((369, 315)), &fitted)
+            .is_none());
+
+        // Anywhere else is still a move made while hidden.
+        pins.pin(MAIN, (450, 315), Some(MAIN_SIZE), now);
+        pins.resized_by_chemdraft(MAIN, (1200, 80), now);
+        pins.close(MAIN, Some((450, 315)));
+        assert!(pins
+            .take_closed_pin(MAIN, Some((400, 315)), &fitted)
+            .is_none());
+
+        // A record with no frame history (the saved position was not the pin's target) is judged
+        // with the live frame alone.
+        pins.pin(MAIN, (450, 315), Some(MAIN_SIZE), now);
+        pins.resized_by_chemdraft(MAIN, (1200, 80), now);
+        pins.close(MAIN, Some((300, 315)));
+        assert!(pins
+            .take_closed_pin(MAIN, Some((369, 315)), &fitted)
+            .is_none());
     }
 }

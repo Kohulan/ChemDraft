@@ -414,7 +414,7 @@ function inspectBoundedClipboardPayload(payload: ClipboardReadPayload, options: 
 
   const firstPlainText =
     textItems.find((item) => isTextLikeType(item.type)) ??
-    textItems.find((item) => !isMarkupType(item.type) && !looksLikeMarkupText(item.text));
+    textItems.find((item) => !isMarkupType(item.type));
   const svgText = payload.textItems.find((item) => looksLikeSvgDocument(item.text) ||
     ["image/svg+xml", "public.svg", "public.svg-image"].includes(item.type.trim().toLowerCase()));
   const image = payload.imageItems?.find((item) => item.type === "image/png") ?? payload.imageItems?.[0];
@@ -988,39 +988,23 @@ export function isTextLikeType(type: string): boolean {
   const normalized = type.trim().toLowerCase();
   return textLikeTypePatterns.some((pattern) => normalized === pattern.toLowerCase()) ||
     normalized.includes("plain-text") ||
-    // A MIME type may carry parameters: Linux apps publish `text/plain;charset=utf-8` and
-    // `text/plain;charset=utf-16` beside (or instead of) the bare name.
-    normalized.startsWith("text/plain;") ||
     normalized === "text";
 }
 
 /**
  * Rich-text flavors whose payload is MARKUP, not the text a person copied: `public.html`,
- * `public.rtf`, `text/richtext` (LibreOffice's second RTF flavor on Linux), WebKit's web archive.
- * Every app that publishes one also publishes a plain-text flavor, so the markup is never the best
- * reading of a clipboard — and taking it as text pastes the source, which is how a copy inside the
- * app's own WebView once pasted "<!DOCTYPE html>" into the drawing as a text box, and how a
- * LibreOffice Writer copy pasted "{\rtf1\ansi…" on Linux.
+ * `public.rtf`, WebKit's web archive. Every app that publishes one also publishes a plain-text
+ * flavor, so the markup is never the best reading of a clipboard — and taking it as text pastes
+ * the source, which is how a copy inside the app's own WebView once pasted "<!DOCTYPE html>"
+ * into the drawing as a text box.
  */
 export function isMarkupType(type: string): boolean {
   const normalized = type.trim().toLowerCase();
   return (
     normalized.includes("html") ||
     normalized.includes("rtf") ||
-    normalized.includes("richtext") ||
-    normalized === "text/enriched" ||
     /web[\s-]?archive/.test(normalized)
   );
-}
-
-/**
- * Markup sniffed from the payload itself, for flavors whose name gives no hint (an app-private
- * type that happens to carry RTF or an HTML document). Only the opening is checked: this guards
- * the plain-text fallback, it never classifies chemistry.
- */
-export function looksLikeMarkupText(text: string): boolean {
-  const head = text.trimStart().slice(0, 64).toLowerCase();
-  return head.startsWith("{\\rtf") || head.startsWith("<!doctype html") || head.startsWith("<html");
 }
 
 export function isVectorArtworkType(type: string): boolean {

@@ -3281,7 +3281,14 @@ fn restore_utility_labels<R: Runtime>(
                 None
             };
             // X11: the show below maps the palette again, and the window manager may place it anew.
-            pin_palette_for_map(app, &window, resizable, moved_to, hidden_at, "dialog-end");
+            pin_palette_for_map(
+                app,
+                &window,
+                resizable,
+                moved_to,
+                hidden_at.map(Into::into),
+                "dialog-end",
+            );
         }
         if dialog_windows::is_dialog_label(&label) {
             dialog_windows::mark_transient(&label);
@@ -3741,7 +3748,7 @@ fn close_toolset_window(
         // A palette still pinned through a map (palette_map_pin) saves its pin: its live frame may
         // be the window manager's clamp, closed before the move back landed.
         // A palette closed this way and reopened starts from that pin too, not from the clamp
-        // its hidden window may still sit at (palette_map_pin::MapPins::reopen_position).
+        // its hidden window may still sit at (palette_map_pin::MapPins::take_closed_pin).
         let native = webview.window();
         let position = visible_toolset_physical_position(&native).and_then(|live| {
             palette_position_to_keep_at(&native, Some((live.x, live.y)), pinned, now)
@@ -8144,7 +8151,7 @@ fn read_clipboard_payload_impl() -> Result<ClipboardReadPayload, String> {
         .iter()
         .map(|source| {
             let priority = clipboard_limits::text_read_priority(source);
-            let priority = if clipboard_limits::previews_text_for_chemistry(source, priority) {
+            let priority = if priority == Some(2) {
                 pasteboard
                     .dataForType(&NSString::from_str(source))
                     .as_ref()
@@ -11699,8 +11706,8 @@ fn ensure_toolset_window<R: Runtime>(
         // A palette closed while pinned (palette_map_pin) may still sit at the window manager's
         // clamp; it reopens from the position saved at the close, as long as nothing moved it
         // since. Read before the recovery, which judges that same frame.
-        let closed_at = if hidden {
-            reopen_position_for_map(&window)
+        let closed_pin = if hidden {
+            closed_pin_for_map(&window)
         } else {
             None
         };
@@ -11710,7 +11717,7 @@ fn ensure_toolset_window<R: Runtime>(
         if !palette_first_paint::reopened(&label) {
             // X11: showing a hidden palette maps it again, and the window manager may place it.
             if hidden {
-                pin_palette_for_map(app, &window, resizable, moved_to, closed_at, "reopen");
+                pin_palette_for_map(app, &window, resizable, moved_to, closed_pin, "reopen");
             }
             window.show().map_err(|error| error.to_string())?;
             if hidden {
@@ -13166,9 +13173,11 @@ impl PalettePinFrame {
 }
 
 /// Where a hidden palette that was closed while pinned should be pinned as it reopens
-/// (palette_map_pin::MapPins::reopen_position), or `None` to use its live frame as before. Only a
+/// (palette_map_pin::MapPins::take_closed_pin), or `None` to use its live frame as before. Only a
 /// palette with such a record reads the monitors, so this is `None` off Linux X11.
-fn reopen_position_for_map<R: Runtime>(window: &tauri::WebviewWindow<R>) -> Option<(i32, i32)> {
+fn closed_pin_for_map<R: Runtime>(
+    window: &tauri::WebviewWindow<R>,
+) -> Option<palette_map_pin::ClosedPin> {
     let label = window.label();
     if !palette_map_pin::with_pins(|pins| pins.was_closed_while_pinned(label)) {
         return None;
@@ -13180,7 +13189,7 @@ fn reopen_position_for_map<R: Runtime>(window: &tauri::WebviewWindow<R>) -> Opti
         .map(|position| (position.x, position.y));
     match PalettePinFrame::read(&webview.window()) {
         Some(frame) => frame.judge(|layout| {
-            palette_map_pin::with_pins(|pins| pins.reopen_position(label, live, layout))
+            palette_map_pin::with_pins(|pins| pins.take_closed_pin(label, live, layout))
         }),
         None => {
             palette_map_pin::with_pins(|pins| pins.forget(label));
@@ -13304,25 +13313,34 @@ fn pin_palette_for_map<R: Runtime>(
     window: &tauri::WebviewWindow<R>,
     resizable: bool,
     moved_to: Option<(i32, i32)>,
-    hidden_at: Option<(i32, i32)>,
+    hidden: Option<palette_map_pin::ClosedPin>,
     path: &str,
 ) {
     if resizable || !utility_window::map_replaces_position(app) {
         return;
     }
     let label = window.label();
-    let target = moved_to.or_else(|| {
-        let position = hidden_at.or_else(|| {
-            window
-                .outer_position()
-                .ok()
-                .map(|position| (position.x, position.y))
-        })?;
-        toolset_title_reachable(app, window, Some(position)).then_some(position)
-    });
+    let hidden_at = hidden.as_ref().map(|record| record.position);
+    let target = if let Some(position) = moved_to {
+        Some(
+            hidden
+                .filter(|record| record.position == position)
+                .unwrap_or_else(|| position.into()),
+        )
+    } else {
+        hidden
+            .or_else(|| {
+                window
+                    .outer_position()
+                    .ok()
+                    .map(|position| (position.x, position.y).into())
+            })
+            .filter(|target| toolset_title_reachable(app, window, Some(target.position)))
+    };
     palette_frame_log(format_args!(
         "pin label={label} path={path} moved_to={moved_to:?} hidden_at={hidden_at:?} \
-         pin={target:?}"
+         pin={:?}",
+        target.as_ref().map(|target| target.position)
     ));
     let size = window.outer_size().ok().map(|size| {
         (
@@ -18089,7 +18107,7 @@ mod tests {
         // before the recovery moves the frame), and moved back at once if shown at its clamp.
         let ensure = body("fn ensure_toolset_window<");
         let reopen = &ensure[..ensure.find("builder.build()").unwrap()];
-        let reopen_at = reopen.find("reopen_position_for_map(&window)").unwrap();
+        let reopen_at = reopen.find("closed_pin_for_map(&window)").unwrap();
         let reopen_pin = reopen.find("pin_palette_for_map(").unwrap();
         let reopen_show = reopen.find("window.show()").unwrap();
         expect_true(reopen_at < reopen.find("recover_offscreen_toolset_window(").unwrap());
