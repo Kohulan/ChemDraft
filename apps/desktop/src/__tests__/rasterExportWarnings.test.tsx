@@ -47,8 +47,28 @@ interface Decoded {
   describe: string;
 }
 
-const records = (writerOutput as { records: WriterRecord[] }).records;
 const RASTER_FORMATS: RasterFormat[] = ["png", "jpeg", "bmp", "gif", "tiff"];
+
+function isWriterRecord(value: unknown): value is WriterRecord {
+  if (typeof value !== "object" || value === null) return false;
+  if (!("format" in value) || !("background" in value) || !("width" in value) || !("height" in value)
+    || !("nativeWarningCodes" in value) || !("rustDecodedColorType" in value)
+    || !("rustDecodedCornerRgba" in value) || !("bytesBase64" in value)) return false;
+  return (value.format === "png" || value.format === "jpeg" || value.format === "bmp" || value.format === "gif" || value.format === "tiff")
+    && (value.background === "transparent" || value.background === "#ffffff")
+    && typeof value.width === "number" && typeof value.height === "number"
+    && Array.isArray(value.nativeWarningCodes) && value.nativeWarningCodes.every(code => typeof code === "string")
+    && typeof value.rustDecodedColorType === "string"
+    && Array.isArray(value.rustDecodedCornerRgba) && value.rustDecodedCornerRgba.length === 4
+    && value.rustDecodedCornerRgba.every(channel => typeof channel === "number")
+    && typeof value.bytesBase64 === "string";
+}
+
+const fixtureRecords: unknown = writerOutput.records;
+if (!Array.isArray(fixtureRecords) || !fixtureRecords.every(isWriterRecord)) {
+  throw new Error("Invalid raster writer output fixture records");
+}
+const records: WriterRecord[] = fixtureRecords;
 
 function writerBytes(format: RasterFormat, background: WireBackground): Uint8Array {
   const record = records.find(candidate => candidate.format === format && candidate.background === background);
