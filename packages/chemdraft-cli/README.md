@@ -167,8 +167,11 @@ width, background and padding do not change PDF or native saves. SVG, PNG and PD
 the first page and warn when more pages exist. `.chemdraft` retains the complete native document
 using the desktop's CDXML envelope codec, including style data the visible compatibility layer
 may approximate.
-PDF draws SVG pictures (rasterised with resvg at 300 dpi of their drawn size); one that cannot be
-rendered is skipped with a warning.
+PDF and PNG draw SVG pictures (rasterised with resvg, at 300 dpi of their drawn size in PDF); one
+that cannot be rendered is skipped with a warning. A picture is parsed as XML first and refused if it
+declares a DOCTYPE or entities, nests another SVG, or refers to anything but a fragment of itself
+or an inline PNG, JPEG, GIF or WebP, so a document opened from disk cannot make the renderer read
+files on this machine.
 
 The input read is capped at 5 MB before parsing. Limits are 100 pages, 2000 objects per page,
 500 heavy atoms per molecule, and 2000 total atoms / 4000 bonds per molecule. Output filenames

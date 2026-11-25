@@ -60,7 +60,8 @@ include the physical picture frame.
 SVG pictures are drawn in PDF through the injected `rasterizeSvgPicture` hook (300 dpi of the drawn
 size, bounded per picture and per document): the desktop app uses its webview rasteriser and
 `chemdraft-cli` uses resvg. Without a hook, or when it fails, the picture is skipped with an
-`export.pdf.svg_picture_not_drawn` warning.
+`export.pdf.svg_picture_not_drawn` warning. A PNG picture jsPDF cannot embed (a corrupt data chunk)
+is skipped with an `export.pdf.picture_not_drawn` warning rather than failing the export.
 
 Filled-ring label halos use the shared SVG composite paint (paper plus clipped ring fills).
 PDF converts that paint to a tiling pattern and applies it through a glyph soft mask, preserving

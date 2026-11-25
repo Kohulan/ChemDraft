@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { describe, expect, it, vi } from "vitest";
 import type { SvgPictureRasterRequest } from "@chemdraft/export-engine/pdf";
-import { RasterPictureMaxCount, RasterPictureMaxSidePx } from "../rasterPictureDecode";
+import { bytesToBase64, prepareRasterPictures, RasterPictureMaxCount, RasterPictureMaxSidePx, readPngSize } from "../rasterPictureDecode";
 import { picturePngBase64 } from "../testSupport/imageFixture";
 import { rasterizeEmbeddedBitmapPictures } from "./rasterEmbeddedBitmaps";
 
@@ -123,5 +123,66 @@ describe("rasterizeEmbeddedBitmapPictures", () => {
     const svg = page([...Array(RasterPictureMaxCount).fill(png), picture(dataUri(BITMAP_SVG()))]);
     expect(await rasterizeEmbeddedBitmapPictures(svg, { rasterize })).toBe(svg);
     expect(rasterize).not.toHaveBeenCalled();
+  });
+
+  describe("with the pass that decodes the PNGs next (one budget in drawing order)", () => {
+    const MiB = 1024 * 1024;
+    /** A PNG signature and IHDR declaring the size: all `prepareRasterPictures` reads before its decoder runs. */
+    const pngOfSize = (width: number, height: number) => {
+      const header = new Uint8Array(33);
+      header.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52]);
+      new DataView(header.buffer).setUint32(16, width);
+      new DataView(header.buffer).setUint32(20, height);
+      return header;
+    };
+    const decode = async (png: Uint8Array) => {
+      const size = readPngSize(png)!;
+      return { ...size, rgba: new Uint8Array(size.width * size.height * 4) };
+    };
+    const sizing = () => vi.fn(async (request: SvgPictureRasterRequest) => pngOfSize(request.pixelWidth, request.pixelHeight));
+    const pngPicture = (width: number, height: number, x: number) =>
+      `<image x="${x}" y="0" width="${width}" height="${height}" href="data:image/png;base64,${bytesToBase64(pngOfSize(width, height))}"/>`;
+    const svgPicture = (width: number, height: number, x: number) =>
+      `<image x="${x}" y="0" width="${width}" height="${height}" href="${dataUri(BITMAP_SVG())}"/>`;
+    const root = 'width="1000" height="800" viewBox="0 0 1000 800"';
+
+    it("shrinks an SVG picture to what a 384 x 512 PNG before it leaves of a 1 MiB budget, instead of having it discarded", async () => {
+      const rasterize = sizing();
+      const svg = page([pngPicture(384, 512, 0), svgPicture(400, 300, 400)], root);
+      const flattened = await rasterizeEmbeddedBitmapPictures(svg, { rasterize, budgetBytes: MiB });
+      const { pictures } = await prepareRasterPictures(flattened, { decode, budgetBytes: MiB });
+      // Both pictures reach Rust as pixels; none is refused for the budget.
+      expect(pictures.map(picture => "refused" in picture)).toEqual([false, false]);
+      const left = MiB - 384 * 512 * 4;
+      const { pixelWidth, pixelHeight } = rasterize.mock.calls[0]![0];
+      expect(pixelWidth * pixelHeight * 4).toBeLessThanOrEqual(left);
+      expect(pixelWidth * pixelHeight * 4).toBeGreaterThan(left * 0.9);
+      expect(pixelWidth).toBeLessThan(400);
+      expect(pixelWidth / pixelHeight).toBeCloseTo(400 / 300, 1);
+    });
+
+    it("sizes a PNG's charge in drawing order: a PNG after the SVG picture does not shrink it", async () => {
+      const rasterize = sizing();
+      const svg = page([svgPicture(400, 300, 0), pngPicture(384, 512, 400)], root);
+      const flattened = await rasterizeEmbeddedBitmapPictures(svg, { rasterize, budgetBytes: MiB });
+      expect(rasterize.mock.calls[0]![0]).toMatchObject({ pixelWidth: 400, pixelHeight: 300 });
+      const { pictures } = await prepareRasterPictures(flattened, { decode, budgetBytes: MiB });
+      // The SVG picture took 480000 bytes first, so the PNG (786432) no longer fits: the PNG, not the SVG, is the one refused.
+      expect(pictures.map(picture => "refused" in picture ? picture.refused : "drawn")).toEqual(["drawn", "overBudget"]);
+    });
+
+    it("does not charge a PNG the next pass refuses, or a picture whose rasterising failed", async () => {
+      const rasterize = sizing();
+      const tooBig = pngPicture(RasterPictureMaxSidePx + 1, 1, 0);
+      const svg = page([tooBig, svgPicture(400, 300, 400)], root);
+      await rasterizeEmbeddedBitmapPictures(svg, { rasterize, budgetBytes: 480000 });
+      expect(rasterize.mock.calls[0]![0]).toMatchObject({ pixelWidth: 400, pixelHeight: 300 });
+      const failing = vi.fn(async (request: SvgPictureRasterRequest) => {
+        if (failing.mock.calls.length === 1) throw new Error("no");
+        return pngOfSize(request.pixelWidth, request.pixelHeight);
+      });
+      await rasterizeEmbeddedBitmapPictures(page([svgPicture(400, 300, 0), svgPicture(200, 100, 400)], root), { rasterize: failing, budgetBytes: 480000 });
+      expect(failing.mock.calls[1]![0]).toMatchObject({ pixelWidth: 200, pixelHeight: 100 });
+    });
   });
 });

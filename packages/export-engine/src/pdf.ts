@@ -197,9 +197,12 @@ export async function exportSvgToPdf(
           pdf.addImage(png, "PNG",
             picture.x + (picture.width - width) / 2, picture.y + (picture.height - height) / 2, width, height);
         } catch (error) {
-          // A bad rasteriser result costs one picture; a bad native PNG still fails the export as before.
-          if (typeof png === "string") throw error;
-          warnings.push(svgPictureNotDrawn(picture.id, `the rasterised PNG could not be embedded (${errorReason(error)})`));
+          // A PNG jsPDF cannot embed (a bad rasteriser result, or a native PNG with a corrupt data chunk)
+          // costs that one picture, not the export.
+          warnings.push(typeof png === "string"
+            ? { code: "export.pdf.picture_not_drawn", severity: "warning", objectId: picture.id,
+              message: `PDF export: picture ${picture.id} was not drawn: the PNG could not be embedded (${errorReason(error)})` }
+            : svgPictureNotDrawn(picture.id, `the rasterised PNG could not be embedded (${errorReason(error)})`));
         }
         pdf.restoreGraphicsState();
         pdf.compatAPI();
