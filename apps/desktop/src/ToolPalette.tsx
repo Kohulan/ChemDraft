@@ -48,6 +48,7 @@ import {
   usePaletteButtonInvoke
 } from "./toolbars/toolbarCells";
 import { MainStyleWidget } from "./toolbars/mainStyleWidget";
+import { DocumentZoomControls } from "./toolbars/DocumentZoomControls";
 import { CustomColorSwatchWidget } from "./toolbars/CustomColorSwatchWidget";
 import {
   type ClearTooltipOptions,
@@ -580,6 +581,10 @@ const TOOLBAR_WIDGET_REGISTRY: Record<
     gridMode: "append" as const, className: "custom-color-palette", title: `Custom Color Swatch ${swatch}`,
     render: () => <CustomColorSwatchWidget swatch={swatch} />
   }])),
+  [TOOLBAR_WIDGET_IDS.documentZoom]: {
+    gridMode: "append", className: "document-zoom-palette", title: "Document Zoom",
+    render: () => <DocumentZoomControls />
+  },
   [TOOLBAR_WIDGET_IDS.mainStyleControls]: {
     gridMode: "append",
     className: "main-style-palette",

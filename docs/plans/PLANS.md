@@ -8,6 +8,23 @@ in progress rather than a changelog.
 
 # In flight
 
+## Molecule angle entry (`resubmit/molecule-rotation`)
+
+Adapt the requested numeric context-menu option from #183 to current main's shared canvas-menu
+model and current rigid rotation engine. Offer Rotate Molecule only for a whole native molecule;
+reuse angle entry, preview, cancel and Undo/Redo. Keep current pointer rotation and Shift/tilt
+behavior. Cover both platform settings, arbitrary angles, isotope/charge/stereo and geometry.
+Native Windows and both macOS builds remain unverified.
+
+## Main document zoom controls (`resubmit/document-zoom`)
+
+Rebuild #188 on current main. Add the customizable Main widget with Zoom Out/In and exact
+25/50/75/100/200/400% presets. Step buttons through 25/50/75/100/125/150/200/300/400/600/850%;
+keep wheel/pinch smooth. Anchor toolbar/keyboard zoom at the measured visible workspace center,
+accounting for rulers and scrollbars, and guard queued work when documents change. Broadcast only
+validated small view state to palettes. Preserve document geometry/history and current clipboard,
+assistant, text/color and menu infrastructure. Native Windows and both macOS checks remain pending.
+
 ## Native effect color picker (`resubmit/effect-color-picker`)
 
 Rebuild #180 on current main's art/text color and opening-session protocol. Route effect colors

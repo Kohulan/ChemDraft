@@ -1,5 +1,16 @@
 # Manual stress checklist
 
+Molecule angle entry: select one whole native molecule, right-click, choose Rotate molecule, and
+enter positive/negative/fractional angles and a full 360 degrees. Accept/cancel and Undo/Redo must
+preserve charge, isotopes, stereochemistry, bond lengths and internal angles. Partial selections
+must not offer whole-molecule rotation. Check native menus and input focus on Windows and both macOS builds.
+
+Document zoom controls: use Main's Zoom Out/In and each preset, check 100→125→150→200 and reverse,
+then smooth wheel/pinch and tab switching. The displayed percentage must follow the active view.
+Check center anchoring after scrolling, rulers on/off and scrollbar appearance, custom toolbar
+layouts, old-session restore and display scaling. Molecules, undo history and exported page size
+must stay unchanged. Repeat with native palettes on Windows and both macOS builds.
+
 Effect color popovers: select art or a molecule, enable Glow/Shadow/Sketch in Color Controls, then
 open Effect. The entire picker must fit in its owned window. Preview, commit, cancel and switch
 between effects, fill and text colors; only the intended target should change. Repeat at mixed
