@@ -16141,8 +16141,12 @@ function transformOtherObjectAroundPointPatches(
     ? rotatePointAround(scaledCenter, center, degrees * Math.PI / 180)
     : scaledCenter;
   const tableLayout = object.type === "table" ? planTableLayout(object) : undefined;
-  const nextWidth = tableLayout?.width ?? object.width * scaleX;
-  const nextHeight = tableLayout?.height ?? object.height * scaleY;
+  // A picture keeps its aspect ratio under any stretch (a group's Shift-resize, a numeric X/Y
+  // stretch): its frame scales by the mean factor while its centre still follows the stretch.
+  const pictureScale = object.type === "graphic" && object.graphicKind === "image"
+    ? proportionalGraphicScale(scaleX, scaleY) : undefined;
+  const nextWidth = tableLayout?.width ?? object.width * (pictureScale ?? scaleX);
+  const nextHeight = tableLayout?.height ?? object.height * (pictureScale ?? scaleY);
   const nextX = newCenter.x - nextWidth / 2;
   const nextY = newCenter.y - nextHeight / 2;
 
