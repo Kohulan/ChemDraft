@@ -19,29 +19,35 @@ function smilesHead(smiles: string): { leading: string; head: string; rest: stri
 /**
  * The nonzero atom-map numbers of a SMILES, in input order (class 0 means unmapped).
  * `drawn` is the molecule the SMILES belongs to: ChemDraft writes a drawn R2 as `[*:2]`, so a
- * dummy-atom class is that label, not a map, only when it is the same atom: a drawn atom labelled
- * Rn whose drawn neighbours are the `[*:n]` atom's neighbours in the SMILES, each drawn label
- * standing for one SMILES atom. Anything else (no drawing, another Rn, a different place) is a map.
+ * dummy-atom class is that label, not a map, but only when that reading is unambiguous: the SMILES
+ * has no unmapped dummy atom, its `[*:n]` is the only dummy numbered n, and the drawing has exactly
+ * one atom labelled Rn, with the same neighbours. Anything else is a map (a missed map is lost data;
+ * an extra notice is only noise).
  */
 export function smilesAtomMapNumbers(smiles: string, drawn?: DrawnAtoms): number[] {
   const { head } = smilesHead(smiles);
-  const graph = drawn ? smilesGraph(head) : undefined;
-  const claimed = new Set<number>();
-  return graph === undefined
-    ? [...head.matchAll(SMILES_ATOM_CLASS)].flatMap(match => Number(match[2]) > 0 ? [Number(match[2])] : [])
-    : graph.atoms.flatMap((token, index) => {
-      const match = /^\[([^[\]:\s]*):(\d+)\]$/.exec(token);
-      const value = match ? Number(match[2]) : 0;
-      if (value <= 0) return [];
-      // `[*:n]`, with the charge ChemDraft's writer may add (`[*+:n]`), and nothing else.
-      if (/^\*[+-]*\d*$/.test(match![1]!)) {
-        const neighbours = graph.neighbours(index).map(smilesAtomSymbol).filter(symbol => symbol !== "H").sort();
-        const own = drawn!.findIndex((atom, atomIndex) => !claimed.has(atomIndex) &&
-          atom.element.trim() === `R${value}` && sameList(atom.neighbours, neighbours));
-        if (own >= 0) { claimed.add(own); return []; }
-      }
-      return [value];
-    });
+  const maps = [...head.matchAll(SMILES_ATOM_CLASS)].flatMap(match => Number(match[2]) > 0 ? [Number(match[2])] : []);
+  // Reading with the drawing only ever excuses maps, so text without any needs no graph.
+  if (!drawn || maps.length === 0) return maps;
+  const drawnLabels: DrawnAtoms = drawn;
+  const graph = smilesGraph(head);
+  const classes = graph.atoms.map(token => {
+    const match = /^\[([^[\]:\s]*):(\d+)\]$/.exec(token);
+    return match ? Number(match[2]) : 0;
+  });
+  const dummies = graph.atoms.flatMap((token, index) => smilesAtomSymbol(token) === "*" ? [classes[index]!] : []);
+  const ambiguous = dummies.includes(0);
+  return graph.atoms.flatMap((token, index) => {
+    const value = classes[index]!;
+    if (value <= 0) return [];
+    // `[*:n]`, with the charge ChemDraft's writer may add (`[*+:n]`), and nothing else.
+    if (!ambiguous && /^\[\*[+-]*\d*:\d+\]$/.test(token) && dummies.filter(number => number === value).length === 1) {
+      const labels = drawnLabels.filter(atom => atom.element.trim() === `R${value}`);
+      const neighbours = graph.neighbours(index).map(smilesAtomSymbol).filter(symbol => symbol !== "H").sort();
+      if (labels.length === 1 && sameList(labels[0]!.neighbours, neighbours)) return [];
+    }
+    return [value];
+  });
 }
 
 /**
@@ -184,17 +190,31 @@ function ownRGroupAtom(
 
 /**
  * The nonzero atom-atom-mapping numbers of a molfile's atoms (V2000 `mmm` column, V3000 positional
- * aamap or `AAMAP=`). Read as the clipboard reader reads the text: a text with `M  V30` block lines
- * is V3000 whatever its counts line says (short, blank-separated from the block, or absent), and its
- * atom block is read. A V3000 atom keeps the positional map when it is nonzero (as RDKit reads it)
- * and the `AAMAP=` keyword (spaces allowed around "=") otherwise, so neither can hide the other.
+ * aamap or `AAMAP=`). Header lines never decide the format: the text is read both as V2000 and as
+ * V3000, each reading finds maps only where that reading is valid (a V2000 connection table, a
+ * V3000 atom block), and every map either reading finds is kept (a missed map is lost data; an
+ * extra notice is noise). A V3000 atom keeps the positional map when it is nonzero (as RDKit reads
+ * it) and the `AAMAP=` keyword (spaces allowed around "=") otherwise, so neither can hide the other.
  * The one exception is ChemDraft's own R-group encoding (`ownRGroupAtom`), and only in the
  * positional field. `drawn` is the molecule the molfile belongs to, when there is one.
  */
 export function molfileAtomMapNumbers(molfile: string, drawn?: DrawnAtoms): number[] {
   const lines = normalizeClipboardMolfileText(molfile).split("\n");
-  const firstBlockLine = lines.findIndex(line => /^M {2}V30(?:\s|$)/.test(line));
-  if (firstBlockLine >= 0) return v3000AtomMapNumbers(lines, firstBlockLine, drawn);
+  return mapUnion(v2000AtomMapNumbers(lines, drawn), v3000AtomMapNumbers(lines, drawn));
+}
+
+/** Every map of `first`, then each map of `second` beyond the times `first` already has it. */
+function mapUnion(first: readonly number[], second: readonly number[]): number[] {
+  const unmatched = [...first];
+  return [...first, ...second.filter(map => {
+    const index = unmatched.indexOf(map);
+    if (index < 0) return true;
+    unmatched.splice(index, 1);
+    return false;
+  })];
+}
+
+function v2000AtomMapNumbers(lines: readonly string[], drawn: DrawnAtoms | undefined): number[] {
   const counts = v2000CountsLine(lines);
   if (!counts) return [];
   const ownWriter = chemDraftProgramLine(lines[counts.index - 2]);
@@ -207,16 +227,22 @@ export function molfileAtomMapNumbers(molfile: string, drawn?: DrawnAtoms): numb
   });
 }
 
-function v3000AtomMapNumbers(lines: readonly string[], firstBlockLine: number, drawn: DrawnAtoms | undefined): number[] {
-  // The counts line is the last non-blank line before the block; the program line two above it.
-  let countsIndex = firstBlockLine - 1;
+/** A V3000 integer field as RDKit reads it: an optional sign, then digits. Anything else is 0. */
+const v3000Integer = (text: string | undefined) => /^[+-]?\d+$/.test(text ?? "") ? Number(text) : 0;
+
+function v3000AtomMapNumbers(lines: readonly string[], drawn: DrawnAtoms | undefined): number[] {
+  const blockLine = (line: string) => /^M {2}V30(?:\s|$)/.test(line);
+  if (!lines.some(blockLine)) return [];
+  // The counts line is the last non-blank line before BEGIN CTAB; the program line two above it.
+  const beginCtab = lines.findIndex(line => /^M {2}V30\s+BEGIN\s+CTAB\b/.test(line));
+  let countsIndex = beginCtab - 1;
   while (countsIndex >= 0 && blankLine(lines[countsIndex]!)) countsIndex -= 1;
-  const ownWriter = countsIndex >= 2 && chemDraftProgramLine(lines[countsIndex - 2]);
-  const maps: number[] = [];
+  const ownWriter = beginCtab >= 0 && countsIndex >= 2 && chemDraftProgramLine(lines[countsIndex - 2]);
+  const atoms: { id: string; symbol: string; value: number; keyword: boolean; rgroup: number | undefined }[] = [];
   let inAtoms = false;
   let pending = "";
-  for (const raw of lines.slice(firstBlockLine)) {
-    if (!/^M {2}V30(?:\s|$)/.test(raw)) continue;
+  for (const raw of lines) {
+    if (!blockLine(raw)) continue;
     const body = raw.replace(/^M {2}V30\s*/, "").trim();
     // A V3000 line ending in "-" continues on the next M  V30 line.
     if (body.endsWith("-")) { pending += body.slice(0, -1); continue; }
@@ -227,17 +253,22 @@ function v3000AtomMapNumbers(lines: readonly string[], firstBlockLine: number, d
     if (!inAtoms) continue;
     // index type x y z aamap [key=value ...]
     const fields = line.split(/\s+/);
-    const positional = /^\d+$/.test(fields[5] ?? "") ? Number(fields[5]) : 0;
-    const keywordText = /(?:^|\s)AAMAP\s*=\s*(\d+)/i.exec(line)?.[1];
-    const keyword = keywordText !== undefined ? Number(keywordText) : 0;
-    const value = positional > 0 ? positional : keyword;
-    if (value <= 0) continue;
+    const positional = v3000Integer(fields[5]);
+    const keywordText = /(?:^|\s)AAMAP\s*=\s*([+-]?\d+)/i.exec(line)?.[1];
     const rgroupText = /\bRGROUPS\s*=\s*\(\s*1\s+(\d+)\s*\)/i.exec(line)?.[1];
-    const own = keywordText === undefined && ownRGroupAtom(
-      ownWriter, fields[1] ?? "", value, rgroupText !== undefined ? Number(rgroupText) : undefined, Number(fields[0]), drawn);
-    if (!own) maps.push(value);
+    atoms.push({
+      id: fields[0] ?? "", symbol: fields[1] ?? "", value: positional > 0 ? positional : v3000Integer(keywordText),
+      keyword: keywordText !== undefined, rgroup: rgroupText !== undefined ? Number(rgroupText) : undefined
+    });
   }
-  return maps;
+  // ChemDraft writes atom IDs 1..n in drawn order. Any other numbering (reordered records, a second
+  // CTAB) leaves the drawn atom of a record ambiguous, so no map is excused as an R-group label.
+  const ordered = atoms.every((atom, index) => atom.id === String(index + 1));
+  return atoms.flatMap((atom, index) => {
+    if (atom.value <= 0) return [];
+    const own = ordered && !atom.keyword && ownRGroupAtom(ownWriter, atom.symbol, atom.value, atom.rgroup, index + 1, drawn);
+    return own ? [] : [atom.value];
+  });
 }
 
 /** A drawn atom of the molecule a stored source belongs to: its label and its neighbours' symbols. */
@@ -254,15 +285,20 @@ function drawnAtomSymbol(label: string): string {
 /** The molecule's drawn atoms, in order, each with its drawn neighbours' symbols (hydrogens left out). */
 export function drawnAtoms(molecule: Partial<Pick<MoleculeObject, "atoms" | "bonds">>): DrawnAtom[] {
   const atoms = molecule.atoms ?? [];
-  const byId = new Map(atoms.map(atom => [atom.id, atom]));
-  return atoms.map(atom => ({
-    element: atom.element,
-    neighbours: (molecule.bonds ?? []).flatMap(bond => {
-      const other = bond.fromAtomId === atom.id ? bond.toAtomId : bond.toAtomId === atom.id ? bond.fromAtomId : undefined;
-      const neighbour = other !== undefined ? byId.get(other) : undefined;
-      return neighbour ? [drawnAtomSymbol(neighbour.element)] : [];
-    }).filter(symbol => symbol !== "H").sort()
-  }));
+  const symbols = new Map(atoms.map(atom => [atom.id, drawnAtomSymbol(atom.element)]));
+  // One pass over the bonds (O(atoms + bonds)), not one per atom.
+  const neighbours = new Map<string, string[]>();
+  const add = (atomId: string, otherId: string) => {
+    const symbol = symbols.get(otherId);
+    if (symbol === undefined || symbol === "H") return;
+    const list = neighbours.get(atomId);
+    if (list) list.push(symbol); else neighbours.set(atomId, [symbol]);
+  };
+  for (const bond of molecule.bonds ?? []) {
+    add(bond.fromAtomId, bond.toAtomId);
+    add(bond.toAtomId, bond.fromAtomId);
+  }
+  return atoms.map(atom => ({ element: atom.element, neighbours: [...(neighbours.get(atom.id) ?? [])].sort() }));
 }
 
 const sameList = (left: readonly string[], right: readonly string[]) =>
@@ -275,16 +311,18 @@ type AtomMapSource = Pick<MoleculeObject, "structureFormat" | "structure"> &
  * Whether a molecule's stored source carries atom-map numbers ChemDraft does not keep: its source
  * structure, or the SMILES it was made from (`compatibility.unknown.smiles`). ChemDraft's own
  * spelling of a drawn Rn label is that label, not a map, only on the very atom that is the label.
+ * Each text is first read without the drawing, which can only find more maps, so a source with
+ * none (the common case) returns before the drawing is looked at.
  */
 export function moleculeSourceHasAtomMaps(molecule: AtomMapSource): boolean {
-  const drawn = molecule.atoms ? drawnAtoms(molecule) : undefined;
-  const mappedSmiles = (text: unknown) => typeof text === "string" && smilesAtomMapNumbers(text, drawn).length > 0;
-  if (typeof molecule.structure === "string" && molecule.structure.length > 0) {
-    if (molecule.structureFormat === "smiles" && mappedSmiles(molecule.structure)) return true;
-    if ((molecule.structureFormat === "molfile-v2000" || molecule.structureFormat === "molfile-v3000") &&
-        molfileAtomMapNumbers(molecule.structure, drawn).length > 0) return true;
-  }
-  return mappedSmiles(molecule.compatibility?.unknown?.smiles);
+  let drawn: DrawnAtoms | undefined;
+  const drawing = () => drawn ??= molecule.atoms ? drawnAtoms(molecule) : undefined;
+  const mapped = (read: (text: string, drawn?: DrawnAtoms) => number[], text: unknown) =>
+    typeof text === "string" && text.length > 0 && read(text).length > 0 && read(text, drawing()).length > 0;
+  const { structure, structureFormat } = molecule;
+  if (structureFormat === "smiles" && mapped(smilesAtomMapNumbers, structure)) return true;
+  if ((structureFormat === "molfile-v2000" || structureFormat === "molfile-v3000") && mapped(molfileAtomMapNumbers, structure)) return true;
+  return mapped(smilesAtomMapNumbers, molecule.compatibility?.unknown?.smiles);
 }
 
 export const ATOM_MAPS_DROPPED_EXPORT_CODE = "export.atom_maps_dropped";
@@ -350,7 +388,15 @@ function smilesGraph(head: string) {
       symbol = "";
     }
   }
-  const neighbours = (atom: number) => bonds.flatMap(bond => bond.a === atom ? [atoms[bond.b]!] : bond.b === atom ? [atoms[bond.a]!] : []);
+  let adjacency: string[][] | undefined;
+  const neighbours = (atom: number) => {
+    if (!adjacency) {
+      // Built once, on first use: O(atoms + bonds).
+      adjacency = atoms.map(() => []);
+      for (const bond of bonds) { adjacency[bond.a]!.push(atoms[bond.b]!); adjacency[bond.b]!.push(atoms[bond.a]!); }
+    }
+    return adjacency[atom]!;
+  };
   return { atoms, bonds, neighbours };
 }
 

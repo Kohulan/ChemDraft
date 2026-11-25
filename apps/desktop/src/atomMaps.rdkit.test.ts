@@ -43,12 +43,19 @@ const molfiles: [string, string][] = [
   ["V3000 positional", v3000(["M  V30 1 C 0 0 0 4", "M  V30 2 O 1.5 0 0 0"], ["M  V30 1 1 1 2"])],
   ["V3000 AAMAP=0 beside a positional map", v3000(["M  V30 1 C 0 0 0 5 AAMAP=0", "M  V30 2 O 1.5 0 0 0"], ["M  V30 1 1 1 2"])],
   ["V3000 positional and AAMAP= both nonzero", v3000(["M  V30 1 C 0 0 0 5 AAMAP=7", "M  V30 2 O 1.5 0 0 0"], ["M  V30 1 1 1 2"])],
-  ["V3000 positional split over a continuation line", v3000(["M  V30 1 C 0 0 0 -", "M  V30 6", "M  V30 2 O 1.5 0 0 0"], ["M  V30 1 1 1 2"])]
+  ["V3000 positional split over a continuation line", v3000(["M  V30 1 C 0 0 0 -", "M  V30 6", "M  V30 2 O 1.5 0 0 0"], ["M  V30 1 1 1 2"])],
+  // 1.2.3 third review.
+  ["V2000 with a bare \"M  V30\" header comment", ethanol("  2  1  0  0  0  0  0  0  0  0999 V2000", [7, 0]).replace(/^\n  Other\n/, "\n  Other\nM  V30")],
+  ["V2000 whose title is \"M  V30\"", `M  V30${ethanol("  2  1  0  0  0  0  0  0  0  0999 V2000", [7, 0])}`],
+  ["V3000 positional with a plus sign", v3000(["M  V30 1 C 0 0 0 +5", "M  V30 2 O 1.5 0 0 0"], ["M  V30 1 1 1 2"])],
+  ["V3000 positional with leading zeros", v3000(["M  V30 1 C 0 0 0 007", "M  V30 2 O 1.5 0 0 0"], ["M  V30 1 1 1 2"])],
+  ["V3000 negative positional", v3000(["M  V30 1 C 0 0 0 -5", "M  V30 2 O 1.5 0 0 0"], ["M  V30 1 1 1 2"])],
+  ["V3000 atom records out of ID order", v3000(["M  V30 2 O 1.5 0 0 0", "M  V30 1 * 0 0 0 1"], ["M  V30 1 1 1 2"])]
 ];
 
 const smiles = [
   "[CH3:1]/[CH:2]=[CH:3]/[CH3:4]", "[CH3:0]O", "[2*:7]C", "[*:2]CC", "c1cc:c([OH:9])cc1", "[13CH3:1][C@@H:2]([NH3+:3])C(=O)[O-:12]",
-  "CCO", "[CH2:1]1CC[CH2:2]C1.[Na+:7]"
+  "CCO", "[CH2:1]1CC[CH2:2]C1.[Na+:7]", "*CCOCCC[*:1]", "[*:1]CC[*:1]"
 ];
 
 /** RDKit's atom-map numbers: the classes of its own SMILES output (it writes every nonzero map). */

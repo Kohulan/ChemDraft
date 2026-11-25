@@ -1,11 +1,12 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { deserializeDocument, type MoleculeObject } from "@chemdraft/chem-core";
+import { deserializeDocument, moleculeToMolfileV2000, moleculeToMolfileV3000, type MoleculeObject } from "@chemdraft/chem-core";
 import {
   ATOM_MAPS_DROPPED_EXPORT_CODE, ATOM_MAPS_NOT_KEPT_OPEN_CODE, atomMapStereoLossMessage, atomMapsNotKeptOpenWarnings,
   molfileAtomMapNumbers, moleculeSourceHasAtomMaps, pushAtomMapsDroppedWarning, smilesAtomMapNumbers,
   smilesStereoElementCounts, stripSmilesAtomMaps
 } from "./atomMaps";
+import { tryNativeSingleBondGraphSmiles } from "./smiles";
 
 const fixture = readFileSync(new URL("../../fixtures/open-double-bonds/atom-mapped.chemdraft", import.meta.url), "utf8");
 
@@ -315,3 +316,115 @@ describe("re-review findings (1.2.3)", () => {
     expect(molfileAtomMapNumbers(starV3000.replace("  ChemDraft", "  Other"), [{ element: "R2", neighbours: ["O"] }])).toEqual([2]);
   });
 });
+
+describe("third review findings (1.2.3)", () => {
+  const atomLine = (x: number, symbol: string, map: number | string) =>
+    `${x.toFixed(4).padStart(10)}    0.0000    0.0000 ${symbol.padEnd(3)} 0  0  0  0  0  0  0  0  0${String(map).padStart(3)}  0  0`;
+  const v3000 = (atoms: readonly string[], program = "  Other") => ["", program, "", "  0  0  0     0  0            999 V3000",
+    "M  V30 BEGIN CTAB", `M  V30 COUNTS ${atoms.length} 0 0 0 0`, "M  V30 BEGIN ATOM", ...atoms, "M  V30 END ATOM",
+    "M  V30 END CTAB", "M  END"].join("\n");
+  const atom = (element: string, id = element) => ({ id, element, x: 0, y: 0, formalCharge: 0 });
+  const bond = (from: string, to: string) => ({ id: `${from}-${to}`, fromAtomId: from, toAtomId: to, order: "single" as const });
+
+  it("never lets an \"M  V30\" header line hide V2000 maps (finding 1)", () => {
+    const text = (header: readonly string[]) => [...header, "  2  1  0  0  0  0  0  0  0  0999 V2000",
+      atomLine(0, "C", 7), atomLine(1.5, "O", 0), "  1  2  1  0", "M  END"].join("\n");
+    expect(molfileAtomMapNumbers(text(["", "  Other", "M  V30"]))).toEqual([7]);
+    expect(molfileAtomMapNumbers(text(["M  V30", "  Other", ""]))).toEqual([7]);
+    expect(molfileAtomMapNumbers(text(["M  V30 BEGIN ATOM", "  Other", "M  V30 END ATOM"]))).toEqual([7]);
+    expect(molfileAtomMapNumbers(text(["", "  Other", "M  V30"]).replace("  7  0  0", "  0  0  0"))).toEqual([]);
+  });
+
+  it("reads V3000 integer fields as RDKit does: optional sign, nonzero positive is a map (finding 2)", () => {
+    expect(molfileAtomMapNumbers(v3000(["M  V30 1 C 0 0 0 +5", "M  V30 2 O 1.5 0 0 0"]))).toEqual([5]);
+    expect(molfileAtomMapNumbers(v3000(["M  V30 1 C 0 0 0 007"]))).toEqual([7]);
+    expect(molfileAtomMapNumbers(v3000(["M  V30 1 C 0 0 0 -5"]))).toEqual([]);
+    expect(molfileAtomMapNumbers(v3000(["M  V30 1 C 0 0 0 +0"]))).toEqual([]);
+    // The clipboard-reader keyword takes the same integers (RDKit ignores AAMAP=; reporting is the safe side).
+    expect(molfileAtomMapNumbers(v3000(["M  V30 1 C 0 0 0 0 AAMAP=+6"]))).toEqual([6]);
+    expect(molfileAtomMapNumbers(v3000(["M  V30 1 C 0 0 0 -5 AAMAP=6"]))).toEqual([6]);
+    expect(molfileAtomMapNumbers(v3000(["M  V30 1 C 0 0 0 0 AAMAP=-6"]))).toEqual([]);
+  });
+
+  it("excuses a SMILES [*:n] as a drawn Rn only when that reading is unambiguous (finding 3)", () => {
+    // Drawn R1-C-C-O-C-C-C-*: the real [*:1] is on the right; the drawn R1 is the left end.
+    const ids = ["R1", "c1", "c2", "o", "c3", "c4", "c5", "star"];
+    const elements = ["R1", "C", "C", "O", "C", "C", "C", "*"];
+    const drawn = { atoms: ids.map((id, index) => atom(elements[index]!, id)),
+      bonds: ids.slice(1).map((id, index) => bond(ids[index]!, id)) };
+    expect(moleculeSourceHasAtomMaps({ structureFormat: "smiles", structure: "*CCOCCC[*:1]", ...drawn })).toBe(true);
+    expect(moleculeSourceHasAtomMaps({ structureFormat: "smiles", structure: "[*]CCOCCC[*:1]", ...drawn })).toBe(true);
+    // The same number on two dummies, or two drawn R1 labels: ambiguous, so reported.
+    const r1 = { atoms: [atom("R1"), atom("C", "c1"), atom("C", "c2")], bonds: [bond("R1", "c1"), bond("c1", "c2")] };
+    expect(moleculeSourceHasAtomMaps({ structureFormat: "smiles", structure: "[*:1]CC[*:1]", ...r1 })).toBe(true);
+    expect(moleculeSourceHasAtomMaps({ structureFormat: "smiles", structure: "[*:1]CC",
+      atoms: [atom("R1"), atom("C", "c1"), atom("R1", "r1b")], bonds: [bond("R1", "c1"), bond("c1", "r1b")] })).toBe(true);
+    // A real map elsewhere is reported even when the [*:1] is excused.
+    expect(smilesAtomMapNumbers("[*:1]C[CH3:4]", [{ element: "R1", neighbours: ["C"] }, { element: "C", neighbours: ["*", "C"] },
+      { element: "C", neighbours: ["C"] }])).toEqual([4]);
+    // The plain case stays excused.
+    expect(moleculeSourceHasAtomMaps({ structureFormat: "smiles", structure: "[*:1]CC", ...r1 })).toBe(false);
+  });
+
+  it("keeps ChemDraft's own R-group round trip free of warnings (finding 3)", () => {
+    const molecule = { ...r1Molecule(), structureFormat: "smiles" as const, structure: "" };
+    const written = tryNativeSingleBondGraphSmiles(molecule.atoms, molecule.bonds);
+    expect(written).toEqual({ smiles: expect.stringContaining("[*:1]") });
+    const smiles = (written as { smiles: string }).smiles;
+    expect(moleculeSourceHasAtomMaps({ ...molecule, structure: smiles })).toBe(false);
+    for (const [format, write] of [["molfile-v2000", moleculeToMolfileV2000], ["molfile-v3000", moleculeToMolfileV3000]] as const) {
+      for (const abbreviations of ["dummy", "rgroup"] as const) {
+        const molfile = write(molecule as unknown as MoleculeObject, { fromDocFrame: true, abbreviations, kekuleBondOrders: new Map() }).contents;
+        // Without the drawing the R1 is unexplained, so it reads as a map; with it, as the label.
+        expect(molfileAtomMapNumbers(molfile)).toEqual(abbreviations === "dummy" ? [1] : []);
+        expect(moleculeSourceHasAtomMaps({ ...molecule, structureFormat: format, structure: molfile })).toBe(false);
+      }
+    }
+  });
+
+  it("ties a V3000 record to the drawn atom by its place in the atom block, not its ID (finding 3)", () => {
+    const ordered = v3000(["M  V30 1 * 0 0 0 1", "M  V30 2 O 1.5 0 0 0"], "  ChemDraft");
+    expect(molfileAtomMapNumbers(ordered, [{ element: "R1", neighbours: ["O"] }, { element: "O", neighbours: ["*"] }])).toEqual([]);
+    // Records out of order: ID 1 is the second record. Neither reading of the drawn order is trusted.
+    const reordered = v3000(["M  V30 2 O 1.5 0 0 0", "M  V30 1 * 0 0 0 1"], "  ChemDraft");
+    expect(molfileAtomMapNumbers(reordered, [{ element: "R1", neighbours: ["O"] }, { element: "O", neighbours: ["*"] }])).toEqual([1]);
+    expect(molfileAtomMapNumbers(reordered, [{ element: "O", neighbours: ["*"] }, { element: "R1", neighbours: ["O"] }])).toEqual([1]);
+    // IDs that skip a number are not 1..n either.
+    const gapped = v3000(["M  V30 1 * 0 0 0 1", "M  V30 3 O 1.5 0 0 0"], "  ChemDraft");
+    expect(molfileAtomMapNumbers(gapped, [{ element: "R1", neighbours: ["O"] }, { element: "O", neighbours: ["*"] }])).toEqual([1]);
+  });
+
+  it("checks a large unmapped molecule in well under 100 ms (finding 5)", () => {
+    const count = 20_000;
+    const atoms = Array.from({ length: count }, (_, index) => ({ ...atom("C", `a${index}`), x: index * 1.5 }));
+    const bonds = atoms.slice(1).map((current, index) => bond(atoms[index]!.id, current.id));
+    const molfile = ["", "  Other", "", `${String(count).padStart(3)}${String(count - 1).padStart(3)}  0  0  0  0  0  0  0  0999 V2000`,
+      ...atoms.map((_, index) => atomLine(index * 1.5, "C", 0)),
+      ...bonds.map((_, index) => `${String(index + 1).padStart(3)}${String(index + 2).padStart(3)}  1  0`), "M  END"].join("\n");
+    const sources = [
+      { structureFormat: "smiles" as const, structure: "" },
+      { structureFormat: "smiles" as const, structure: "C".repeat(count) },
+      { structureFormat: "molfile-v2000" as const, structure: molfile },
+      { structureFormat: "smiles" as const, structure: "", compatibility: { sourceFormat: "smiles" as const, warnings: [], unknown: { smiles: "C".repeat(count) } } }
+    ];
+    for (const source of sources) {
+      const started = performance.now();
+      expect(moleculeSourceHasAtomMaps({ ...source, atoms, bonds })).toBe(false);
+      expect(performance.now() - started).toBeLessThan(100);
+    }
+    // A mapped source still reads the drawing, once, in linear time.
+    const withR1 = [{ ...atom("R1"), x: -1.5 }, ...atoms];
+    const started = performance.now();
+    expect(moleculeSourceHasAtomMaps({ structureFormat: "smiles", structure: `[*:1]${"C".repeat(count)}`,
+      atoms: withR1, bonds: [bond("R1", "a0"), ...bonds] })).toBe(false);
+    expect(performance.now() - started).toBeLessThan(100);
+  });
+});
+
+function r1Molecule() {
+  const atom = (element: string, id: string, x: number) => ({ id, element, x, y: 0, formalCharge: 0 });
+  return {
+    atoms: [atom("R1", "r1", 0), atom("C", "c1", 20), atom("C", "c2", 40), atom("O", "o", 60)],
+    bonds: [["r1", "c1"], ["c1", "c2"], ["c2", "o"]].map(([from, to]) => ({ id: `${from}-${to}`, fromAtomId: from!, toAtomId: to!, order: "single" as const }))
+  };
+}
