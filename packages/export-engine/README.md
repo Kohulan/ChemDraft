@@ -57,6 +57,11 @@ the surrounding layout. Explicit SVG pixel dimensions (without `outputUnit`) sca
 the whole page for raster sampling and previews. Document-style SVG crops expand when needed to
 include the physical picture frame.
 
+SVG pictures are drawn in PDF through the injected `rasterizeSvgPicture` hook (300 dpi of the drawn
+size, bounded per picture and per document): the desktop app uses its webview rasteriser and
+`chemdraft-cli` uses resvg. Without a hook, or when it fails, the picture is skipped with an
+`export.pdf.svg_picture_not_drawn` warning.
+
 Filled-ring label halos use the shared SVG composite paint (paper plus clipped ring fills).
 PDF converts that paint to a tiling pattern and applies it through a glyph soft mask, preserving
 gradients and opacity without a white outline. These documents use PDF 1.4 transparency; unfilled

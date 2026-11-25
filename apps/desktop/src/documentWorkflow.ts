@@ -21018,6 +21018,19 @@ function applyEditorV3000SaveKeepingElectronMarks(
  */
 const nativeSavePayloadCache = new WeakMap<ChemDraftDocument, NativeSavePayload>();
 
+/**
+ * The CDXML writer warns that a picture is kept only in the embedded ChemDraft data, because another
+ * program opening a CDXML or CDX will not show it. A `.chemdraft` file is the embedded data, so the
+ * picture is not lost there and the warning would be noise on every save. A picture with no data
+ * still warns: nothing of it is saved. Save As and Export CDXML or CDX keep the warning.
+ */
+function isPictureKeptByNativePayload(document: ChemDraftDocument, warning: { code: string; sourceObjectId?: string }): boolean {
+  if (warning.code !== "cdxml.picture_not_saved") return false;
+  return document.pages.some((page) => page.objects.some((object) => object.id === warning.sourceObjectId
+    && object.type === "graphic" && object.graphicKind === "image"
+    && (object.data.image !== undefined || object.data.imageHref !== undefined)));
+}
+
 export function createNativeSavePayload(document: ChemDraftDocument): NativeSavePayload {
   const cached = nativeSavePayloadCache.get(document);
   if (cached) {
@@ -21030,7 +21043,7 @@ export function createNativeSavePayload(document: ChemDraftDocument): NativeSave
     contents: result.contents,
     warnings: [
       ...nativeDocumentExportWarnings(document).map(({ code, message, objectId }) => ({ code, message, sourceObjectId: objectId })),
-      ...result.warnings
+      ...result.warnings.filter((warning) => !isPictureKeptByNativePayload(document, warning))
     ],
     // The embedded native document's hash, already computed by the export: hashing the whole
     // envelope again cost ~190 ms per autosave on a large page.
@@ -21699,11 +21712,15 @@ export async function exportPhase4Svg(
 
 export async function exportPhase4Pdf(
   document: ChemDraftDocument,
-  options: Pick<PdfExportOptions, "compress" | "includePageGuides" | "pageIndex" | "outputWidth" | "outputHeight" | "directElectronMarkEditing"> = {}
+  options: Pick<PdfExportOptions, "compress" | "includePageGuides" | "pageIndex" | "outputWidth" | "outputHeight" | "directElectronMarkEditing" | "rasterizeSvgPicture"> = {}
 ): Promise<BinaryExportResult> {
   const { exportDocumentToPdf } = await import("@chemdraft/export-engine/pdf");
   return exportDocumentToPdf(document, { ...options,
-    directElectronMarkEditing: options.directElectronMarkEditing ?? loadDirectElectronMarkEditing() });
+    directElectronMarkEditing: options.directElectronMarkEditing ?? loadDirectElectronMarkEditing(),
+    // Loaded on the first SVG picture only. Without a DOM (Node tests, the CLI) it throws, and the
+    // export skips that picture with a warning rather than failing.
+    rasterizeSvgPicture: options.rasterizeSvgPicture ?? (async (picture) =>
+      (await import("./svgPicture/svgPictureRaster")).rasterizeSvgPicture(picture)) });
 }
 
 export function chemistryMetadataFromAnalysis(result: StructureAnalysisResult): ChemicalMetadata {

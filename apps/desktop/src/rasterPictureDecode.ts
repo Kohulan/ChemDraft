@@ -10,6 +10,9 @@
  * copy made through `<use>` or `<feImage>`, but parses each copy's href afresh, so the copy still
  * names its picture and Rust can report exactly which pictures have copies it could not draw.
  *
+ * SVG pictures that embed a bitmap reach this module as PNGs: `svgPicture/rasterEmbeddedBitmaps.ts`
+ * rasterises them first, so they take the same path. Pure-vector SVG pictures draw natively.
+ *
  * Limits, enforced before decoding and re-checked in Rust: 16384 px a side, 256 MiB of decoded
  * pixels (width × height × 4) across one export call, and 1024 pictures per call. A picture over a
  * limit, or one that fails to decode, is not drawn; Rust reports it with a warning naming the reason.
