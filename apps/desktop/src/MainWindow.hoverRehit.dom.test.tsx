@@ -170,6 +170,27 @@ describe.each(["windows", "macos"] as const)("hover re-hit (%s shortcuts)", plat
     expect(molecule().atoms[0]?.element).toBe("Br");
   });
 
+  it.each([
+    { name: "a literal +", init: { key: "+", code: "Equal", shiftKey: true } },
+    { name: "Shift+= reported as \"=\"", init: { key: "=", code: "Equal", shiftKey: true } }
+  ])("routes $name bound to an atom label over a bond to the nearer atom", async ({ init }) => {
+    saveKeybindingSettings({ scheme: "chemdraft", overrides: { chemdraft: { atom: {
+      "atom.setHoveredElement.F": ["+"], "atom.addPositiveChargeToHoveredAtom": []
+    } } } });
+    await mount();
+    const bond = molecule().bonds[0]!;
+    const from = molecule().atoms.find(atom => atom.id === bond.fromAtomId)!;
+    const to = molecule().atoms.find(atom => atom.id === bond.toAtomId)!;
+    await pointer("pointermove", { x: from.x + (to.x - from.x) * 0.56, y: from.y + (to.y - from.y) * 0.56 });
+    expect(snapshot().hoveredNativeTarget).toMatchObject({ kind: "bond", bondId: bond.id });
+    await act(async () => {
+      (document.activeElement ?? document.body).dispatchEvent(new KeyboardEvent("keydown", { ...init, bubbles: true, cancelable: true }));
+    });
+    expect(molecule().atoms.find(atom => atom.id === to.id)?.element).toBe("F");
+    expect(molecule().atoms.find(atom => atom.id === from.id)?.element).toBe("C");
+    expect(snapshot().activeToolCommandId).toBe("tool.bond");
+  });
+
   it("keeps default-preset element-key label continuation on the same atom", async () => {
     await mount();
     const atom = molecule().atoms[0]!;

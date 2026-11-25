@@ -1,10 +1,10 @@
-import { editShortcut, normalizeShortcut, parseShortcutDisplay } from "@chemdraft/shortcut-engine";
+import { editShortcut, normalizeShortcut, parseShortcutDisplay, resolveHoverKey } from "@chemdraft/shortcut-engine";
 import { describe, expect, it } from "vitest";
 import { buildAppMenuModel, flattenAppMenuCommands } from "./appMenu";
 import { createLayerActions, createQuickActions } from "./commands";
 import { createPhase4Document } from "./documentWorkflow";
 import { withStandaloneDrawingToolCommands } from "./drawingTools";
-import { keyboardShortcutActions, nativeMenuShortcutOverrides } from "./customKeyboardShortcuts";
+import { capturedShortcut, keyboardShortcutActions, nativeMenuShortcutOverrides } from "./customKeyboardShortcuts";
 import { applyKeybindingSchemeToCommands, createHoverShortcutTables } from "./keybindingScheme";
 import { DEFAULT_KEYBINDING_SETTINGS, LEGACY_DEFAULT_KEYBINDING_SCHEME } from "./keybindingSettings";
 import {
@@ -188,6 +188,72 @@ describe.each(["windows", "macos"] as const)("custom keyboard shortcuts (%s)", p
     expect(hover.atom.get("B")).toBe(boron.id);
     const cleared = editShortcut(actions, overrides, save, { kind: "clear" }, platform);
     expect(cleared.kind === "updated" && nativeMenuShortcutOverrides(cleared.overrides, platform)).toEqual({ [save.id]: null });
+  });
+
+  // + and - each name a hover charge command and, in the ChemDraft scheme, a charge tool. The
+  // pairs are intended (hover acts on the atom; no hover picks the tool), so the Preferences conflict
+  // check must treat + exactly as it treats -: the shipped defaults overlap silently, and binding
+  // either key again reports the same one-row conflict. Shift on + must not make it a different chord.
+  it("treats the hover +/- charge keys and the charge tools as the same intended pairs", () => {
+    const actions = keyboardShortcutActions("chemdraft", platform);
+    const pairs = [
+      { hover: "atom.addPositiveChargeToHoveredAtom", tool: "tool.plus", key: "+" },
+      { hover: "atom.addNegativeChargeToHoveredAtom", tool: "tool.minus", key: "-" }
+    ];
+    const outcome = (id: string, scope: "atom" | "commands", edit: Parameters<typeof editShortcut>[3]) => {
+      const action = actions.find(candidate => candidate.id === id && candidate.scope === scope)!;
+      const result = editShortcut(actions, {}, action, edit, platform);
+      return result.kind === "conflict" ? { kind: result.kind, with: result.actions.map(other => other.id) } : { kind: result.kind };
+    };
+    const results = pairs.map(({ hover, tool, key }) => {
+      expect(actions.find(action => action.id === hover)).toMatchObject({ scope: "atom", defaults: [key] });
+      expect(actions.find(action => action.id === tool)).toMatchObject({ scope: "commands", defaults: [key] });
+      return {
+        resetHover: outcome(hover, "atom", { kind: "reset" }),
+        resetTool: outcome(tool, "commands", { kind: "reset" }),
+        assignHover: outcome(hover, "atom", { kind: "assign", key }),
+        assignTool: outcome(tool, "commands", { kind: "assign", key })
+      };
+    });
+    expect(results[0]).toEqual({
+      resetHover: { kind: "updated" }, resetTool: { kind: "updated" },
+      assignHover: { kind: "conflict", with: ["tool.plus"] },
+      assignTool: { kind: "conflict", with: ["atom.addPositiveChargeToHoveredAtom"] }
+    });
+    expect(results[1]).toEqual({
+      resetHover: { kind: "updated" }, resetTool: { kind: "updated" },
+      assignHover: { kind: "conflict", with: ["tool.minus"] },
+      assignTool: { kind: "conflict", with: ["atom.addNegativeChargeToHoveredAtom"] }
+    });
+    // Both live tables still hold both keys: the hover table literally, the window registry by chord.
+    const hover = createHoverShortcutTables("chemdraft");
+    expect(hover.atom.get("+")).toBe("atom.addPositiveChargeToHoveredAtom");
+    expect(hover.atom.get("-")).toBe("atom.addNegativeChargeToHoveredAtom");
+    const document = createPhase4Document("Charge keys");
+    const registry = createDesktopShortcutRegistry(createMainWindowShortcutCommands({
+      quickActions: createQuickActions(document, undefined),
+      layerActions: createLayerActions(document),
+      toolCommandSpecs: withStandaloneDrawingToolCommands(getToolsetCommandSpecs())
+    }, "chemdraft", undefined, platform), { platform });
+    expect(registry.resolve({ key: "+", code: "Equal", shiftKey: true })).toBe("tool.plus");
+    expect(registry.resolve({ key: "+", code: "NumpadAdd" })).toBe("tool.plus");
+    expect(registry.resolve({ key: "-", code: "Minus" })).toBe("tool.minus");
+    // Shift+= reported as "=" (some macOS input paths): the window registry folds it into the tool's
+    // + chord, so with nothing hovered it picks the tool; the hover lookup reads the same press as
+    // the hover table's literal "+", so over an atom the hover action wins.
+    const shiftedEqual = { key: "=", code: "Equal", shiftKey: true };
+    expect(registry.resolve(shiftedEqual)).toBe("tool.plus");
+    expect(resolveHoverKey(shiftedEqual, key => hover.atom.get(key)))
+      .toEqual({ key: "+", match: "atom.addPositiveChargeToHoveredAtom" });
+    expect(resolveHoverKey({ key: "=", code: "Equal" }, key => hover.atom.get(key)).match).toBeUndefined();
+  });
+
+  it("records Shift+= as + for a hover action, however the press reports it", () => {
+    const press = (init: { key: string; code: string; shiftKey?: boolean }) =>
+      ({ ctrlKey: false, altKey: false, metaKey: false, shiftKey: false, ...init }) as KeyboardEvent;
+    expect(capturedShortcut("Shift+=", press({ key: "=", code: "Equal", shiftKey: true }), "atom", platform)).toEqual({ key: "+" });
+    expect(capturedShortcut("Shift+=", press({ key: "+", code: "Equal", shiftKey: true }), "atom", platform)).toEqual({ key: "+" });
+    expect(capturedShortcut("=", press({ key: "=", code: "Equal" }), "atom", platform)).toEqual({ key: "=" });
   });
 
   it("includes and clears the Windows redo alternate with its action", () => {
