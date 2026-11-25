@@ -2216,11 +2216,14 @@ pub(crate) async fn dialog_send(
             if message.dialog_kind == "about" && message.data["action"] == "copyVersion" {
                 // Copy only these fields from the trusted owner snapshot. No host-supplied text
                 // reaches the system clipboard, and copying does not reserve a terminal action.
+                // The version is copied as the About box shows it ("1.2.3β" on Linux).
                 let text = format!(
                     "ChemDraft {} (build {})",
-                    session.snapshot.data["version"]
-                        .as_str()
-                        .unwrap_or_default(),
+                    super::display_version(
+                        session.snapshot.data["version"]
+                            .as_str()
+                            .unwrap_or_default()
+                    ),
                     session.snapshot.data["buildStamp"]
                         .as_str()
                         .unwrap_or_default()
