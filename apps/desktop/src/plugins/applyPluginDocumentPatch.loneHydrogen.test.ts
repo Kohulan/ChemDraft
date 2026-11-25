@@ -1,8 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createEmptyDocument, moleculeToMolfileV2000, moleculeToMolfileV3000, type MoleculeAtom, type MoleculeBond, type MoleculeObject } from "@chemdraft/chem-core";
+import {
+  createEmptyDocument, moleculeToMolfileV2000, moleculeToMolfileV3000, type BracketObject, type MoleculeAtom, type MoleculeBond, type MoleculeObject
+} from "@chemdraft/chem-core";
 import { ProposedDocumentPatchSchema } from "@chemdraft/plugin-api";
 import { rebasePluginPatch } from "@chemdraft/plugin-host";
-import { normalizeCommittedDocument, refreshNativeSingleBondGraph, type ImpliedRadicalRefreshTarget } from "../documentWorkflow";
+import {
+  impliedRadicalCacheDeclinedLine, normalizeCommittedDocument, refreshNativeSingleBondGraph, type ImpliedRadicalRefreshTarget
+} from "../documentWorkflow";
 import {
   applyAcceptedPluginProposal, applyPluginDocumentPatch, rebaseProposedInsertion, refreshPluginPatchChemistry
 } from "./applyPluginDocumentPatch";
@@ -202,6 +206,48 @@ describe("verifying a plugin insert of a lone H's cache", () => {
     expect(warn).not.toHaveBeenCalled();
   }, 60_000);
 
+  // A repeat-unit bracket pair ("n") inserted around the molecule in the same write: chem-core notes on
+  // the molecule's record that its values are for one drawn copy (`chemistry.bracket_multiplier`), and
+  // the H2 reading's record is compared with that note on it too.
+  const BRACKET_NOTE = "chemistry.bracket_multiplier";
+  const repeatUnitPair = (moleculeId: string): BracketObject[] => {
+    const open: BracketObject = { id: "open", type: "bracket", x: 270, y: 260, width: 8, height: 70, rotation: 0, style: {},
+      bracketKind: "square", side: "open", pairId: "pair", repeatUnit: true, containedObjectIds: [moleculeId] };
+    return [open, { ...open, id: "close", x: 360, side: "close", label: "n" }];
+  };
+  it.each([false, true])("refreshes a CC.[HH] cache inserted inside a repeat-unit bracket pair as release/1.2.3 did, and the verifier accepts it (accepted: %s)", async (accepted) => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const stored = ethane();
+    const before = createEmptyDocument();
+    const pageId = before.pages[0]!.id;
+    const patch = ProposedDocumentPatchSchema.parse({ reason: "Insert structure", patch: { op: "batch",
+      patches: [stored, ...repeatUnitPair(stored.id)].map((object) => ({ op: "addObject", pageId, object })) } });
+    const applied = (accepted ? applyAcceptedPluginProposal : applyPluginDocumentPatch)(before, patch);
+    const authored = accepted ? rebaseProposedInsertion(before, patch) : rebasePluginPatch(before, patch);
+    const molecule = (document: typeof before) =>
+      document.pages[0]!.objects.find((candidate): candidate is MoleculeObject => candidate.type === "molecule")!;
+    const inserted = molecule(applied.document);
+    expect(applied.warnings).toEqual([]);
+    expect(inserted.structure).toBe("CC.[H]");
+    expect(inserted.chemistry?.radicalCount).toBe(1);
+    // Release/1.2.3's record, with the page's own note kept on it.
+    const notes = inserted.chemistry!.warnings.filter((warning) => warning.code === BRACKET_NOTE);
+    expect(notes).toHaveLength(1);
+    expect(notes[0]!.message).toContain("repeat unit n");
+    const at123 = refreshedAt123(stored);
+    expect({ structureFormat: inserted.structureFormat, structure: inserted.structure,
+      chemistry: { ...inserted.chemistry!, warnings: inserted.chemistry!.warnings.filter((warning) => warning.code !== BRACKET_NOTE) } })
+      .toEqual(at123);
+    expect(inserted.atoms).toEqual(stored.atoms);
+    // The commit's verification accepts it, as release/1.2.3's did.
+    const normalized = normalizeCommittedDocument(applied.document);
+    const committed = molecule((await refreshPluginPatchChemistry(before, normalized, authored)) ?? normalized);
+    expect(committed.structure).toBe("CC.[H]");
+    expect(committed.chemistry?.formula).toBe("C2H7");
+    expect(committed.chemistry?.radicalCount).toBe(1);
+    expect(warn).not.toHaveBeenCalled();
+  }, 60_000);
+
   it.each([false, true])("refreshes a bonded H2 beside a lone D ([2HH].[H][H]) and its cached copy, with no warning (accepted: %s)", async (accepted) => {
     const stored = moleculeOf("h2d", [atom("h1", "H", 300), atom("h2", "H", 314), atom("d", "D", 350)], [bond("hh", "h1", "h2")],
       "[2HH].[H][H]", record("H3D", 5.038, 5.03758, 3, 1, { isotopeLabels: ["2H"] }), { warnings: [], unknown: { smiles: "[2HH].[H][H]" } });
@@ -226,6 +272,8 @@ describe("verifying a plugin insert of a lone H's cache", () => {
     expect(applied.warnings[0]).toContain('molecule "wedged"');
     expect(applied.warnings[0]).toContain("not ChemDraft's own earlier output");
     expect(applied.warnings[0]).toContain("was not refreshed");
+    // In the words a paste names its kept molecules with.
+    expect(applied.warnings[0]).toBe(impliedRadicalCacheDeclinedLine("wedged"));
     expect(cacheOf(inserted())).toEqual(cacheOf(stored));
     expect(warn).toHaveBeenCalledTimes(1);
     expect(String(warn.mock.calls[0]![0])).toContain("on plugin insert");

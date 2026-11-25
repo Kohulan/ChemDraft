@@ -1,8 +1,9 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   admitParsedDocument, applyPatch, createEmptyDocument, serializeDocument,
-  type ChemDraftDocument, type MoleculeAtom, type MoleculeBond, type MoleculeObject
+  type BracketObject, type ChemDraftDocument, type DocumentObject, type MoleculeAtom, type MoleculeBond, type MoleculeObject
 } from "@chemdraft/chem-core";
+import { nativeSingleBondGraphMetadata } from "@chemdraft/document-workflow-core";
 import { ensureRdkit } from "@chemdraft/rdkit-adapter";
 import { installNodeRdkitModuleLoader } from "@chemdraft/rdkit-adapter/node";
 import { buildDocumentSessionEnvelope, parseDocumentSessionEnvelope } from "./documentSession";
@@ -23,24 +24,24 @@ beforeAll(() => {
 const atom = (id: string, element: string, x: number, y = 0): MoleculeAtom => ({ id, element, x, y, formalCharge: 0 });
 const bond = (id: string, fromAtomId: string, toAtomId: string, order: MoleculeBond["order"] = "single",
   display?: MoleculeBond["display"]): MoleculeBond => ({ id, fromAtomId, toAtomId, order, ...(display ? { display } : {}) });
-const documentOf = (objects: MoleculeObject[]): ChemDraftDocument => {
+const documentOf = (objects: DocumentObject[]): ChemDraftDocument => {
   const base = createEmptyDocument();
   return { ...base, pages: [{ ...base.pages[0]!, objects }] };
 };
 /** File > Open: read, then the commit MainWindow's `resetDocumentHistory` makes. */
-const openRead = (objects: MoleculeObject[]) => workflow.openNativeDocument(serializeDocument(documentOf(objects)));
+const openRead = (objects: DocumentObject[]) => workflow.openNativeDocument(serializeDocument(documentOf(objects)));
 /** Autosave's session envelope for `objects`, with any saved report metadata, parsed as MainWindow's restore does. */
-const restoredSession = (objects: MoleculeObject[], metadata: object = {}) => {
+const restoredSession = (objects: DocumentObject[], metadata: object = {}) => {
   const payload = workflow.createNativeSavePayload(admitParsedDocument(documentOf(objects)));
   const envelope = buildDocumentSessionEnvelope(payload, { dirty: true }, "Untitled", false);
   return parseDocumentSessionEnvelope(JSON.parse(JSON.stringify({ ...envelope, ...metadata })) as unknown, true)!;
 };
 /** Session restore: autosave's envelope, parsed and read as MainWindow's restore does. */
-const restoreRead = (objects: MoleculeObject[]) => workflow.openNativeDocument(restoredSession(objects).contents);
+const restoreRead = (objects: DocumentObject[]) => workflow.openNativeDocument(restoredSession(objects).contents);
 const committed = (read: ReturnType<typeof workflow.openNativeDocument> | ChemDraftDocument) =>
   workflow.normalizeCommittedDocument(admitParsedDocument("source" in read ? read.document! : read), { preserveElectronMarks: true });
 /** A native ChemDraft clipboard paste of `objects`, copied from a document holding them. */
-const pasted = (objects: MoleculeObject[], warningsOut?: string[]) => {
+const pasted = (objects: DocumentObject[], warningsOut?: string[]) => {
   let source: ChemDraftDocument = admitParsedDocument(documentOf(objects));
   source = applyPatch(source, { op: "setSelection", pageId: source.pages[0]!.id, objectIds: objects.map((object) => object.id) });
   const payload = workflow.createSelectionClipboardPayload(source)!;
@@ -143,6 +144,37 @@ const lowercasePartneredRecord = (partnered: string[]) => {
     [...lowercaseBonds, ...partnered.map((id, index) => bond(`pair${index}`, id, `partner${index}`))]);
   return { ...derived.chemistry!, atomCount: lowercaseAtoms.length, bondCount: lowercaseBonds.length };
 };
+
+// A repeat-unit bracket pair ("n") around a molecule: chem-core notes on the molecule's chemistry record,
+// on every read and commit, that its values are for one drawn copy (`chemistry.bracket_multiplier`).
+const repeatUnitPair = (moleculeId: string): BracketObject[] => {
+  const open: BracketObject = { id: "open", type: "bracket", x: -20, y: -30, width: 10, height: 60, rotation: 0, style: {},
+    bracketKind: "square", side: "open", pairId: "pair", repeatUnit: true, containedObjectIds: [moleculeId] };
+  return [open, { ...open, id: "close", x: 70, side: "close", label: "n" }];
+};
+const BRACKET_NOTE = "chemistry.bracket_multiplier";
+const bracketNotes = (molecule: MoleculeObject) => molecule.chemistry?.warnings.filter((warning) => warning.code === BRACKET_NOTE) ?? [];
+const withoutBracketNotes = (molecule: MoleculeObject) => molecule.chemistry &&
+  { ...molecule.chemistry, warnings: molecule.chemistry.warnings.filter((warning) => warning.code !== BRACKET_NOTE) };
+
+// Two lone H atoms, the first stating one hydrogen of its own (hydrogenCount 1): a count nothing counts
+// on a hydrogen atom (chem-core `atomIgnoresStatedHydrogenCount`), so the validator writes a diagnostic
+// about that atom, naming the count it derives. Today, and from e7ef3bc68 on, a hydrogen atom derives
+// none ("... SMILES count 0."); the H2 reading's writer derived one for it ("... SMILES count 1.").
+const statedAtoms = [{ ...atom("h1", "H", 0), hydrogenCount: 1 }, atom("h2", "H", 40)];
+const stated = (id: string, structure: string, chemistry: MoleculeObject["chemistry"], compatibility?: MoleculeObject["compatibility"]) =>
+  moleculeOf(id, statedAtoms, [], "smiles", structure, chemistry, compatibility);
+/** Today's record for the drawing: "[H].[H]", H2, two radicals, and the diagnostic about h1 ending "SMILES count 0.". */
+const statedToday = () => workflow.refreshNativeSingleBondGraph(stated("p", "", undefined), statedAtoms, []).chemistry!;
+/**
+ * The H2 reading's formula and masses for the drawing (H4, no radical), with today's diagnostic about
+ * h1: today's native metadata of the drawing with a hydrogen bonded to each lone H, as the refresh
+ * once rebuilt the H2 record (each bonded H still states its count, and derives none).
+ */
+const statedH4WithTodaysDiagnostic = () => ({
+  ...nativeSingleBondGraphMetadata([...statedAtoms, atom("p1", "H", 10), atom("p2", "H", 50)], [bond("q1", "h1", "p1"), bond("q2", "h2", "p2")]),
+  atomCount: 2, bondCount: 0
+});
 
 /** A V2000 molfile of C, F, Cl, Br and a lone H, as RDKit writes one (the lone H with no valence field: H2). */
 const haloV2000 = [
@@ -324,6 +356,85 @@ describe("a lone H's stale cache that is ChemDraft's own earlier output is refre
       expect(cacheOf(molecules(committed(result))[0]!)).toBe(cacheOf(refreshedAt123(stored)));
     }
   });
+
+  // The read notes the bracket pair on the stored H2 record, as on every record on that page; the
+  // H2 reading's record is compared with that note on it too, made by chem-core's own annotation.
+  it("refreshes a CC.[HH] cache inside a repeat-unit bracket pair on open, session restore and paste, as release/1.2.3 did", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const stored = ethane("polymer");
+    const at123 = refreshedAt123(stored);
+    for (const [occasion, read] of [["open", openRead], ["session restore", restoreRead]] as const) {
+      const result = read([stored, ...repeatUnitPair("polymer")]);
+      expect(declinedOf(result.warnings), occasion).toEqual([]);
+      const [readBack] = molecules(result.document!);
+      expect(readBack!.structure, occasion).toBe("CC.[HH]");
+      expect(bracketNotes(readBack!), occasion).toHaveLength(1);
+      expect(bracketNotes(readBack!)[0]!.message).toContain("repeat unit n");
+      const [kept] = molecules(committed(result));
+      expect(kept!.structure, occasion).toBe("CC.[H]");
+      expect(kept!.structureFormat).toBe(at123.structureFormat);
+      // Release/1.2.3's record, with the page's own note kept on it, as the next commit would leave it.
+      expect(withoutBracketNotes(kept!), occasion).toEqual(at123.chemistry);
+      expect(bracketNotes(kept!), occasion).toEqual(bracketNotes(readBack!));
+      expect(kept!.atoms).toEqual(stored.atoms);
+    }
+    const warningsOut: string[] = [];
+    const paste = pasted([stored, ...repeatUnitPair("polymer")], warningsOut);
+    const [pastedMolecule] = molecules(paste);
+    expect(bracketNotes(pastedMolecule!)).toHaveLength(1);
+    expect(pastedMolecule!.structure).toBe("CC.[H]");
+    expect(withoutBracketNotes(pastedMolecule!)).toEqual(at123.chemistry);
+    expect(warningsOut).toEqual([]);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("refreshes the bare-atom reading of release 1.2.2 inside a repeat-unit bracket pair, with no warning", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const stored = ethane("released", "CC.[H]", record("C2H7", 31.078, 31.05478, 3, 1));
+    for (const read of [openRead, restoreRead]) {
+      const result = read([stored, ...repeatUnitPair("released")]);
+      expect(declinedOf(result.warnings)).toEqual([]);
+      const [kept] = molecules(committed(result));
+      expect(kept!.chemistry?.radicalCount).toBe(1);
+      expect(withoutBracketNotes(kept!)).toEqual(refreshedAt123(stored).chemistry);
+      expect(bracketNotes(kept!)).toHaveLength(1);
+    }
+    expect(molecules(pasted([stored, ...repeatUnitPair("released")]))[0]!.chemistry?.radicalCount).toBe(1);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("says nothing and changes nothing for today's own record inside a repeat-unit bracket pair", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const stored = { ...ethane("current"), ...refreshedAt123(ethane("current")) };
+    for (const read of [openRead, restoreRead]) {
+      const result = read([stored, ...repeatUnitPair("current")]);
+      expect(declinedOf(result.warnings)).toEqual([]);
+      const [readBack] = molecules(result.document!);
+      const [kept] = molecules(committed(result));
+      expect(cacheOf(kept!)).toBe(cacheOf(readBack!));
+      expect(bracketNotes(kept!)).toHaveLength(1);
+    }
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  // From e7ef3bc68 until 95783e713 the writer read a lone H as the bare atom and derived no hydrogen
+  // for it, as today's does: its diagnostic about the stated count is today's, word for word.
+  it("refreshes the bare-atom reading of two lone H atoms, one stating a count, with today's diagnostic about it", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const today = statedToday();
+    expect(today.warnings).toHaveLength(1);
+    expect(today.warnings[0]!.objectId).toBe("h1");
+    expect(today.warnings[0]!.message).toMatch(/SMILES count 0\.$/);
+    const stored = stated("bare", "[H].[H]", { ...today, radicalCount: 0 });
+    for (const read of [openRead, restoreRead]) {
+      const result = read([stored]);
+      expect(declinedOf(result.warnings)).toEqual([]);
+      const [kept] = molecules(committed(result));
+      expect(kept!.structure).toBe("[H].[H]");
+      expect(kept!.chemistry).toEqual(today);
+    }
+    expect(warn).not.toHaveBeenCalled();
+  });
 });
 
 describe("a lone H's cache that is not ChemDraft's own earlier output is kept as stored, with one warning", () => {
@@ -376,7 +487,27 @@ describe("a lone H's cache that is not ChemDraft's own earlier output is kept as
     ["a V2000 molfile with an M  RAD doublet on the lone H, beside today's record",
       () => ({ ...refreshedAt123(ethane("radctab")), structureFormat: "molfile-v2000" as const, structure: ethaneRadicalV2000 })],
     ["a chemistry record whose warnings the native writer never wrote (an engine's record)",
-      () => ({ ...ethane("engine"), chemistry: { ...ethaneH2, warnings: [{ code: "rdkit.sanitize", message: "Read by RDKit." }] } })]
+      () => ({ ...ethane("engine"), chemistry: { ...ethaneH2, warnings: [{ code: "rdkit.sanitize", message: "Read by RDKit." }] } })],
+    // The H2 reading's structure (in both SMILES fields), formula, masses and radical count, beside
+    // TODAY's diagnostic about h1 ("SMILES count 0."): the H2 writer wrote "SMILES count 1.", so no
+    // writer ever emitted this mix, and refreshing it would read a record of two eras as one.
+    ["two lone H atoms, one stating a count: the H2 reading's [HH].[HH] and H4 with today's diagnostic", () => {
+      const mixed = statedH4WithTodaysDiagnostic();
+      expect(mixed).toMatchObject({ formula: "H4", radicalCount: 0 });
+      expect(mixed.warnings).toEqual(statedToday().warnings);
+      expect(mixed.warnings[0]!.message).toMatch(/SMILES count 0\.$/);
+      return stated("mixedH4", "[HH].[HH]", mixed, { warnings: [], unknown: { smiles: "[HH].[HH]" } });
+    }],
+    // The H2 writer's own record for that drawing. Its diagnostic states the hydrogen that era derived
+    // for h1 ("SMILES count 1."), which today's validator never derives for a hydrogen atom, so the
+    // reading cannot be rebuilt exactly and is not offered: the record is kept and named, never
+    // matched in part.
+    ["two lone H atoms, one stating a count: the H2 writer's record, whose diagnostic today's validator cannot rebuild", () => {
+      const mixed = statedH4WithTodaysDiagnostic();
+      const warnings = mixed.warnings.map((warning) => ({ ...warning, message: warning.message.replace(/SMILES count 0\.$/, "SMILES count 1.") }));
+      expect(warnings[0]!.message).toMatch(/SMILES count 1\.$/);
+      return stated("h2era", "[HH].[HH]", { ...mixed, warnings });
+    }]
   ];
 
   for (const [what, make, stereo] of cases) {
@@ -405,6 +536,29 @@ describe("a lone H's cache that is not ChemDraft's own earlier output is kept as
       expect(warn).toHaveBeenCalledTimes(3);
     }, 30_000);
   }
+
+  it("names each molecule a paste keeps as stored once, one line each, in the open report's words", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const ether = moleculeOf("ether", ethanolAtoms.map((each) => ({ ...each, y: each.y + 60 })), ethanolBonds, "smiles", "COC.[HH]", ethanolH2);
+    const both = [halo("wedged", { wedge: true, structure: "F[C@@H](Cl)Br.[HH]", stereochemistry: ["atom 0 (S)"] }), ether];
+    const warningsOut: string[] = [];
+    const kept = molecules(pasted(both, warningsOut));
+    expect(kept).toHaveLength(2);
+    expect(new Set(kept.map((molecule) => molecule.id)).size).toBe(2);
+    // One line per kept molecule, naming it (its pasted id), and no line twice.
+    expect(warningsOut).toEqual(kept.map((molecule) => workflow.impliedRadicalCacheDeclinedLine(molecule.id)));
+    expect(new Set(warningsOut).size).toBe(2);
+    kept.forEach((molecule, index) => expect(warningsOut[index]).toContain(`molecule "${molecule.id}"`));
+    // The same text the open report shows for each of them.
+    const opened = declinedOf(openRead(both).warnings);
+    expect(opened).toHaveLength(2);
+    for (const line of warningsOut) {
+      expect(line).toContain(workflow.impliedRadicalCacheNotRefreshedText());
+      expect(opened.some((warning) => warning.message.endsWith(workflow.impliedRadicalCacheNotRefreshedText()))).toBe(true);
+    }
+    // One console line per kept molecule of the paste (the open read above commits nothing).
+    expect(warn).toHaveBeenCalledTimes(2);
+  });
 
   it("says nothing and changes nothing when the stored record already is today's and no structure is stored", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
