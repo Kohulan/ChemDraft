@@ -511,6 +511,7 @@ import {
   activateDrawingToolCommand,
   createActiveToolState,
   drawingToolStatusLabel,
+  getDrawingToolDefinition,
   isDrawingToolCommand,
   withStandaloneDrawingToolCommands,
   type ActiveToolState
@@ -1905,7 +1906,9 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.25.09.30-opus";
+const CURRENT_BUILD_STAMP = "11.25.12.22-opus";
+
+const NUMERIC_ENTRY_DURING_DRAG_STATUS = "Finish the current drag, then enter a value";
 
 /**
  * Sets `target` to `markIds`. A commit updater fills its policy's `IndependentMarkMoves` this way:
@@ -2529,6 +2532,18 @@ export function MainWindow({
   const objectResizeReadoutTimeoutRef = useRef<number | undefined>(undefined);
   const groupTransformDragRef = useRef<GroupTransformDragState | null>(null);
   const textResizeRef = useRef<TextResizeState | null>(null);
+  // Pointer drags that preview from `startDocument` and record `startDocument → result` on release
+  // (the same list the tab cleanup rolls back). While one is active no numeric entry may open, and
+  // any other write that moves history disarms it (`installDocumentHistory`), so its release can
+  // never overwrite an edit made after it started.
+  const snapshotDragRefs = useMemo((): ReadonlyArray<{ current: { pointerId: number; startDocument: ChemDraftDocument } | null }> => [
+    nativePlacementDragRef, nativeBondEditDragRef, nativePartDragRef, objectDragRef, graphicCornerRadiusDragRef,
+    graphicPathEditDragRef, graphicMarkerDragRef, graphicGradientDragRef, freehandArtDragRef, mechanismHandleDragRef,
+    objectRotateDragRef, projectedPlaneTiltDragRef, objectResizeDragRef, groupTransformDragRef, textResizeRef
+  ], []);
+  // The start document of the outermost `commitDocumentHistoryFrom` in progress: a drag's own commit
+  // records from its `startDocument` and must not disarm that drag.
+  const historyCommitStartRef = useRef<ChemDraftDocument | undefined>(undefined);
   const artStylePreviewRef = useRef<{ startDocument: ChemDraftDocument; undoLabel: string; commandKey: string; commandId: string } | null>(null);
   const moleculeInspectorPreviewRef = useRef<{ startDocument: ChemDraftDocument; undoLabel: string; commandKey: string; commandId: string } | null>(null);
   const settlePalettePreviewRef = useRef<(reason: string) => void>(() => undefined);
@@ -2792,6 +2807,14 @@ export function MainWindow({
   const textEditHistoryWritingRef = useRef(false);
   // Keeps an open numeric rotate/stretch preview as its own entry; assigned where those handlers live.
   const keepNumericInputPreviewsRef = useRef<() => void>(() => undefined);
+  // Set while a numeric entry writes its own preview, cancel, keep or tab rollback, so the
+  // history funnel does not settle that same session first (`installDocumentHistory`).
+  const numericInputOwnWriteRef = useRef(false);
+  const withNumericInputWrite = <T,>(write: () => T): T => {
+    const previous = numericInputOwnWriteRef.current;
+    numericInputOwnWriteRef.current = true;
+    try { return write(); } finally { numericInputOwnWriteRef.current = previous; }
+  };
   const textAutoConversionInProgressRef = useRef(false);
   // Only the first committed edit of each box placed by the Text tool may become an atom label.
   // Existing captions always remain text when reopened; the explicit command remains available.
@@ -3889,6 +3912,13 @@ export function MainWindow({
     switchingTabs = false,
     palettePreview = false
   ) => {
+    // A typed rotate/stretch entry previews outside history and its Cancel restores the document it
+    // opened on. Keep it as its own undo entry before any other write (a drawn bond, a hover key, a
+    // menu command), so Cancel can never discard a later edit and undo still reaches the state
+    // before the entry. A tab switch rolls the entry back first (`cancelDocumentTabSessions`).
+    if (!switchingTabs && !numericInputOwnWriteRef.current && (rotationInputRef.current || objectResizeInputRef.current)) {
+      withNumericInputWrite(() => keepNumericInputPreviewsRef.current());
+    }
     // A chooser may never blur. Close its snapshot transaction before *any* other
     // document write, including live drawing/selection replacements and navigation.
     // Compute history only afterwards so this edit cannot skip the preview's undo entry.
@@ -3930,6 +3960,38 @@ export function MainWindow({
       hoverPagePointRef.current = undefined;
       setArrowEditTargetId(undefined);
     }
+    // Every other snapshot drag previews from its start document and records from it on release. A
+    // write that moves history (an undo step recorded, undone or redone) and changes the drawing,
+    // by anything but that drag's own commit, would be overwritten by the next preview frame and
+    // dropped from history by the release, so disarm the drag. Settling a session that predates the
+    // drag (a palette preview, a numeric entry, a text checkpoint) records the drawing already showing
+    // and leaves the drag armed. A tab switch cleans up on its own.
+    const foreignDrags = !switchingTabs && (history.past !== previous.past || history.future !== previous.future)
+      ? snapshotDragRefs.filter(ref => ref.current && ref.current.startDocument !== historyCommitStartRef.current)
+      : [];
+    if (foreignDrags.length > 0 && history.present !== previous.present &&
+      !assistantDocumentContentUnchanged(previous.present, history.present)) {
+      let disarmed = false;
+      for (const ref of foreignDrags) {
+        const active = ref.current;
+        if (!active) continue;
+        ref.current = null;
+        disarmed = true;
+        clearObjectTransformPreview(active.pointerId);
+        releaseGesturePointer(active.pointerId);
+        for (const target of [pageRef.current, canvasRegionRef.current]) {
+          if (target?.hasPointerCapture?.(active.pointerId)) target.releasePointerCapture(active.pointerId);
+        }
+      }
+      if (disarmed) {
+        for (const ref of [objectRotateMachineRef, projectedPlaneTiltMachineRef, objectDragMachineRef, groupTransformMachineRef]) {
+          ref.current = initialInteractionState();
+        }
+        setObjectResizeReadout(undefined);
+        setObjectRotateReadout(undefined);
+        setProjectedPlaneTiltReadout(undefined);
+      }
+    }
     documentHistoryRef.current = history;
     documentRef.current = history.present;
     // A switch restores its own selection below; the previous tab's inline text range and fragment
@@ -3937,7 +3999,7 @@ export function MainWindow({
     if (!switchingTabs) updateToolbarStyleTargetSnapshot(history.present);
     setDocumentHistory(history);
     if (perfProbe) perfHook(() => perfProbe?.signal("document-commit"));
-  }, [clearObjectTransformPreview, releaseGesturePointer, updateToolbarStyleTargetSnapshot]);
+  }, [clearObjectTransformPreview, releaseGesturePointer, snapshotDragRefs, updateToolbarStyleTargetSnapshot]);
   // `nextDocument` is handed over, not lent: both callers pass a schema-parse result nothing else
   // holds (an opened file's parse, or a newly created document), so the engine admits it without the
   // copy-and-reparse `toEngineDocument` would make — 150–200 ms per open of a 5,000-molecule file.
@@ -4355,15 +4417,20 @@ export function MainWindow({
       reportChemistryRefusal(refusal);
       return false;
     }
-    // Exclude live preview geometry from the text checkpoint, then resume on the final frame.
-    const resumeTextEdit = checkpointTextEditBeforeCommitRef.current(startDocument);
+    // A drag's own commit (and the text checkpoint it may record first) must not disarm that drag.
+    const outerCommitStart = historyCommitStartRef.current;
+    historyCommitStartRef.current = outerCommitStart ?? startDocument;
     try {
-      installDocumentHistory((currentHistory) => ({
-        past: boundedHistoryPast([...currentHistory.past, atomLabelHistorySnapshot(startDocument)], present),
-        present,
-        future: []
-      }));
-    } finally { resumeTextEdit?.(); }
+      // Exclude live preview geometry from the text checkpoint, then resume on the final frame.
+      const resumeTextEdit = checkpointTextEditBeforeCommitRef.current(startDocument);
+      try {
+        installDocumentHistory((currentHistory) => ({
+          past: boundedHistoryPast([...currentHistory.past, atomLabelHistorySnapshot(startDocument)], present),
+          present,
+          future: []
+        }));
+      } finally { resumeTextEdit?.(); }
+    } finally { historyCommitStartRef.current = outerCommitStart; }
     setFileState((current) => {
       const nextFileState = { ...current, dirty: true };
       fileStateRef.current = nextFileState;
@@ -4464,15 +4531,16 @@ export function MainWindow({
     const refusal = commitChemistryRefusal(startDocument, previewDocument, previewDocument,
       selectionTransformChemistry(undefined, independent), undoLabel);
     if (refusal) {
-      installDocumentHistory((history) => history.present === startDocument ? history : { ...history, present: startDocument });
+      withNumericInputWrite(() => installDocumentHistory((history) => history.present === startDocument ? history : { ...history, present: startDocument }));
       reportChemistryRefusal(refusal);
       return false;
     }
-    if (undoLabel) documentUndoLabelsRef.current.set(previewDocument, undoLabel);
+    // An unchanged entry records nothing, not even a label on the document it leaves in place.
+    if (undoLabel && previewDocument !== startDocument) documentUndoLabelsRef.current.set(previewDocument, undoLabel);
     const resumeTextEdit = checkpointTextEditBeforeCommitRef.current(startDocument);
     let changed = false;
     try {
-      installDocumentHistory((currentHistory) => {
+      withNumericInputWrite(() => installDocumentHistory((currentHistory) => {
         if (previewDocument === startDocument) return currentHistory;
         changed = true;
         return {
@@ -4480,7 +4548,7 @@ export function MainWindow({
           present: previewDocument,
           future: []
         };
-      });
+      }));
     } finally { resumeTextEdit?.(); }
     if (!changed) return false;
     markDocumentDirty();
@@ -9613,6 +9681,9 @@ export function MainWindow({
 
   const previewObjectStyleCommand = useCallback((commandId: string) => {
     settleOtherPalettePreview(commandId);
+    // Keep an open rotate/stretch entry before this preview takes its start document; kept later,
+    // inside this preview's own write, it would settle the preview it just opened.
+    keepNumericInputPreviewsRef.current();
     const session = artStylePreviewRef.current;
     const startDocument = session?.startDocument ?? documentRef.current;
     const result = applyObjectStyleCommandToDocument(startDocument, commandId, effectiveArtPaintTarget, "keep");
@@ -10128,6 +10199,7 @@ export function MainWindow({
 
   const previewMoleculeInspectorCommand = useCallback((commandId: string) => {
     settleOtherPalettePreview(commandId);
+    keepNumericInputPreviewsRef.current(); // As in `previewObjectStyleCommand`.
     const session = moleculeInspectorPreviewRef.current;
     const startDocument = session?.startDocument ?? documentRef.current;
     const result = applyMoleculeInspectorCommandToDocument(startDocument, commandId);
@@ -10424,7 +10496,7 @@ export function MainWindow({
       graphicMarkerDragRef.current ?? graphicGradientDragRef.current ?? freehandArtDragRef.current ??
       mechanismHandleDragRef.current ?? objectRotateDragRef.current ?? projectedPlaneTiltDragRef.current ??
       objectResizeDragRef.current ?? groupTransformDragRef.current ?? textResizeRef.current;
-    if (preview) replacePresentDocument(preview.startDocument);
+    if (preview) withNumericInputWrite(() => replacePresentDocument(preview.startDocument));
     updateRotationInput(undefined);
     updateObjectResizeInput(undefined);
     cancelObjectStylePreview();
@@ -12603,6 +12675,12 @@ export function MainWindow({
   };
 
   const openObjectRotateInput = useCallback((objectId: string, activateSelection = false): boolean => {
+    // A drag records from the document it started on; an entry opened over its preview would be
+    // overwritten when the drag is released.
+    if (snapshotDragRefs.some(ref => ref.current)) {
+      setStatus(NUMERIC_ENTRY_DURING_DRAG_STATUS);
+      return false;
+    }
     if (activeToolState.activeKind !== "selection" && !activateSelection) {
       return false;
     }
@@ -12638,21 +12716,23 @@ export function MainWindow({
     const homeZDegrees = rotationInputDraftDegrees(
       object.type === "molecule" ? nativeMoleculeTransformState(object).rotationDegrees : object.rotation
     );
+    // An open stretch (or rotation) entry is kept as its own undo entry first; dropping it would
+    // leave its preview in this entry's start document with no way to undo back past it.
+    keepNumericInputPreviewsRef.current();
     setObjectRotateReadout(undefined);
     setProjectedPlaneTiltReadout(undefined);
-    updateObjectResizeInput(undefined);
     updateRotationInput({
       kind: "z",
       objectId,
       target: selectedFragmentTarget,
       targetLabel,
-      startDocument: currentDocument,
+      startDocument: documentRef.current,
       draftZDegrees: homeZDegrees,
       homeZDegrees
     });
     setStatus("Z rotation entry");
     return true;
-  }, [directElectronMarkEditing, activeToolState.activeKind, selectedNativeMoleculePart, updateObjectResizeInput, updateRotationInput]);
+  }, [directElectronMarkEditing, activeToolState.activeKind, selectedNativeMoleculePart, snapshotDragRefs, updateRotationInput]);
 
   const coreCommandBindingsRef = useRef<Map<string, { spec: CommandSpec; run: () => Promise<void> }>>(
     new Map()
@@ -13365,6 +13445,14 @@ export function MainWindow({
             setStatus("Select one whole molecule to rotate");
             return;
           }
+          // Refused during a drag before the tool switch, which would leave the drag running.
+          if (snapshotDragRefs.some(ref => ref.current)) {
+            setStatus(NUMERIC_ENTRY_DURING_DRAG_STATUS);
+            return;
+          }
+          // The entry box renders only under a selection tool. Opened from a menu while a drawing
+          // tool is active, it would otherwise stay open but hidden.
+          if (getDrawingToolDefinition(activeToolCommandIdRef.current)?.kind !== "selection") switchToSelectTool();
           if (!rotationInputRef.current) openObjectRotateInput(object.id, true);
           return;
         }
@@ -13788,6 +13876,8 @@ export function MainWindow({
     flashArtPaintTargetControls,
     layerActions,
     openObjectRotateInput,
+    switchToSelectTool,
+    snapshotDragRefs,
     compoundLayoutsEnabled,
     nativePalette,
     openExportDialog,
@@ -15258,6 +15348,12 @@ export function MainWindow({
       updateObjectResizeInput(undefined);
     }
   }, [document.selection.objectIds, objectResizeInput, selectedNativeMoleculePart, updateObjectResizeInput]);
+
+  // Entry boxes render only under a selection tool. Switching to a drawing tool keeps an open
+  // entry as its own undo entry instead of leaving a hidden session behind.
+  useEffect(() => {
+    if (activeToolState.activeKind !== "selection") keepNumericInputPreviewsRef.current();
+  }, [activeToolState.activeKind]);
 
   // Publish which build this WINDOW is running, so it can be asked from outside instead of read off
   // the corner of the screen. Written on load, after every hot update, and whenever the window comes
@@ -18625,6 +18721,12 @@ export function MainWindow({
     const rotationRefusal = result?.kind === "xy" ? result.rotationRefusal : undefined;
     updateRotationInput({ ...nextInput, warnings, rotationRefusal });
     if (!result) {
+      // A draft that no longer parses (empty, "-", "1.", letters) shows the start document again,
+      // so keeping it changes nothing instead of keeping the last valid preview.
+      liveInputMarkMovesRef.current = undefined;
+      withNumericInputWrite(() => replacePresentDocument(nextInput.startDocument));
+      setObjectRotateReadout(undefined);
+      setProjectedPlaneTiltReadout(undefined);
       setStatus(nextInput.kind === "z" ? "Enter a valid Z rotation" : "Enter valid X and Y rotations");
       return;
     }
@@ -18632,7 +18734,7 @@ export function MainWindow({
     const edit = result.kind === "xy" && result.verifiedSpin3d ? undefined
       : resolveElectronMarksInSelectionTransform(nextInput.startDocument, result.document, result.kind === "z" ? { motion: "turn" } : {});
     liveInputMarkMovesRef.current = edit ? { startDocument: nextInput.startDocument, markIds: edit.independentlyMovedMarkIds } : undefined;
-    replacePresentDocument(edit?.document ?? result.document);
+    withNumericInputWrite(() => replacePresentDocument(edit?.document ?? result.document));
     if (result.kind === "xy") {
       showProjectedPlaneTiltReadout(nextInput.objectId, result.tiltXRad, result.tiltYRad, result.clamped, false);
     } else {
@@ -18657,7 +18759,7 @@ export function MainWindow({
     const session = input ?? rotationInputRef.current;
     if (input && input !== rotationInputRef.current) return;
     if (session) {
-      replacePresentDocument(session.startDocument);
+      withNumericInputWrite(() => replacePresentDocument(session.startDocument));
     }
     updateRotationInput(undefined);
     setObjectRotateReadout(undefined);
@@ -18758,18 +18860,22 @@ export function MainWindow({
     updateObjectResizeInput(nextInput);
     const result = objectResizeInputDocumentFromDraft(nextInput);
     if (!result) {
+      // As for rotation: an unparseable draft shows, and keeps, the start document.
+      liveInputMarkMovesRef.current = undefined;
+      withNumericInputWrite(() => replacePresentDocument(nextInput.startDocument));
+      setObjectResizeReadout(undefined);
       setStatus("Enter valid X and Y stretch percentages");
       return;
     }
 
     const edit = resolveElectronMarksInSelectionTransform(nextInput.startDocument, result.document);
     liveInputMarkMovesRef.current = { startDocument: nextInput.startDocument, markIds: edit.independentlyMovedMarkIds };
-    replacePresentDocument(edit.document);
+    withNumericInputWrite(() => replacePresentDocument(edit.document));
     showObjectResizeReadout(nextInput.objectId, result.targetScale, false);
   }, [objectResizeInputDocumentFromDraft, replacePresentDocument, showObjectResizeReadout, updateObjectResizeInput]);
 
   const handleObjectResizeInputHome = useCallback((input: ObjectResizeInputState) => {
-    replacePresentDocument(input.startDocument);
+    withNumericInputWrite(() => replacePresentDocument(input.startDocument));
     updateObjectResizeInput({
       ...input,
       draftXPercent: input.homeXPercent,
@@ -18783,7 +18889,7 @@ export function MainWindow({
     const session = input ?? objectResizeInputRef.current;
     if (input && input !== objectResizeInputRef.current) return;
     if (session) {
-      replacePresentDocument(session.startDocument);
+      withNumericInputWrite(() => replacePresentDocument(session.startDocument));
     }
     updateObjectResizeInput(undefined);
     setObjectResizeReadout(undefined);
@@ -18797,7 +18903,8 @@ export function MainWindow({
       return false;
     }
 
-    const changed = commitLiveInputPreview(session.startDocument, findDocumentObject(session.startDocument, session.objectId)?.type === "electron-mark" ? "Resize electron mark" : undefined);
+    const stretchedType = findDocumentObject(session.startDocument, session.objectId)?.type;
+    const changed = commitLiveInputPreview(session.startDocument, stretchedType === "electron-mark" ? "Resize electron mark" : stretchedType === "molecule" ? "Stretch molecule" : "Stretch art object");
     updateObjectResizeInput(undefined);
     setObjectResizeReadout(undefined);
     setStatus(changed ? "Stretch applied" : "Stretch unchanged");
@@ -21833,6 +21940,12 @@ export function MainWindow({
   }, [openObjectRotateInput]);
 
   const openProjectedPlaneTiltInput = useCallback((objectId: string): boolean => {
+    // A drag records from the document it started on; an entry opened over its preview would be
+    // overwritten when the drag is released.
+    if (snapshotDragRefs.some(ref => ref.current)) {
+      setStatus(NUMERIC_ENTRY_DURING_DRAG_STATUS);
+      return false;
+    }
     if (activeToolState.activeKind !== "selection") {
       return false;
     }
@@ -21879,15 +21992,15 @@ export function MainWindow({
       : false;
     const homeXDegrees = rotationInputDraftDegrees(modeledRotationEntry ? 0 : selectedFragmentTarget ? 0 : transform.tiltXDegrees ?? 0);
     const homeYDegrees = rotationInputDraftDegrees(modeledRotationEntry ? 0 : selectedFragmentTarget ? 0 : transform.tiltYDegrees ?? 0);
+    keepNumericInputPreviewsRef.current();
     setObjectRotateReadout(undefined);
     setProjectedPlaneTiltReadout(undefined);
-    updateObjectResizeInput(undefined);
     updateRotationInput({
       kind: "xy",
       objectId,
       target: selectedFragmentTarget,
       targetLabel,
-      startDocument: currentDocument,
+      startDocument: documentRef.current,
       draftXDegrees: homeXDegrees,
       draftYDegrees: homeYDegrees,
       homeXDegrees,
@@ -21895,7 +22008,7 @@ export function MainWindow({
     });
     setStatus("3D rotation entry");
     return true;
-  }, [directElectronMarkEditing, activeToolState.activeKind, selectedNativeMoleculePart, updateObjectResizeInput, updateRotationInput]);
+  }, [directElectronMarkEditing, activeToolState.activeKind, selectedNativeMoleculePart, snapshotDragRefs, updateRotationInput]);
 
   const handleProjectedPlaneTiltPointerDown = useCallback((objectId: string, event: PointerEvent<HTMLButtonElement>) => {
     event.preventDefault();
@@ -22034,6 +22147,12 @@ export function MainWindow({
   }, [openProjectedPlaneTiltInput]);
 
   const openObjectResizeInput = useCallback((objectId: string, corner: ObjectResizeCorner): boolean => {
+    // A drag records from the document it started on; an entry opened over its preview would be
+    // overwritten when the drag is released.
+    if (snapshotDragRefs.some(ref => ref.current)) {
+      setStatus(NUMERIC_ENTRY_DURING_DRAG_STATUS);
+      return false;
+    }
     if (activeToolState.activeKind !== "selection") {
       return false;
     }
@@ -22069,14 +22188,14 @@ export function MainWindow({
       : object.type === "molecule" ? "selected molecule" : "selected art object";
     const homeXPercent = objectResizeInputDraftPercent(selectedFragmentTarget ? 1 : transform?.scaleX ?? 1);
     const homeYPercent = objectResizeInputDraftPercent(selectedFragmentTarget ? 1 : transform?.scaleY ?? 1);
-    updateRotationInput(undefined);
+    keepNumericInputPreviewsRef.current();
     setObjectResizeReadout(undefined);
     updateObjectResizeInput({
       objectId,
       target: selectedFragmentTarget,
       targetLabel,
       corner,
-      startDocument: currentDocument,
+      startDocument: documentRef.current,
       draftXPercent: homeXPercent,
       draftYPercent: homeYPercent,
       homeXPercent,
@@ -22085,7 +22204,7 @@ export function MainWindow({
     });
     setStatus("Stretch entry");
     return true;
-  }, [directElectronMarkEditing, activeToolState.activeKind, selectedNativeMoleculePart, updateObjectResizeInput, updateRotationInput]);
+  }, [directElectronMarkEditing, activeToolState.activeKind, selectedNativeMoleculePart, snapshotDragRefs, updateObjectResizeInput]);
 
   const handleGraphicCornerRadiusPointerDown = useCallback((objectId: string, event: PointerEvent<HTMLButtonElement>) => {
     event.preventDefault();
@@ -26093,7 +26212,8 @@ function nativeMoleculeObjectIdsForGroupProjectedPlaneTilt(
 
 export function parseRotationInputDegrees(value: string): number | undefined {
   const trimmed = value.trim();
-  if (trimmed.length === 0) {
+  // A trailing decimal point ("1.") is still being typed; it must not preview or be kept.
+  if (trimmed.length === 0 || trimmed.endsWith(".")) {
     return undefined;
   }
   const parsed = Number(trimmed);
@@ -26114,7 +26234,8 @@ export function rotationInputHomeDraftDegrees(kind: "z" | "xy") {
 
 export function parseObjectResizeInputPercent(value: string): number | undefined {
   const trimmed = value.trim();
-  if (trimmed.length === 0) {
+  // A trailing decimal point ("1.") is still being typed; it must not preview or be kept.
+  if (trimmed.length === 0 || trimmed.endsWith(".")) {
     return undefined;
   }
   const parsed = Number(trimmed);

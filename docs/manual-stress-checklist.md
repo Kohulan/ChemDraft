@@ -4,6 +4,8 @@ Molecule angle entry: select one whole native molecule, right-click, choose Rota
 enter positive/negative/fractional angles and a full 360 degrees. Accept/cancel and Undo/Redo must
 preserve charge, isotopes, stereochemistry, bond lengths and internal angles. Partial selections
 must not offer whole-molecule rotation. Check native menus and input focus on Windows and both macOS builds.
+Then, with the Bond tool active, right-click the selected molecule and choose Rotate molecule: the Selection tool comes up with the angle box showing; type an angle (say 30) and check the molecule turns, then pick the Bond tool, draw a bond onto that molecule, return to Selection and press Escape: the bond stays and Undo removes it, then the rotation. Type a stretch, then choose Rotate molecule and press Escape: the stretch stays and Undo returns to before it. Type 30 in the angle box, then clear it (or change it to `1.` or letters): the molecule returns to where it started, and Enter adds no undo step. While dragging a stretch or rotate handle (button still held), choose Rotate molecule from the menu or shortcut: no angle box opens, and on release the drag is one undo step.
+Open the angle box (and, separately, the stretch box) and leave it empty, or type only `-`, `1.` or letters, then hover a palette color and move off it, pick the Bond tool, or press Enter: the drawing is unchanged and Undo has nothing new to undo. A palette color hover while a typed angle is showing keeps the rotation as one step, and moving off the color removes the color again.
 
 Document zoom controls: use Main's Zoom Out/In and each preset, check 100→125→150→200 and reverse,
 then smooth wheel/pinch and tab switching. The displayed percentage must follow the active view.
