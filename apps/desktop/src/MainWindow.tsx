@@ -13,7 +13,7 @@ import { createBracketCommands, selectedBracketPair, toggleBracketRepeatUnit, se
 import { bracketLabelPlan, bracketLabelContainsPoint, lonePairDragDirection, transformPointForObject } from "@chemdraft/layout-engine";
 import { useCanvasHandwritingFont } from "./canvasHandwritingFont";
 import { nativeTemplateForToolCommand } from "./ringTemplates";
-import { documentDrawingDefaults } from "@chemdraft/document-workflow-core";
+import { ATOM_MAPS_REMOVED_STATUS, documentDrawingDefaults, stripSmilesAtomMaps } from "@chemdraft/document-workflow-core";
 import { nativeStylePresetPatchForSelection } from "./nativeStylePresetCommand";
 import { AtomProblemMarker } from "./AtomProblemMarker";
 import { atomProblemCommandId, atomProblemCommands, atomProblemSnapshot, type AtomProblemTarget } from "./atomProblemCommands";
@@ -94,6 +94,7 @@ import {
   OPEN_WARNINGS_LIST_ID,
   openWarningsHeading,
   restoreSessionWarningReports,
+  statusMessageTitle,
   TOGGLE_OPEN_WARNINGS_COMMAND_ID,
   warningCountLabel,
   type OpenWarning,
@@ -286,7 +287,7 @@ import { canvasOverlayPrompt, OVERLAY_BUSY_MESSAGE, pluginCanvasOverlayOpenComma
 import type { PluginPanelActionRequest, PluginPanelActionResult } from "./plugins/pluginPanelActionTypes";
 import { handleSpectrumWindowAction, saveBinaryFileHere, saveTextFileHere, spectrumToPdf } from "./plugins/spectrumExport";
 import type { QueuedProposedPatch } from "@chemdraft/plugin-host";
-import { hoverKeyFromEvent, isBlockedByModalDialog, shouldIgnoreShortcutTarget, subscribeToModalDialogChanges, type ShortcutPlatform } from "@chemdraft/shortcut-engine";
+import { hoverKeyFromEvent, isBlockedByModalDialog, resolveHoverKey, shouldIgnoreShortcutTarget, subscribeToModalDialogChanges, type ShortcutPlatform } from "@chemdraft/shortcut-engine";
 import {
   atomLabelAnchorOffset,
   nativeHoverAtomLabelCompletion,
@@ -345,9 +346,9 @@ import { createRdkitAdapter } from "@chemdraft/rdkit-adapter/adapter";
 import { buildAnalysisReport, type AnalysisReport, type AnalysisRun } from "@chemdraft/analysis-core";
 import { analysisClient } from "./analysisClient";
 import { clipboardChemistrySizeRefusal, guardClipboardPayload, inspectClipboardPayload, isVectorArtworkType, looksLikeSmiles, smilesListCandidates, type ClipboardDetectedPayload } from "@chemdraft/clipboard-adapter";
-import { verifySmilesPaste, verifySmilesPasteInput, verifySmilesGridEntries } from "./smilesPasteIdentity";
+import { atomMapStereoLossStatus, verifySmilesPaste, verifySmilesPasteInput, verifySmilesGridEntries } from "./smilesPasteIdentity";
 import {
-  SmilesListPasteError, depictSmilesForPaste, depictSmilesListForPaste, smilesListFailureStatus
+  SmilesListPasteError, depictSmilesForPaste, depictSmilesListForPaste, smilesListAtomMapNotes, smilesListFailureStatus
 } from "./smilesListPaste";
 import type { Generate3DConformerResult, StructureAnalysisResult } from "@chemdraft/chemistry-adapter";
 import {
@@ -951,7 +952,7 @@ import {
 import { installBrowserReloadGuard, wasBrowserReloadPrevented } from "./browserReloadGuard";
 import { assertDocumentSize, decodeNativeDocumentContents, documentContentsKey, readBrowserDocumentFile, readNativeDocumentFile, type DocumentContents } from "./documentText";
 import { handleDroppedFiles, type DroppedImageInsertion, type DroppedImageSource } from "./imageDrop/dropHandler";
-import { browserDropClientPoint, drawableCanvasRect, dropPagePoint, tauriDropClientPoint, type DropClientPoint } from "./imageDrop/dropPosition";
+import { DOCUMENT_FILE_DROP_EVENT, browserDropClientPoint, drawableCanvasRect, dropPagePoint, nativeDropClientPoint, type DocumentFileDropPayload, type DropClientPoint } from "./imageDrop/dropPosition";
 import { insertDroppedImages, type PagePointLike } from "./imageDrop/insertDroppedImages";
 import type { PreparedDroppedImage } from "./imageDrop/prepareDroppedImage";
 import { savedDocumentBytes } from "./imageDrop/dropDocumentBudget";
@@ -1899,7 +1900,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.25.01.20-opus";
+const CURRENT_BUILD_STAMP = "11.25.03.25-opus";
 
 /**
  * Sets `target` to `markIds`. A commit updater fills its policy's `IndependentMarkMoves` this way:
@@ -8036,20 +8037,29 @@ export function MainWindow({
       if (signal.aborted) return { outcome: "terminal" as const };
     };
     setStatus("Drawing the pasted SMILES…");
+    // Atom maps have no native field yet: draw, verify and store the SMILES without them, so the
+    // identity check compares like with like and still refuses any other change.
+    const { smiles: pasteSmiles, removed: removedAtomMaps } = stripSmilesAtomMaps(smilesText);
     try {
-      await verifySmilesPasteInput(smilesText, signal);
+      await verifySmilesPasteInput(pasteSmiles, signal);
       let terminal = pictureFallback ? terminalResult() : undefined;
       if (terminal) return terminal;
       const layoutDocument = documentRef.current;
       const point = anchor.point;
-      const parsed = await depictSmilesForPaste(smilesText, { signal }, {
+      const parsed = await depictSmilesForPaste(pasteSmiles, { signal }, {
         document: layoutDocument, centre: point, reservedObjectIds: new Set<string>()
       });
       terminal = terminalResult();
       if (terminal) return terminal;
       if (!parsed) return { outcome: "no-structure" };
       const { depiction } = parsed;
-      await verifySmilesPaste(depiction, smilesText);
+      await verifySmilesPaste(depiction, pasteSmiles);
+      terminal = terminalResult();
+      if (terminal) return terminal;
+      // Compare stereo whenever the text changed: a class 0 is not a map (no "removed" note), but
+      // removing it can still leave a centre or an alkene without stereo.
+      const atomMapNotes = pasteSmiles !== smilesText ? [...(removedAtomMaps ? [ATOM_MAPS_REMOVED_STATUS] : []),
+        ...[await atomMapStereoLossStatus(smilesText, pasteSmiles, undefined, signal)].filter((note): note is string => note !== undefined)] : [];
       terminal = terminalResult();
       if (terminal) return terminal;
       const pasteDocument = documentRef.current;
@@ -8066,7 +8076,7 @@ export function MainWindow({
         pasteDocument,
         point,
         depiction,
-        smilesText,
+        pasteSmiles,
         SMILES_PASTE_OPTIONS
       ), status: undefined };
       const nextDocument = inserted.document;
@@ -8095,7 +8105,7 @@ export function MainWindow({
       resetPasteUiState();
       setPageFitPrompt(undefined);
       const pasteStatus = `Pasted SMILES structure — ${depiction.atoms.length} atoms${stereoStatus}`;
-      setStatus([pasteStatus, ...(inserted.status ? [inserted.status] : []), ...(parsed.warnings ?? []), ...stereoWarnings].join("; "));
+      setStatus([pasteStatus, ...(inserted.status ? [inserted.status] : []), ...(parsed.warnings ?? []), ...stereoWarnings, ...atomMapNotes].join("; "));
       return { outcome: "success" };
     } catch (error) {
       const terminal = terminalResult();
@@ -8147,6 +8157,7 @@ export function MainWindow({
       setStatus(`Parsing SMILES list: ${completed} of ${total} tokens`);
     }, {
       signal, inspectInput: verifySmilesPasteInput,
+      inspectAtomMapStereo: (mapped, stripped, stereoSignal) => atomMapStereoLossStatus(mapped, stripped, undefined, stereoSignal),
       templatePlacement: { document: pasteDocument, centre: anchor.point }
     });
     if (!pendingList) return undefined;
@@ -8178,7 +8189,9 @@ export function MainWindow({
       const failures = smilesListFailureStatus(displayedFailures);
       const failureCount = displayedFailures.length;
       const makeStatus = (placementStatus: string) => {
-        const baseStatus = [placementStatus, ...new Set(entries.flatMap(entry => entry.molecule ? [structureTemplateLayoutMessage(entry.molecule)!] : [])), ...(parsed.warnings ?? [])].join("; ");
+        const baseStatus = [placementStatus, ...new Set(entries.flatMap(entry => entry.molecule ? [structureTemplateLayoutMessage(entry.molecule)!] : [])), ...(parsed.warnings ?? []),
+          // Only the entries that passed identity verification were pasted; only they add a note.
+          ...smilesListAtomMapNotes(entries)].join("; ");
         return failures ? `${baseStatus}; ${failureCount} item${failureCount === 1 ? "" : "s"} failed: ${failures}` +
           (engineUnavailable ? "; pasted as text" : "") : baseStatus;
       };
@@ -10571,7 +10584,9 @@ export function MainWindow({
     setAnalysisReport(undefined);
     setObjectContextMenu(undefined);
     setArrowEditTargetId(undefined);
-    setStatus(tableDraftStatusRef.current?.announced ?? snapshot.status);
+    // The ref follows at once, so a second switch before React renders snapshots this tab's status.
+    statusRef.current = tableDraftStatusRef.current?.announced ?? snapshot.status;
+    setStatus(statusRef.current);
     pluginRuntimeRef.current?.notifyActiveDocumentChanged(requestDocumentKey(id));
   }, [cancelDocumentTabSessions, clearDocumentInteractionState, installDocumentHistory, requestDocumentKey]);
 
@@ -11222,6 +11237,24 @@ export function MainWindow({
     return () => { dialogCoordinatorRef.current = undefined; void coordinator.dispose(); };
   }, []);
 
+  /**
+   * A status for one tab, whichever is active: the active tab shows it at once, another tab keeps it
+   * in its snapshot for when it is shown again. `statusRef` follows at once, so a tab switch in the
+   * same tick, before React renders, snapshots this status and not the one before it. False when the
+   * tab has closed.
+   */
+  const setTabStatus = useCallback((tabId: string, message: string): boolean => {
+    if (tabId === activeDocumentTabIdRef.current) {
+      statusRef.current = message;
+      setStatus(message);
+      return true;
+    }
+    const snapshot = documentTabSnapshotsRef.current.get(tabId);
+    if (!snapshot || !documentTabsRef.current.some(tab => tab.id === tabId)) return false;
+    documentTabSnapshotsRef.current.set(tabId, { ...snapshot, status: message });
+    return true;
+  }, []);
+
   const openDroppedDocumentPaths = useCallback(async (paths: readonly string[]) => {
     return openDocumentBatch(paths.map(path => ({
       contents: () => readNativeDocumentFile(path), displayName: nativePathBasename(path), path
@@ -11270,6 +11303,13 @@ export function MainWindow({
     openDocuments(files: T[]): Promise<string | undefined>;
   }) => {
     const tabId = activeDocumentTabIdRef.current;
+    // "Reading…", the result and any failure belong to the tab the drop landed on, wherever the user
+    // has gone since (a tab that has closed meanwhile: the active one). The whole outcome is also
+    // shown on the tab active at the end, so a refusal is never only on a tab out of sight.
+    const setDropStatus = (message: string) => {
+      if (!setTabStatus(tabId, message)) setTabStatus(activeDocumentTabIdRef.current, message);
+    };
+    const showOutcome = (message: string) => { setTabStatus(activeDocumentTabIdRef.current, message); };
     // Bumped whenever the active document is replaced or another tab is installed (as for plugin
     // writes): a picture is only ever inserted into the document it was dropped on.
     const documentIdentity = documentIdentityRef.current;
@@ -11300,7 +11340,7 @@ export function MainWindow({
       return { ok: true, scaledToPage };
     };
     return handleDroppedFiles(files, {
-      ...route, insertImages, decoders: browserImageDecoders, setStatus,
+      ...route, insertImages, decoders: browserImageDecoders, setStatus: setDropStatus, showOutcome,
       insertRefusal: imageDropRefusal,
       documentBytes: () => {
         // The session's cached payload when autosave has built one for this very document.
@@ -11326,12 +11366,20 @@ export function MainWindow({
         imageDropQueueRef.current = run.catch(() => undefined);
         return run;
       }
-    }).catch((error: unknown) => setStatus(`Couldn't finish the drop: ${error instanceof Error ? error.message : String(error)}`));
-  }, [commitDocumentChangeWithPageFit, droppedImagePagePoint, imageDropRefusal, resetPasteUiState]);
+    }).catch((error: unknown) => {
+      const message = `Couldn't finish the drop: ${error instanceof Error ? error.message : String(error)}`;
+      setDropStatus(message);
+      showOutcome(message);
+    });
+  }, [commitDocumentChangeWithPageFit, droppedImagePagePoint, imageDropRefusal, resetPasteUiState, setTabStatus]);
 
   const dropNativePaths = useCallback((paths: readonly string[], client: DropClientPoint | undefined) =>
     runFileDrop(paths, client, { nameOf: nativePathBasename, imageSource: nativeDroppedImageSource,
       openDocuments: openDroppedDocumentPaths }), [openDroppedDocumentPaths, runFileDrop]);
+  // The native drop listener below is registered once per mount and calls the latest handler, so a
+  // re-created `dropNativePaths` (after a page-size change, say) never leaves a gap with no listener.
+  const dropNativePathsRef = useRef(dropNativePaths);
+  dropNativePathsRef.current = dropNativePaths;
 
   const dropBrowserFiles = useCallback((files: readonly File[], client: DropClientPoint | undefined) =>
     runFileDrop(files, client, { nameOf: file => file.name, imageSource: browserDroppedImageSource,
@@ -11343,18 +11391,19 @@ export function MainWindow({
     if (!isDesktopRuntime()) return undefined;
     let disposed = false;
     let unlisten: (() => void) | undefined;
-    const platform = shortcutPlatform ?? detectDesktopShortcutPlatform();
-    void listenCurrentWindowEvent<{ paths: string[]; position?: { x: number; y: number } }>("tauri://drag-drop", (event) => {
+    // Not `tauri://drag-drop`: its macOS position is measured from under the title bar. Rust sends
+    // this one, once per drop, with the position made relative to the page (`file_drop.rs`).
+    void listenCurrentWindowEvent<DocumentFileDropPayload>(DOCUMENT_FILE_DROP_EVENT, (event) => {
       if (disposed || closeTabPromptRef.current || quitInteractionRef.current) return;
       // Pixels per CSS pixel right now, including any webview zoom, for Windows' physical position.
-      const client = tauriDropClientPoint(event.payload.position, platform, window.devicePixelRatio);
-      void dropNativePaths(event.payload.paths, client);
+      const client = nativeDropClientPoint(event.payload, window.devicePixelRatio);
+      void dropNativePathsRef.current(event.payload.paths, client);
     }).then((stop) => {
       if (disposed) stop();
       else unlisten = stop;
     }).catch(() => undefined);
     return () => { disposed = true; unlisten?.(); };
-  }, [dropNativePaths, shortcutPlatform]);
+  }, []);
 
   // The web build: a file dropped anywhere in the document window (the canvas, a toolbar, the tab
   // strip) is taken here. `main.tsx` keeps every other drop from navigating. The desktop webviews
@@ -12305,13 +12354,6 @@ export function MainWindow({
     }
   }, closeTabPrompt, true);
 
-  const setExportTabStatus = useCallback((tabId: string, message: string) => {
-    if (tabId === activeDocumentTabIdRef.current) setStatus(message);
-    else {
-      const snapshot = documentTabSnapshotsRef.current.get(tabId);
-      if (snapshot) documentTabSnapshotsRef.current.set(tabId, { ...snapshot, status: message });
-    }
-  }, []);
   const openExportDialog = useCallback(() => {
     const tabId = activeDocumentTabIdRef.current;
     const state = createDefaultExportDialogState(documentRef.current, lastExportDirectoryRef.current, fileStateRef.current.path);
@@ -12362,10 +12404,10 @@ export function MainWindow({
       if (path.length > 1024 || nativePathBasename(path).length > 256 || new TextEncoder().encode(JSON.stringify([path, nativePathBasename(path)])).length > 2400) throw new Error("The chosen export path is too long for the dialog. Choose a shorter path.");
       const filename = nativePathBasename(path);
       exportGrantsRef.current.set(tabId, { path, filename, format: options.format });
-      setExportTabStatus(tabId, `Export location: ${filename}`);
+      setTabStatus(tabId, `Export location: ${filename}`);
       return { status: "picked", destinationPath: path, filename };
     } catch (error) {
-      if (live()) setExportTabStatus(tabId, `Export location failed: ${String(error)}`);
+      if (live()) setTabStatus(tabId, `Export location failed: ${String(error)}`);
       throw error;
     }
   };
@@ -12407,12 +12449,12 @@ export function MainWindow({
         lastExportDirectoryRef.current = nativePathDirname(path) ?? lastExportDirectoryRef.current;
       }
       const notice = formatExportStatus(descriptor.menuLabel, result.format, result.warnings);
-      if (live()) setExportTabStatus(tabId, notice);
+      if (live()) setTabStatus(tabId, notice);
       const details = [notice, ...result.warnings.map(warning => warning.message)].join("\n");
       // Successful receipts carry a notice only when there are warnings to review.
       return { status: "exported", ...(result.warnings.length ? { notice: boundExportNotice(details) } : {}) };
     } catch (error) {
-      if (live()) setExportTabStatus(tabId, `Export failed: ${String(error)}`);
+      if (live()) setTabStatus(tabId, `Export failed: ${String(error)}`);
       throw error;
     }
   };
@@ -16100,10 +16142,11 @@ export function MainWindow({
       }
 
       if (!event.metaKey && !event.ctrlKey && !event.altKey) {
-        const key = hoverKeyFromEvent(event);
         const tables = hoverShortcutsRef.current;
+        // The literal key decides the re-hit below; the shifted alternate ("+" for a Shift+= some
+        // input paths report as "=") is never a letter or digit, so it would decide the same way.
+        const literalKey = hoverKeyFromEvent(event);
         const assignment = hoverLabelAssignmentRef.current;
-        let labelContinues = false;
         // Over a different atom, element keys (either case) and digits act on that atom; other
         // letters continue the original label ("M" and "e" in OMe), even after pointer drift.
         // Bond shortcuts use the pointer's bond. Other keys follow hoverLabelContinuesForKey.
@@ -16114,32 +16157,36 @@ export function MainWindow({
           const current = hoveredNativeDeleteTargetRef.current;
           const continuingOnAtom = assignment !== undefined && current?.kind === "atom" &&
             current.objectId === assignment.objectId && current.atomId === assignment.atomId &&
-            /^[a-z0-9]$/i.test(key) && !Object.prototype.hasOwnProperty.call(numericBondDrawingHotkeys, key);
+            /^[a-z0-9]$/i.test(literalKey) && !Object.prototype.hasOwnProperty.call(numericBondDrawingHotkeys, literalKey);
           if (retarget && !activeAtomLabelEditRef.current &&
-            (!continuingOnAtom || hasBondHoverShortcut(retarget.pointerTarget, key, tables))) {
+            (!continuingOnAtom || hasBondHoverShortcut(retarget.pointerTarget, literalKey, tables))) {
             labelHoverRetargetRef.current = undefined;
             rederiveNativeCanvasHoverRef.current?.(documentRef.current);
           }
-          // Decide against the pointer's current target before retargeting: element keys (either
-          // case) and digits act on a different atom; non-element letters continue the label there.
-          // Preserve that decision when the hover moves to the atom being labelled.
-          const pointerTarget = hoveredNativeDeleteTargetRef.current;
-          const followsSchemeDefault = hoveredNativeTargetShortcutCommand(pointerTarget, key, keybindingSchemeRef.current, tables) ===
-            hoveredNativeTargetShortcutCommand(pointerTarget, key, keybindingSchemeRef.current);
-          labelContinues = assignment !== undefined && followsSchemeDefault &&
-            hoverLabelContinuesForKey(documentRef.current, pointerTarget, assignment, key);
-          const labelAtom = hoverLabelAtomTargetForKey(
-            documentRef.current,
-            pointerTarget,
-            hoverPagePointRef.current,
-            labelContinues ? assignment : undefined,
-            key,
-            tables
-          );
-          if (labelAtom) {
-            assignHoveredNativeDeleteTarget(labelAtom);
-            labelHoverRetargetRef.current ??= { pointerTarget };
-          }
+        }
+        // Each candidate key (the configured literal binding first, then the shifted alternate) runs
+        // the whole hover route, a label key over a bond moving to the nearer atom included, and the
+        // first that does something wins, before the global registry (which folds +/=) can claim it.
+        const pointerTarget = hoveredNativeDeleteTargetRef.current;
+        const routeFor = (candidate: string) => hoverKeyRoute(
+          documentRef.current,
+          selectedNativeMoleculePart,
+          pointerTarget,
+          hoverPagePointRef.current,
+          assignment,
+          candidate,
+          keybindingSchemeRef.current,
+          tables
+        );
+        const resolved = resolveHoverKey(event, (candidate) => {
+          const route = routeFor(candidate);
+          return route.labelContinues || route.commandId !== undefined ? route : undefined;
+        });
+        const key = resolved.key;
+        const { labelContinues, labelAtom, commandId: hoveredTargetCommandId } = resolved.match ?? routeFor(key);
+        if (labelAtom) {
+          assignHoveredNativeDeleteTarget(labelAtom);
+          labelHoverRetargetRef.current ??= { pointerTarget };
         }
         const hoveredTarget = hoveredNativeDeleteTargetRef.current;
         if (key !== "Shift") {
@@ -16167,14 +16214,6 @@ export function MainWindow({
             return;
           }
         }
-        const hoveredTargetCommandId = activeNativeTargetShortcutCommand(
-          documentRef.current,
-          selectedNativeMoleculePart,
-          hoveredNativeDeleteTargetRef.current,
-          key,
-          keybindingSchemeRef.current,
-          tables
-        );
         if (hoveredTargetCommandId) {
           event.preventDefault();
           const beforeObject = hoveredTarget ? findDocumentObject(documentRef.current, hoveredTarget.objectId) : undefined;
@@ -24731,7 +24770,7 @@ export function MainWindow({
               title={spin3dErrorMessage ?? (interactive3dWorkspace ? interactive3dWorkspaceStatusText({
                 status: interactive3dWorkspace.status, energyLabel: interactive3dWorkspace.energyLabel,
                 warnings: interactive3dWorkspace.session?.warnings ?? []
-              }) : fileWarningsTooltip(warningReports))}>
+              }) : statusMessageTitle(hoveredNativeWarning ?? status, fileWarningsTooltip(warningReports)))}>
               {spin3dErrorMessage ?? (interactive3dWorkspace
                 ? <Interactive3dWorkspaceStatus status={interactive3dWorkspace.status}
                     energyLabel={interactive3dWorkspace.energyLabel} warnings={interactive3dWorkspace.session?.warnings ?? []} />
@@ -26710,6 +26749,38 @@ export function hoverLabelAtomTargetForKey(
   const distance = (atom: MoleculeAtom) => pointer ? Math.hypot(atom.x - pointer.x, atom.y - pointer.y) : 0;
   const nearer = distance(to) < distance(from) ? to : from;
   return { objectId: target.objectId, kind: "atom", atomId: nearer.id, distanceToPointer: distance(nearer) };
+}
+
+/**
+ * Where a hover key goes, the same way for every candidate key: in the ChemDraft scheme a key may
+ * continue a hover label or (an element key over a bond) move to the bond's nearer atom; then the
+ * command it runs on that target, if any. Decided against the pointer's target before retargeting.
+ */
+function hoverKeyRoute(
+  document: ChemDraftDocument,
+  selectedPart: NativeMoleculeSelectionPart | undefined,
+  pointerTarget: NativeMoleculeDeleteTarget | undefined,
+  pointer: ClientPoint | undefined,
+  assignment: HoverLabelAssignment | undefined,
+  key: string,
+  scheme: KeybindingScheme,
+  tables?: HoverShortcutTables
+): { labelContinues: boolean; labelAtom?: NativeMoleculeDeleteTarget; commandId?: string } {
+  if (scheme !== "chemdraft") {
+    return { labelContinues: false, commandId: activeNativeTargetShortcutCommand(document, selectedPart, pointerTarget, key, scheme, tables) };
+  }
+  // Element keys (either case) and digits act on a different atom; non-element letters continue the
+  // label there. A remapped key keeps its own meaning rather than continuing a label.
+  const followsSchemeDefault = hoveredNativeTargetShortcutCommand(pointerTarget, key, scheme, tables) ===
+    hoveredNativeTargetShortcutCommand(pointerTarget, key, scheme);
+  const labelContinues = assignment !== undefined && followsSchemeDefault &&
+    hoverLabelContinuesForKey(document, pointerTarget, assignment, key);
+  const labelAtom = hoverLabelAtomTargetForKey(document, pointerTarget, pointer, labelContinues ? assignment : undefined, key, tables);
+  return {
+    labelContinues,
+    labelAtom,
+    commandId: activeNativeTargetShortcutCommand(document, selectedPart, labelAtom ?? pointerTarget, key, scheme, tables)
+  };
 }
 
 export function activeNativeTargetShortcutCommand(

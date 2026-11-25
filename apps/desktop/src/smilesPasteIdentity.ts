@@ -1,6 +1,6 @@
 import { createEmptyDocument, type ChemDraftDocument } from "@chemdraft/chem-core";
 import {
-  assertMoleculeMatchesSmiles, ChemicalIdentityMismatchError,
+  assertMoleculeMatchesSmiles, atomMapStereoLossMessage, ChemicalIdentityMismatchError,
   type InspectChemicalIdentity,
   type PagePoint, type PastedStructureDepiction
 } from "@chemdraft/document-workflow-core";
@@ -45,6 +45,30 @@ export class SmilesPasteIdentityError extends Error {
         `for "${smiles}". ${detail}`
       : `SMILES paste refused: chemical identity could not be verified for "${smiles}": ${detail}`);
     this.name = "SmilesPasteIdentityError";
+  }
+}
+
+/**
+ * After the paste stripped atom-map numbers, name any stereo the maps alone made specifiable
+ * (`atomMapStereoLossMessage`). The drawing follows the stripped SMILES; this only tells the user.
+ * Undefined when nothing was lost or the engine reads the mapped input as invalid (the stripped
+ * input's own identity check still decides whether the paste happens).
+ */
+export async function atomMapStereoLossStatus(
+  mapped: string, stripped: string, inspect: InspectChemicalIdentity = inspectPasteIdentity, signal?: AbortSignal
+): Promise<string | undefined> {
+  if (!/[@\\/]/.test(mapped)) return undefined;
+  try {
+    const before = await inspect("smiles", mapped);
+    signal?.throwIfAborted();
+    const after = await inspect("smiles", stripped);
+    signal?.throwIfAborted();
+    if (!before.valid || !after.valid) return undefined;
+    return atomMapStereoLossMessage(before.canonicalSmiles, after.canonicalSmiles);
+  } catch (error) {
+    signal?.throwIfAborted();
+    // The paste itself was verified; never let this note silently vanish either.
+    return `Stereo after removing atom-map numbers could not be checked: ${error instanceof Error ? error.message : String(error)}`;
   }
 }
 

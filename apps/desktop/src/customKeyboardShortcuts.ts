@@ -1,6 +1,6 @@
 import { createEmptyDocument } from "@chemdraft/chem-core";
 import {
-  hoverKeyFromEvent, keyFromCode, normalizeShortcut, parseShortcutDisplay, reservedShortcutReason,
+  keyFromCode, normalizeShortcut, parseShortcutDisplay, recordedHoverKeyFromEvent, reservedShortcutReason,
   type ShortcutAction, type ShortcutOverrides, type ShortcutPlatform
 } from "@chemdraft/shortcut-engine";
 import { buildAppMenuModel, flattenAppMenuCommands } from "./appMenu";
@@ -84,7 +84,8 @@ export function capturedShortcut(
   if (reason) return { reason };
   if (scope !== "commands") {
     if (event.metaKey || event.ctrlKey || event.altKey) return { reason: "Use a single key, with Shift if needed, for hover actions." };
-    const key = hoverKeyFromEvent(event);
+    // Shift+= is the + key, even when the event reports the unshifted legend "=".
+    const key = recordedHoverKeyFromEvent(event);
     return key.length === 1 ? { key } : { reason: "Use a letter, number, or symbol for hover actions." };
   }
   const key = tokens.at(-1) ?? "";

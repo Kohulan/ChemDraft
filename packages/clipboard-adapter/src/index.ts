@@ -1342,6 +1342,14 @@ function parseV3000Molfile(molfile: string): ParsedMolfileGraph {
   };
 }
 
+/**
+ * Clipboard text as the molfile readers here read it: one newline convention, a Mac length-prefixed
+ * record stream decoded, NULs removed. Exported so other readers of the same text agree with them.
+ */
+export function normalizeClipboardMolfileText(text: string): string {
+  return normalizeClipboardText(text);
+}
+
 function normalizeClipboardText(text: string): string {
   const normalized = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
   return decodeMacLengthPrefixedMolfile(normalized) ?? normalized.replace(/\0/g, "");
@@ -1457,17 +1465,25 @@ function parseV2000CountsLine(line: string): { atomCount: number; bondCount: num
   return short ? { atomCount: Number(short[1]), bondCount: Number(short[2]) } : undefined;
 }
 
-export function findV2000CountsLineIndex(lines: readonly string[]): number {
+/**
+ * The atom and bond counts of `line` when it has the shape of a V2000 counts line, in every form
+ * this reader accepts: fixed-width "aaabbb" (abutting when both reach 100), or unpadded separate
+ * fields, with or without the version tag. Undefined for anything else.
+ */
+export function readV2000CountsLine(line: string): { atomCount: number; bondCount: number } | undefined {
+  const counts = parseV2000CountsLine(line);
   // A V2000 counts line is "aaabbb...  V2000" (atoms, bonds, then 9 more fields + tag).
   // Requiring either the explicit V2000 tag or the full 6+ field shape avoids mis-reading
   // ordinary two-number text (e.g. "42 17 results found") as a counts line.
-  return lines.findIndex((line) =>
-    parseV2000CountsLine(line) !== undefined && (
-      /\bV2000\b/.test(line) || line.trim().split(/\s+/).length >= 6 ||
-      // Count the remaining fields separately when aaa and bbb abut.
-      /^(?:\s+\d+){4,}\s*$/.test(line.slice(6))
-    )
-  );
+  return counts && (
+    /\bV2000\b/.test(line) || line.trim().split(/\s+/).length >= 6 ||
+    // Count the remaining fields separately when aaa and bbb abut.
+    /^(?:\s+\d+){4,}\s*$/.test(line.slice(6))
+  ) ? counts : undefined;
+}
+
+export function findV2000CountsLineIndex(lines: readonly string[]): number {
+  return lines.findIndex((line) => readV2000CountsLine(line) !== undefined);
 }
 
 function decodeMacLengthPrefixedMolfile(text: string): string | undefined {
