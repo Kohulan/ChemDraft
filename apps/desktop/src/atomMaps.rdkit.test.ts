@@ -50,7 +50,28 @@ const molfiles: [string, string][] = [
   ["V3000 positional with a plus sign", v3000(["M  V30 1 C 0 0 0 +5", "M  V30 2 O 1.5 0 0 0"], ["M  V30 1 1 1 2"])],
   ["V3000 positional with leading zeros", v3000(["M  V30 1 C 0 0 0 007", "M  V30 2 O 1.5 0 0 0"], ["M  V30 1 1 1 2"])],
   ["V3000 negative positional", v3000(["M  V30 1 C 0 0 0 -5", "M  V30 2 O 1.5 0 0 0"], ["M  V30 1 1 1 2"])],
-  ["V3000 atom records out of ID order", v3000(["M  V30 2 O 1.5 0 0 0", "M  V30 1 * 0 0 0 1"], ["M  V30 1 1 1 2"])]
+  ["V3000 atom records out of ID order", v3000(["M  V30 2 O 1.5 0 0 0", "M  V30 1 * 0 0 0 1"], ["M  V30 1 1 1 2"])],
+  // 1.2.3 fourth review.
+  ["V2000 alkene whose header lines spell a V3000 atom block", v2000(["M  V30 BEGIN ATOM", "M  V30 1 C 0 0 0 +5", "M  V30 END ATOM"],
+    "  4  3  0  0  0  0  0  0  0  0999 V2000", [0, 1, 2, 3].map(index => atomLine(at(index * 1.5), "C", 0)),
+    ["  1  2  1  0", "  2  3  2  0", "  3  4  1  0"])],
+  ["V3000 whose header lines spell a V2000 connection table", v3000(["M  V30 1 C 0 0 0 0"]).replace(/^\n {2}Other\n\n/,
+    "  1  0  0  0  0  0  0  0  0  0999 V2000\n    0.0000    0.0000    0.0000 C   0  0  0  0  0  0  0  0  0  5  0  0\nM  END\n")],
+  ["V3000 continuation whose next line starts with the separator", v3000(["M  V30 1 C 0 0 0-", "M  V30  +1", "M  V30 2 O 1.5 0 0 0"], ["M  V30 1 1 1 2"])]
+];
+
+/**
+ * Fixtures read with their drawing: ChemDraft's R-group exception applies only to its own output
+ * (blank title and comment, "  ChemDraft", an unsigned R number), so here too the detector finds
+ * exactly the maps RDKit finds.
+ */
+const drawnR1 = [{ element: "R1", neighbours: ["O"] }, { element: "O", neighbours: ["*"] }];
+const ownV3000 = (header: readonly string[], value: string) => [...header, "  0  0  0     0  0            999 V3000",
+  "M  V30 BEGIN CTAB", "M  V30 COUNTS 2 1 0 0 0", "M  V30 BEGIN ATOM", `M  V30 1 * 0 0 0 ${value}`, "M  V30 2 O 1.5 0 0 0",
+  "M  V30 END ATOM", "M  V30 BEGIN BOND", "M  V30 1 1 1 2", "M  V30 END BOND", "M  V30 END CTAB", "M  END"].join("\n");
+const molfilesWithDrawing: [string, string][] = [
+  ["V3000 with a bare \"M  V30\" title over ChemDraft's program line", ownV3000(["M  V30", "  ChemDraft", ""], "1")],
+  ["V3000 R-group number with a sign, ChemDraft's header", ownV3000(["", "  ChemDraft", ""], "+1")]
 ];
 
 const smiles = [
@@ -76,6 +97,10 @@ const sorted = (values: readonly number[]) => [...values].sort((a, b) => a - b);
 describe("atom-map detector agrees with RDKit", () => {
   it.each(molfiles)("molfile: %s", async (_name, text) => {
     expect(sorted(molfileAtomMapNumbers(text))).toEqual(sorted(await rdkitMaps(text)));
+  });
+
+  it.each(molfilesWithDrawing)("molfile with its drawing: %s", async (_name, text) => {
+    expect(sorted(molfileAtomMapNumbers(text, drawnR1))).toEqual(sorted(await rdkitMaps(text)));
   });
 
   it.each(smiles)("SMILES: %s", async text => {

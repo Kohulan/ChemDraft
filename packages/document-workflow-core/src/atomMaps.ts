@@ -132,16 +132,20 @@ interface V2000Counts extends CountsReading { index: number }
  * blank lines before the header are allowed; a blank title looks the same, so each candidate
  * position is tried, each reading of it (`v2000CountsReadings`), and must be followed by a real
  * connection table, which a comment shaped like a counts line (even one declaring no atoms) is not.
- * Only when no standard position holds one are the header lines tried, in order, as the clipboard
- * reader tries them: a ChemDraw for Mac RXN block has a one-line header. They too must be followed
- * by a real connection table. When no candidate passes, maps are still read from the first one
+ * Only when no standard position holds a counts-shaped line at all (V2000 or V3000), so the text
+ * has no three-line header, are its first lines tried, in order, as the clipboard reader tries
+ * them: a ChemDraw for Mac RXN block has a one-line header. They too must be followed by a real
+ * connection table. When no candidate passes, maps are still read from the first one
  * whose declared atom lines all read as atoms (a missed map is lost data; an extra notice is noise).
  */
 function v2000CountsLine(lines: readonly string[]): V2000Counts | undefined {
-  let leadingBlank = 0;
-  while (leadingBlank < lines.length && blankLine(lines[leadingBlank]!)) leadingBlank += 1;
-  const standard = Array.from({ length: leadingBlank + 1 }, (_, offset) => offset + 3);
-  const shortHeader = Array.from({ length: leadingBlank + 3 }, (_, index) => index);
+  const leadingBlank = leadingBlankLines(lines);
+  const standard = Array.from({ length: leadingBlank + 1 }, (_, offset) => offset + 3).filter(index => index < lines.length);
+  // A counts line (V2000 or V3000) at a standard position means the text has a three-line header,
+  // and header lines are never structure. Only a text without one (a one-line RXN block header)
+  // has its first lines tried.
+  const hasHeader = standard.some(index => v2000CountsReadings(lines[index]!).length > 0 || v3000CountsShaped(lines[index]!));
+  const shortHeader = hasHeader ? [] : Array.from({ length: leadingBlank + 3 }, (_, index) => index);
   const candidates = [...standard, ...shortHeader].filter(index => index < lines.length)
     .flatMap(index => v2000CountsReadings(lines[index]!).map(reading => ({ index, ...reading })));
   const atomsOf = (counts: V2000Counts) => lines.slice(counts.index + 1, counts.index + 1 + counts.atomCount);
@@ -159,8 +163,23 @@ function v2000CountsLine(lines: readonly string[]): V2000Counts | undefined {
   return strict ?? candidates.find(counts => counts.atomCount > 0 && atomsRead(counts));
 }
 
-/** Whether `line`, the program line of a header, is ChemDraft's own writer's (`chem-core` molfile.ts). */
-const chemDraftProgramLine = (line: string | undefined) => /^ {2}ChemDraft\s*$/.test(line ?? "");
+/** Blank lines before the header. The V2000 reading allows them; RDKit reads them as the header. */
+function leadingBlankLines(lines: readonly string[]): number {
+  let count = 0;
+  while (count < lines.length && blankLine(lines[count]!)) count += 1;
+  return count;
+}
+
+/** A V3000 counts line ("  0  0  0     0  0            999 V3000", or a short "0 0 V3000"). */
+const v3000CountsShaped = (line: string) => /\bV3000\s*$/i.test(line);
+
+/**
+ * Whether the counts line at `countsIndex` follows ChemDraft's own writer's header (`chem-core`
+ * molfile.ts): exactly a blank title, the "  ChemDraft" program line and a blank comment, at the
+ * top of the text. Any other header (a title, a line before it) is not ChemDraft's output.
+ */
+const chemDraftHeader = (lines: readonly string[], countsIndex: number) => countsIndex === 3 &&
+  blankLine(lines[0]!) && /^ {2}ChemDraft\s*$/.test(lines[1]!) && blankLine(lines[2]!);
 
 /** V2000 `M  RGP` entries: atom number → R-group number. */
 function v2000RGroupNumbers(lines: readonly string[]): Map<number, number> {
@@ -175,7 +194,7 @@ function v2000RGroupNumbers(lines: readonly string[]): Map<number, number> {
 
 /**
  * Whether atom `atomNumber` (1-based) is ChemDraft's own spelling of a drawn R-group, so its map
- * column holds that R number, not a map. Only in a molfile whose program line is ChemDraft's, and
+ * column holds that R number, not a map. Only in a molfile with ChemDraft's own header, and
  * only tied to that very atom: an `R#` whose own `M  RGP` / `RGROUPS=` number is the map, or a `*`
  * with no R-group entry whose drawn atom at the same position (`drawn`, the molecule's atoms in the
  * order ChemDraft writes them) is labelled R<map>. A `*` with nothing tying it to a drawn Rn is a map.
@@ -217,7 +236,7 @@ function mapUnion(first: readonly number[], second: readonly number[]): number[]
 function v2000AtomMapNumbers(lines: readonly string[], drawn: DrawnAtoms | undefined): number[] {
   const counts = v2000CountsLine(lines);
   if (!counts) return [];
-  const ownWriter = chemDraftProgramLine(lines[counts.index - 2]);
+  const ownWriter = chemDraftHeader(lines, counts.index);
   const atomLines = lines.slice(counts.index + 1, counts.index + 1 + counts.atomCount);
   const rgroups = ownWriter ? v2000RGroupNumbers(lines.slice(counts.index + 1 + counts.atomCount)) : new Map<number, number>();
   return atomLines.flatMap((line, index) => {
@@ -232,21 +251,27 @@ const v3000Integer = (text: string | undefined) => /^[+-]?\d+$/.test(text ?? "")
 
 function v3000AtomMapNumbers(lines: readonly string[], drawn: DrawnAtoms | undefined): number[] {
   const blockLine = (line: string) => /^M {2}V30(?:\s|$)/.test(line);
-  if (!lines.some(blockLine)) return [];
-  // The counts line is the last non-blank line before BEGIN CTAB; the program line two above it.
-  const beginCtab = lines.findIndex(line => /^M {2}V30\s+BEGIN\s+CTAB\b/.test(line));
+  // The three header lines are never structure, in either reading: RDKit's (lines 1-3) or the V2000
+  // reading's, which allows blank lines before them. A valid V3000 CTAB never starts earlier: its
+  // counts line, BEGIN CTAB and COUNTS lines all come after the blank lines.
+  const start = leadingBlankLines(lines) + 3;
+  if (!lines.slice(start).some(blockLine)) return [];
+  // The counts line is the last non-blank line before BEGIN CTAB; ChemDraft's header the three above it.
+  const beginCtab = lines.findIndex((line, index) => index >= start && /^M {2}V30\s+BEGIN\s+CTAB\b/.test(line));
   let countsIndex = beginCtab - 1;
   while (countsIndex >= 0 && blankLine(lines[countsIndex]!)) countsIndex -= 1;
-  const ownWriter = beginCtab >= 0 && countsIndex >= 2 && chemDraftProgramLine(lines[countsIndex - 2]);
-  const atoms: { id: string; symbol: string; value: number; keyword: boolean; rgroup: number | undefined }[] = [];
+  const ownWriter = beginCtab >= 0 && chemDraftHeader(lines, countsIndex);
+  const atoms: { id: string; symbol: string; value: number; native: boolean; keyword: boolean; rgroup: number | undefined }[] = [];
   let inAtoms = false;
   let pending = "";
-  for (const raw of lines) {
+  for (const raw of lines.slice(start)) {
     if (!blockLine(raw)) continue;
-    const body = raw.replace(/^M {2}V30\s*/, "").trim();
-    // A V3000 line ending in "-" continues on the next M  V30 line.
-    if (body.endsWith("-")) { pending += body.slice(0, -1); continue; }
-    const line = (pending + body).trim();
+    // The text after "M  V30 ", as RDKit reads it. A line ending in "-" continues on the next M  V30
+    // line: the "-" is dropped and the next line's text appended whole, so a leading space there
+    // still separates two fields ("0-" then " +1" is "0 +1").
+    const joined = pending + raw.replace(/^M {2}V30 ?/, "");
+    if (joined.trimEnd().endsWith("-")) { pending = joined.trimEnd().slice(0, -1); continue; }
+    const line = joined.trim();
     pending = "";
     if (/^BEGIN\s+ATOM\b/.test(line)) { inAtoms = true; continue; }
     if (/^END\s+ATOM\b/.test(line)) { inAtoms = false; continue; }
@@ -258,6 +283,8 @@ function v3000AtomMapNumbers(lines: readonly string[], drawn: DrawnAtoms | undef
     const rgroupText = /\bRGROUPS\s*=\s*\(\s*1\s+(\d+)\s*\)/i.exec(line)?.[1];
     atoms.push({
       id: fields[0] ?? "", symbol: fields[1] ?? "", value: positional > 0 ? positional : v3000Integer(keywordText),
+      // ChemDraft writes the R-group number bare: no sign, no leading zeros ("+1" and "01" are not its).
+      native: positional > 0 && fields[5] === String(positional),
       keyword: keywordText !== undefined, rgroup: rgroupText !== undefined ? Number(rgroupText) : undefined
     });
   }
@@ -266,7 +293,7 @@ function v3000AtomMapNumbers(lines: readonly string[], drawn: DrawnAtoms | undef
   const ordered = atoms.every((atom, index) => atom.id === String(index + 1));
   return atoms.flatMap((atom, index) => {
     if (atom.value <= 0) return [];
-    const own = ordered && !atom.keyword && ownRGroupAtom(ownWriter, atom.symbol, atom.value, atom.rgroup, index + 1, drawn);
+    const own = ordered && atom.native && !atom.keyword && ownRGroupAtom(ownWriter, atom.symbol, atom.value, atom.rgroup, index + 1, drawn);
     return own ? [] : [atom.value];
   });
 }

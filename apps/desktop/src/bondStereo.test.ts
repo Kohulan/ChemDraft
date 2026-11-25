@@ -168,7 +168,9 @@ describe("bond stereo commands", () => {
     ["V3000 AAMAP = 7 with spaces", true],
     ["V3000 AAMAP=0 beside a positional map", true],
     ["V3000 short counts line and a blank line before the block", true],
-    ["SMILES [*:1] on another atom than the drawn R1", true]
+    ["SMILES [*:1] on another atom than the drawn R1", true],
+    ["V2000 whose header lines spell a V3000 atom block", false],
+    ["V3000 map continued on a line that starts with its separator", true]
   ] as const)("locks E/Z exactly when the open report warns of atom maps: %s", (format, locked) => {
     const { document, molecule, target } = drawing("C/C=C/C");
     let changes: Partial<typeof molecule>;
@@ -183,6 +185,19 @@ describe("bond stereo commands", () => {
       const atomLine = lines.indexOf("M  V30 BEGIN ATOM") + 1;
       expect(lines[atomLine]).toMatch(/ 0$/);
       lines.splice(atomLine, 1, lines[atomLine]!.replace(/ 0$/, " -"), "M  V30 1");
+      changes = { structureFormat: "molfile-v3000", structure: lines.join("\n") };
+    } else if (format === "V2000 whose header lines spell a V3000 atom block") {
+      // RDKit reads this as CC=CC, unmapped: header lines are never structure.
+      const lines = molecule.structure.split("\n");
+      expect(lines[3]).toMatch(/V2000\s*$/);
+      lines.splice(0, 3, "M  V30 BEGIN ATOM", "M  V30 1 C 0 0 0 +5", "M  V30 END ATOM");
+      changes = { structure: lines.join("\n") };
+    } else if (format === "V3000 map continued on a line that starts with its separator") {
+      const lines = moleculeToMolfileV3000(molecule, { fromDocFrame: true, kekuleBondOrders: new Map() }).contents.split("\n");
+      const atomLine = lines.indexOf("M  V30 BEGIN ATOM") + 1;
+      expect(lines[atomLine]).toMatch(/ 0$/);
+      // The aamap field moves to the next line: "x y 0-" then " +1" joins as "x y 0 +1", map 1.
+      lines.splice(atomLine, 1, lines[atomLine]!.replace(/ 0$/, "-"), "M  V30  +1");
       changes = { structureFormat: "molfile-v3000", structure: lines.join("\n") };
     } else if (format.startsWith("V3000 ")) {
       const lines = moleculeToMolfileV3000(molecule, { fromDocFrame: true, kekuleBondOrders: new Map() }).contents.split("\n");

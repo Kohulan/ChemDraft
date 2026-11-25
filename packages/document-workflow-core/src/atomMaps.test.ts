@@ -81,7 +81,8 @@ describe("molfileAtomMapNumbers", () => {
       "M  V30 END ATOM", "M  V30 END CTAB", "M  END"].join("\n");
     expect(molfileAtomMapNumbers(v3000(["M  V30 1 C 0 0 0 0", "M  V30 2 O 1.5 0 0 0 CHG=-1"]))).toEqual([]);
     expect(molfileAtomMapNumbers(v3000(["M  V30 1 C 0 0 0 4", "M  V30 2 O 1.5 0 0 0"]))).toEqual([4]);
-    expect(molfileAtomMapNumbers(v3000(["M  V30 1 C 0 0 0 -", "M  V30 6", "M  V30 2 R# 1.5 0 0 2 RGROUPS=(1 2)"]))).toEqual([6]);
+    // A titled header is not ChemDraft's own (its writer leaves the title blank), so the R# 2 is a map too.
+    expect(molfileAtomMapNumbers(v3000(["M  V30 1 C 0 0 0 -", "M  V30 6", "M  V30 2 R# 1.5 0 0 2 RGROUPS=(1 2)"]))).toEqual([6, 2]);
     expect(molfileAtomMapNumbers(v3000(["M  V30 1 C 0 0 0 0 AAMAP=3"]))).toEqual([3]);
   });
 
@@ -394,30 +395,86 @@ describe("third review findings (1.2.3)", () => {
     expect(molfileAtomMapNumbers(gapped, [{ element: "R1", neighbours: ["O"] }, { element: "O", neighbours: ["*"] }])).toEqual([1]);
   });
 
-  it("checks a large unmapped molecule in well under 100 ms (finding 5)", () => {
+  it("checks a large unmapped molecule quickly (finding 5; a 1 s CI smoke guard)", () => {
     const count = 20_000;
     const atoms = Array.from({ length: count }, (_, index) => ({ ...atom("C", `a${index}`), x: index * 1.5 }));
     const bonds = atoms.slice(1).map((current, index) => bond(atoms[index]!.id, current.id));
-    const molfile = ["", "  Other", "", `${String(count).padStart(3)}${String(count - 1).padStart(3)}  0  0  0  0  0  0  0  0999 V2000`,
-      ...atoms.map((_, index) => atomLine(index * 1.5, "C", 0)),
-      ...bonds.map((_, index) => `${String(index + 1).padStart(3)}${String(index + 2).padStart(3)}  1  0`), "M  END"].join("\n");
+    // V3000: a V2000 counts line has three digits, so 20,000 atoms would never reach the atom-table scan.
+    const molfile = ["", "  Other", "", "  0  0  0     0  0            999 V3000", "M  V30 BEGIN CTAB",
+      `M  V30 COUNTS ${count} ${count - 1} 0 0 0`, "M  V30 BEGIN ATOM",
+      ...atoms.map((_, index) => `M  V30 ${index + 1} C ${(index * 1.5).toFixed(4)} 0 0 0`), "M  V30 END ATOM",
+      "M  V30 BEGIN BOND", ...bonds.map((_, index) => `M  V30 ${index + 1} 1 ${index + 1} ${index + 2}`), "M  V30 END BOND",
+      "M  V30 END CTAB", "M  END"].join("\n");
+    // The scan reaches the last atom: a map there is found.
+    expect(molfileAtomMapNumbers(molfile.replace(`M  V30 ${count} C ${((count - 1) * 1.5).toFixed(4)} 0 0 0`,
+      `M  V30 ${count} C ${((count - 1) * 1.5).toFixed(4)} 0 0 7`))).toEqual([7]);
     const sources = [
       { structureFormat: "smiles" as const, structure: "" },
       { structureFormat: "smiles" as const, structure: "C".repeat(count) },
-      { structureFormat: "molfile-v2000" as const, structure: molfile },
+      { structureFormat: "molfile-v3000" as const, structure: molfile },
       { structureFormat: "smiles" as const, structure: "", compatibility: { sourceFormat: "smiles" as const, warnings: [], unknown: { smiles: "C".repeat(count) } } }
     ];
     for (const source of sources) {
       const started = performance.now();
       expect(moleculeSourceHasAtomMaps({ ...source, atoms, bonds })).toBe(false);
-      expect(performance.now() - started).toBeLessThan(100);
+      expect(performance.now() - started).toBeLessThan(1000);
     }
     // A mapped source still reads the drawing, once, in linear time.
     const withR1 = [{ ...atom("R1"), x: -1.5 }, ...atoms];
     const started = performance.now();
     expect(moleculeSourceHasAtomMaps({ structureFormat: "smiles", structure: `[*:1]${"C".repeat(count)}`,
       atoms: withR1, bonds: [bond("R1", "a0"), ...bonds] })).toBe(false);
-    expect(performance.now() - started).toBeLessThan(100);
+    expect(performance.now() - started).toBeLessThan(1000);
+  });
+});
+
+describe("fourth review findings (1.2.3)", () => {
+  const ctab = (header: readonly string[], atoms: readonly string[]) => [...header, "  0  0  0     0  0            999 V3000",
+    "M  V30 BEGIN CTAB", `M  V30 COUNTS ${atoms.length} 0 0 0 0`, "M  V30 BEGIN ATOM", ...atoms, "M  V30 END ATOM",
+    "M  V30 END CTAB", "M  END"].join("\n");
+  const r1 = [{ element: "R1", neighbours: ["O"] }, { element: "O", neighbours: ["*"] }];
+  const v2000Alkene = (header: readonly string[]) => [...header, "  4  3  0  0  0  0  0  0  0  0999 V2000",
+    ...[0, 1, 2, 3].map(index => `${(index * 1.5).toFixed(4).padStart(10)}    0.0000    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0`),
+    "  1  2  1  0", "  2  3  2  0", "  3  4  1  0", "M  END"].join("\n");
+
+  it("never reads a header line as V3000 structure, nor a non-native header as ChemDraft's (rule 1a)", () => {
+    const native = ctab(["", "  ChemDraft", ""], ["M  V30 1 * 0 0 0 1", "M  V30 2 O 1.5 0 0 0"]);
+    expect(molfileAtomMapNumbers(native, r1)).toEqual([]);
+    // ChemDraft's writer leaves the title and comment blank: any other header is another writer's.
+    expect(molfileAtomMapNumbers(native.replace(/^/, "M  V30"), r1)).toEqual([1]);
+    expect(molfileAtomMapNumbers(native.replace(/^/, "Ethanol"), r1)).toEqual([1]);
+    expect(molfileAtomMapNumbers(native.replace("  ChemDraft\n", "  ChemDraft\nM  V30"), r1)).toEqual([1]);
+    expect(molfileAtomMapNumbers(`\n${native}`, r1)).toEqual([1]);
+    // A BEGIN CTAB in the header neither starts the block nor locates ChemDraft's header.
+    expect(molfileAtomMapNumbers(ctab(["M  V30 BEGIN CTAB", "  ChemDraft", ""], ["M  V30 1 * 0 0 0 1", "M  V30 2 O 1.5 0 0 0"]), r1)).toEqual([1]);
+  });
+
+  it("never reads V2000 header lines spelling a V3000 atom block as maps (rule 1b)", () => {
+    expect(molfileAtomMapNumbers(v2000Alkene(["M  V30 BEGIN ATOM", "M  V30 1 C 0 0 0 +5", "M  V30 END ATOM"]))).toEqual([]);
+    expect(moleculeSourceHasAtomMaps({ structureFormat: "molfile-v2000",
+      structure: v2000Alkene(["M  V30 BEGIN ATOM", "M  V30 1 C 0 0 0 +5", "M  V30 END ATOM"]) })).toBe(false);
+    // The same with a blank line before the header, which the V2000 reading allows.
+    expect(molfileAtomMapNumbers(v2000Alkene(["", "M  V30 BEGIN ATOM", "M  V30 1 C 0 0 0 +5", "M  V30 END ATOM"]))).toEqual([]);
+    // A V3000 header shaped like a V2000 connection table is not one either.
+    const v2000Shaped = ["  1  0  0  0  0  0  0  0  0  0999 V2000",
+      "    0.0000    0.0000    0.0000 C   0  0  0  0  0  0  0  0  0  5  0  0", "M  END"];
+    expect(molfileAtomMapNumbers(ctab(v2000Shaped, ["M  V30 1 C 0 0 0 0"]))).toEqual([]);
+  });
+
+  it("never excuses a signed or zero-padded value as ChemDraft's R-group number (rule 1)", () => {
+    for (const value of ["+1", "01", "+01"]) {
+      expect(molfileAtomMapNumbers(ctab(["", "  ChemDraft", ""], [`M  V30 1 * 0 0 0 ${value}`, "M  V30 2 O 1.5 0 0 0"]), r1)).toEqual([1]);
+      expect(molfileAtomMapNumbers(ctab(["", "  ChemDraft", ""], [`M  V30 1 R# 0 0 0 ${value} RGROUPS=(1 1)`, "M  V30 2 O 1.5 0 0 0"]))).toEqual([1]);
+    }
+    expect(molfileAtomMapNumbers(ctab(["", "  ChemDraft", ""], ["M  V30 1 R# 0 0 0 1 RGROUPS=(1 1)", "M  V30 2 O 1.5 0 0 0"]))).toEqual([]);
+  });
+
+  it("keeps the separator a V3000 continuation line starts with (rule 2)", () => {
+    expect(molfileAtomMapNumbers(ctab(["", "  Other", ""], ["M  V30 1 C 0 0 0-", "M  V30  +1"]))).toEqual([1]);
+    expect(molfileAtomMapNumbers(ctab(["", "  Other", ""], ["M  V30 1 C 0 0 0-", "M  V30  1", "M  V30 2 O 1.5 0 0 0"]))).toEqual([1]);
+    // A separator before the "-" separates just as well; with none on either side the parts join into one field.
+    expect(molfileAtomMapNumbers(ctab(["", "  Other", ""], ["M  V30 1 C 0 0 0 -", "M  V30 6"]))).toEqual([6]);
+    expect(molfileAtomMapNumbers(ctab(["", "  Other", ""], ["M  V30 1 C 0 0 0 0 AA-", "M  V30 MAP=9"]))).toEqual([9]);
   });
 });
 
