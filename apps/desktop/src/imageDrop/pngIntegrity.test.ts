@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { DAMAGED_PNG_IMAGE_DATA, PNG_SURPLUS_IMAGE_DATA_BYTES, pngImageDataError } from "./pngIntegrity";
+import { DAMAGED_PNG_IMAGE_DATA, EventLoopTurns, PNG_SURPLUS_IMAGE_DATA_BYTES, pngImageDataError } from "./pngIntegrity";
 import { bytesToBase64, prepareDroppedImage } from "./prepareDroppedImage";
 import type { DecodeCheck, DroppedImageDecoders } from "./rasterDecode";
 import { damagedDropFixture, testPng, writeTestPng, type TestPngChunk, type TestPngOptions } from "./pngTestImages";
@@ -40,12 +40,12 @@ const swapLastAdler = (stream: Uint8Array) => {
  * An RGBA picture whose image data is all zeros (filter 0, black transparent pixels), with `extra`
  * zero bytes more: built from a hand-made stream, so a large one costs nothing to make.
  */
-function zeroPng(width: number, height: number, extra = 0): Uint8Array {
+function zeroPng(width: number, height: number, extra = 0, change = (stream: Uint8Array) => stream): Uint8Array {
   const header = new Uint8Array(13);
   new DataView(header.buffer).setUint32(0, width);
   new DataView(header.buffer).setUint32(4, height);
   header.set([8, 6, 0, 0, 0], 8);
-  const stream = zlibOfZeros((1 + width * 4) * height + extra);
+  const stream = change(zlibOfZeros((1 + width * 4) * height + extra));
   return writeTestPng([{ type: "IHDR", data: header }, { type: "IDAT", data: stream }, { type: "IEND", data: new Uint8Array() }]);
 }
 
@@ -221,6 +221,100 @@ describe("pngImageDataError keeps the window responsive and honours the file's d
     const reason = new Error("reading it took longer than 30 seconds.");
     controller.abort(reason);
     await expect(prepareDroppedImage("late.png", testPng({ width: 4, height: 4 }), decoders, { signal: controller.signal })).rejects.toBe(reason);
+  });
+
+  it("is not slowed by a hidden window's throttled timers: each setTimeout one second late", async () => {
+    const realSetTimeout = globalThis.setTimeout;
+    const throttled = vi.fn((callback: () => void, ms?: number) => realSetTimeout(callback, Math.max(ms ?? 0, 1000)));
+    vi.stubGlobal("setTimeout", throttled);
+    const started = performance.now();
+    expect(await pngImageDataError(zeroPng(8000, 8000))).toBeUndefined();
+    const elapsed = performance.now() - started;
+    vi.unstubAllGlobals();
+    // A setTimeout(0) per ~12 ms turn would take minutes; timer turns give up after 16 ms.
+    expect(elapsed).toBeLessThan(15_000);
+    expect(throttled).toHaveBeenCalled();
+  });
+
+  it("falls back to setTimeout(0) turns where there is no MessageChannel", async () => {
+    vi.stubGlobal("MessageChannel", undefined);
+    const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
+    expect(await pngImageDataError(zeroPng(3000, 3000))).toBeUndefined();
+    expect(setTimeoutSpy.mock.calls.filter(call => call[1] === 0).length).toBeGreaterThan(1);
+    setTimeoutSpy.mockRestore();
+  });
+
+  it("lets the real deadline timer fire during a long check, with the deadline's wording", async () => {
+    const controller = new AbortController();
+    const reason = new Error("reading it took longer than 30 seconds.");
+    const timer = setTimeout(() => controller.abort(reason), 30);
+    await expect(prepareDroppedImage("big.png", zeroPng(8000, 8000), decoders, { signal: controller.signal })).rejects.toBe(reason);
+    clearTimeout(timer);
+  });
+
+  it("settles a pause at once when the signal aborts during it, and closes the channel", async () => {
+    const closeSpy = vi.spyOn(MessagePort.prototype, "close");
+    const controller = new AbortController();
+    const reason = new Error("reading it took longer than 30 seconds.");
+    const turns = new EventLoopTurns(controller.signal);
+    await turns.pause();
+    const paused = turns.pause();
+    controller.abort(reason);
+    await expect(paused).rejects.toBe(reason);
+    await expect(turns.pause()).rejects.toBe(reason);
+    turns.close();
+    expect(closeSpy).toHaveBeenCalledTimes(2);
+    closeSpy.mockRestore();
+  });
+
+  it("closes its channel at the end of every check: passed, refused, aborted", async () => {
+    const closeSpy = vi.spyOn(MessagePort.prototype, "close");
+    const large = zeroPng(3000, 3000);
+    expect(await pngImageDataError(large)).toBeUndefined();
+    expect(closeSpy).toHaveBeenCalledTimes(2);
+    const damaged = zeroPng(3000, 3000, 0, swapLastAdler);
+    expect(await pngImageDataError(damaged)).toBe(DAMAGED_PNG_IMAGE_DATA);
+    expect(closeSpy).toHaveBeenCalledTimes(4);
+    const controller = new AbortController();
+    const reason = new Error("reading it took longer than 30 seconds.");
+    setTimeout(() => controller.abort(reason), 5);
+    await expect(pngImageDataError(large, { signal: controller.signal })).rejects.toBe(reason);
+    expect(closeSpy).toHaveBeenCalledTimes(6);
+    closeSpy.mockRestore();
+  });
+
+  it("runs several checks at once, each on its own channel", async () => {
+    const results = await Promise.all([zeroPng(2000, 2000), zeroPng(1500, 2500), zeroPng(2000, 1000, 0, swapLastAdler)].map(png => pngImageDataError(png)));
+    expect(results).toEqual([undefined, undefined, DAMAGED_PNG_IMAGE_DATA]);
+  });
+
+  it("reports an abort as the deadline wherever it lands, never as damage", async () => {
+    const reason = new Error("reading it took longer than 30 seconds.");
+    // Before the first turn: a check too small to pause, aborted as it starts.
+    const small = new AbortController();
+    const smallCheck = pngImageDataError(testPng({ width: 64, height: 64, colourType: 6 }), { signal: small.signal });
+    small.abort(reason);
+    await expect(smallCheck).rejects.toBe(reason);
+    // Mid-CRC (64 MiB of IDAT, its IEND CRC bad) and mid-inflate (a bad Adler-32 at the end): the
+    // abort lands during the first, third or tenth turn, and the reason is the deadline's every time.
+    const badCrc = zeroPng(2000, 2000, 0, stream => concat(stream, new Uint8Array(64 * 1024 * 1024)));
+    badCrc[badCrc.length - 1] ^= 1;
+    const badAdler = zeroPng(8000, 8000, 0, swapLastAdler);
+    for (const [label, png] of [["bad CRC", badCrc], ["bad Adler-32", badAdler]] as const) {
+      expect(await pngImageDataError(png), label).toBe(DAMAGED_PNG_IMAGE_DATA);
+      for (const turn of [1, 3, 10]) {
+        const controller = new AbortController();
+        let posted = 0;
+        const post = MessagePort.prototype.postMessage;
+        const spy = vi.spyOn(MessagePort.prototype, "postMessage").mockImplementation(function (this: MessagePort, message: unknown) {
+          if (++posted === turn) controller.abort(reason);
+          post.call(this, message);
+        });
+        await expect(pngImageDataError(png, { signal: controller.signal }), `${label}, abort at turn ${turn}`).rejects.toBe(reason);
+        expect(posted, `${label}: turn ${turn} reached`).toBe(turn);
+        spy.mockRestore();
+      }
+    }
   });
 
   it("needs nothing from the webview: the same verdicts where it has no DecompressionStream (macOS 11)", async () => {

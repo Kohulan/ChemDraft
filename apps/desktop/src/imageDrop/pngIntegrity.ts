@@ -6,7 +6,8 @@
  * CRCs and header values, then inflates the image data once with its own checking inflater
  * (`zlibCheck.ts`, the same in every webview), without keeping it, to check its size, every row's
  * filter byte and the zlib Adler-32. Pixels are never reconstructed. Both passes give the event loop a
- * turn every ~12 ms, so a large picture does not freeze the window, and stop at the file's deadline.
+ * turn every ~12 ms, so a large picture does not freeze the window, and stop at the file's deadline,
+ * which is always reported as the deadline, never as damage.
  */
 
 import { crc32 } from "../crc32";
@@ -27,6 +28,9 @@ export interface PngIntegrityOptions {
 const TURN_MS = 12;
 /** A chunk longer than this has its CRC computed in pieces this long, with a turn between when due. */
 const CRC_PIECE = 1024 * 1024;
+/** How often a turn also lets timers run, and how long it waits for them at most. */
+const TIMER_TURN_EVERY_MS = 100;
+const TIMER_TURN_WAIT_MS = 16;
 /** Chunks walked between looks at the clock. */
 const CHUNKS_PER_CLOCK = 1024;
 
@@ -53,9 +57,17 @@ interface PngLayout {
 /**
  * A macrotask turn for the event loop (a resolved promise would only let microtasks run) once about
  * `TURN_MS` of work have passed since the last, then the deadline. A small PNG never waits for one.
+ * Turns are MessageChannel messages: a hidden or covered webview slows `setTimeout(0)` to about one
+ * a second, which would stretch a large check past the file's deadline, but not messages. Messages
+ * alone can starve timers and painting in some engines, so every `TIMER_TURN_EVERY_MS` a turn also
+ * waits for a `setTimeout(0)`, for at most `TIMER_TURN_WAIT_MS` (it is slow only where hidden). Where
+ * there is no MessageChannel, every turn is a `setTimeout(0)`. `close()` must end every check.
  */
-class EventLoopTurns implements ZlibYielder {
+export class EventLoopTurns implements ZlibYielder {
   private last = performance.now();
+  private lastTimerTurn = Number.NEGATIVE_INFINITY;
+  private channel: MessageChannel | undefined;
+  private delivered: (() => void) | undefined;
 
   constructor(private readonly signal: AbortSignal | undefined) {}
 
@@ -64,9 +76,74 @@ class EventLoopTurns implements ZlibYielder {
   }
 
   async pause(): Promise<void> {
-    await new Promise(resolve => setTimeout(resolve, 0));
     if (this.signal?.aborted) throw abortReason(this.signal);
+    if (typeof MessageChannel === "undefined") {
+      await this.untilAborted(resolve => {
+        const timer = setTimeout(resolve, 0);
+        return () => clearTimeout(timer);
+      });
+    } else if (performance.now() - this.lastTimerTurn >= TIMER_TURN_EVERY_MS) {
+      await this.timerTurn();
+      this.lastTimerTurn = performance.now();
+    } else {
+      await this.message();
+    }
     this.last = performance.now();
+  }
+
+  /** Closes the channel; the check is over. */
+  close(): void {
+    this.channel?.port1.close();
+    this.channel?.port2.close();
+    this.channel = undefined;
+    this.delivered = undefined;
+  }
+
+  /** Messages until a `setTimeout(0)` has run or `TIMER_TURN_WAIT_MS` have passed. */
+  private async timerTurn(): Promise<void> {
+    let fired = false;
+    const timer = setTimeout(() => { fired = true; }, 0);
+    const start = performance.now();
+    try {
+      do await this.message(); while (!fired && performance.now() - start < TIMER_TURN_WAIT_MS);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private message(): Promise<void> {
+    if (!this.channel) {
+      this.channel = new MessageChannel();
+      this.channel.port1.onmessage = () => {
+        const delivered = this.delivered;
+        this.delivered = undefined;
+        delivered?.();
+      };
+    }
+    const channel = this.channel;
+    return this.untilAborted(resolve => {
+      this.delivered = resolve;
+      channel.port2.postMessage(undefined);
+      return () => { if (this.delivered === resolve) this.delivered = undefined; };
+    });
+  }
+
+  /** Waits for `start`'s callback; rejects with the abort reason as soon as the signal aborts. */
+  private untilAborted(start: (resolve: () => void) => () => void): Promise<void> {
+    const { signal } = this;
+    return new Promise<void>((resolve, reject) => {
+      const onAbort = () => {
+        cancel();
+        reject(abortReason(signal!));
+      };
+      const cancel = start(() => {
+        signal?.removeEventListener("abort", onAbort);
+        resolve();
+      });
+      signal?.addEventListener("abort", onAbort, { once: true });
+    }).then(() => {
+      if (this.signal?.aborted) throw abortReason(this.signal);
+    });
   }
 }
 
@@ -151,11 +228,15 @@ function imageDataInput(bytes: Uint8Array, firstData: number): ZlibInput {
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   let offset = firstData;
   return () => {
-    if (view.getUint32(offset + 4) !== TYPE_IDAT) return undefined;
-    const body = offset + 8;
-    const end = body + view.getUint32(offset);
-    offset = end + 4;
-    return bytes.subarray(body, end);
+    // Empty IDATs (up to ~1.7 million in a 20 MB file, already walked with turns) are passed over
+    // here without making a view of each: a run of them is a few milliseconds of reads.
+    for (;;) {
+      if (view.getUint32(offset + 4) !== TYPE_IDAT) return undefined;
+      const body = offset + 8;
+      const end = body + view.getUint32(offset);
+      offset = end + 4;
+      if (end > body) return bytes.subarray(body, end);
+    }
   };
 }
 
@@ -190,12 +271,19 @@ export async function pngImageDataError(bytes: Uint8Array, options: PngIntegrity
   const { signal } = options;
   if (signal?.aborted) throw abortReason(signal);
   const turns = new EventLoopTurns(signal);
-  const layout = await readPngLayout(bytes, turns);
-  if (!layout) return DAMAGED_PNG_IMAGE_DATA;
-  const result = await checkZlibStream(imageDataInput(bytes, layout.firstData), {
-    maxOutput: layout.expectedSize + PNG_SURPLUS_IMAGE_DATA_BYTES,
-    output: filterByteCheck(layout.passes),
-    yielder: turns
-  });
-  return result.ok && result.outputBytes >= layout.expectedSize ? undefined : DAMAGED_PNG_IMAGE_DATA;
+  try {
+    const layout = await readPngLayout(bytes, turns);
+    // A check the deadline stopped proves nothing about the image data: its reason, never "damaged".
+    if (signal?.aborted) throw abortReason(signal);
+    if (!layout) return DAMAGED_PNG_IMAGE_DATA;
+    const result = await checkZlibStream(imageDataInput(bytes, layout.firstData), {
+      maxOutput: layout.expectedSize + PNG_SURPLUS_IMAGE_DATA_BYTES,
+      output: filterByteCheck(layout.passes),
+      yielder: turns
+    });
+    if (signal?.aborted) throw abortReason(signal);
+    return result.ok && result.outputBytes >= layout.expectedSize ? undefined : DAMAGED_PNG_IMAGE_DATA;
+  } finally {
+    turns.close();
+  }
 }

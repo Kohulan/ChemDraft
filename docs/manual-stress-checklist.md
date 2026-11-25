@@ -2027,6 +2027,8 @@ lossy and a lossless WebP, an SVG with gradients and `<use href="#id">`, a BMP, 
   (interlaced, 16-bit, palette) still insert. While the 8000 × 8000 PNG is checked the window stays
   responsive: the status shows "Reading…", the menus open and a hover shows its tooltip, with no
   stall longer than a moment. A drop of a refused file and a good one inserts the good one.
+- Hidden window: drop the 8000 × 8000 PNG and at once cover or minimise the window: it is inserted,
+  not refused.
 - Links and shortcuts: drop the `.url`, the `.webloc` and the `.lnk`, each alone: the status is only
   `Couldn't drop "link.url": it is a web link, not a picture or a drawing.` (for the shortcut: `it
   is a shortcut; drop the file it points to instead.`), never a parser's wording, and the app does
