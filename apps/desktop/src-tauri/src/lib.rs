@@ -2726,13 +2726,37 @@ fn focus_native_document_window<R: Runtime>(
     Ok(())
 }
 
+/// Owner rule: a Linux beta is named after its parent version plus β ("1.2.3β"). macOS and
+/// Windows show the version unchanged. Mirrors `versionLabel` in src/appVersionLabel.ts.
+#[cfg(target_os = "linux")]
+const LINUX_BETA_BUILD: bool = true;
+#[cfg(not(target_os = "linux"))]
+const LINUX_BETA_BUILD: bool = false;
+
+/// The running build's version as the About box and the window title show it.
+pub(crate) fn display_version(version: &str) -> String {
+    version_label_for(version, LINUX_BETA_BUILD)
+}
+
+fn version_label_for(version: &str, linux: bool) -> String {
+    if linux {
+        format!("{version}β")
+    } else {
+        version.to_string()
+    }
+}
+
 /// The main window title, suffixed with the worktree label baked in at build time by `run-app` or
 /// `scripts/desktop-tauri.mjs` (e.g. "ChemDraft — chemdraw-toolbars [refactor/toolbars]"). With
 /// several ChemDraft worktrees building an identically-named app, this is what tells the running
 /// windows apart in the title bar, Mission Control, and cmd-tab. A stable package build bakes in an
 /// empty label and gets plain "ChemDraft"; there is no git fallback here. See AGENTS.md §21.1.
+/// The Linux build also names its version ("ChemDraft 1.2.3β"), as the document title does.
 fn main_window_title() -> String {
-    window_title_for(option_env!("CHEMDRAFT_WORKTREE_LABEL"))
+    window_title_for(
+        option_env!("CHEMDRAFT_WORKTREE_LABEL"),
+        LINUX_BETA_BUILD.then(|| display_version(env!("CARGO_PKG_VERSION"))),
+    )
 }
 
 fn set_startup_title<R: Runtime>(window: &tauri::Window<R>) -> tauri::Result<()> {
@@ -2746,31 +2770,67 @@ fn needs_initial_main_window_title(current_title: &str) -> bool {
     matches!(current_title, "" | "ChemDraft")
 }
 
-fn window_title_for(label: Option<&str>) -> String {
+/// `version` is the label to show after the product name, or `None` for the plain "ChemDraft".
+fn window_title_for(label: Option<&str>, version: Option<String>) -> String {
+    let product = match version {
+        Some(version) => format!("ChemDraft {version}"),
+        None => "ChemDraft".to_string(),
+    };
     match label {
-        Some(label) if !label.trim().is_empty() => format!("ChemDraft — {}", label.trim()),
-        _ => "ChemDraft".to_string(),
+        Some(label) if !label.trim().is_empty() => format!("{product} — {}", label.trim()),
+        _ => product,
     }
 }
 
 #[cfg(test)]
 mod window_title_tests {
-    use super::{needs_initial_main_window_title, window_title_for};
+    use super::{
+        display_version, main_window_title, needs_initial_main_window_title, version_label_for,
+        window_title_for,
+    };
 
     #[test]
     fn unlabeled_builds_get_the_plain_title() {
-        assert_eq!(window_title_for(None), "ChemDraft");
-        assert_eq!(window_title_for(Some("")), "ChemDraft");
-        assert_eq!(window_title_for(Some("  ")), "ChemDraft");
+        assert_eq!(window_title_for(None, None), "ChemDraft");
+        assert_eq!(window_title_for(Some(""), None), "ChemDraft");
+        assert_eq!(window_title_for(Some("  "), None), "ChemDraft");
     }
 
     #[test]
     fn labeled_builds_append_the_trimmed_label() {
         assert_eq!(
-            window_title_for(Some("chemdraw [x]")),
+            window_title_for(Some("chemdraw [x]"), None),
             "ChemDraft — chemdraw [x]"
         );
-        assert_eq!(window_title_for(Some(" a [b] ")), "ChemDraft — a [b]");
+        assert_eq!(window_title_for(Some(" a [b] "), None), "ChemDraft — a [b]");
+    }
+
+    #[test]
+    fn linux_names_its_beta_after_the_parent_version_plus_beta() {
+        assert_eq!(version_label_for("1.2.3", true), "1.2.3β");
+        assert_eq!(version_label_for("1.2.3", false), "1.2.3");
+        assert_eq!(
+            window_title_for(None, Some(version_label_for("1.2.3", true))),
+            "ChemDraft 1.2.3β"
+        );
+        assert_eq!(
+            window_title_for(Some(" a [b] "), Some(version_label_for("1.2.3", true))),
+            "ChemDraft 1.2.3β — a [b]"
+        );
+    }
+
+    #[test]
+    fn only_the_linux_build_shows_the_beta_mark() {
+        let version = env!("CARGO_PKG_VERSION");
+        let plain = window_title_for(option_env!("CHEMDRAFT_WORKTREE_LABEL"), None);
+        if cfg!(target_os = "linux") {
+            assert_eq!(display_version(version), format!("{version}β"));
+            assert_ne!(main_window_title(), plain);
+            assert!(main_window_title().starts_with(&format!("ChemDraft {version}β")));
+        } else {
+            assert_eq!(display_version(version), version);
+            assert_eq!(main_window_title(), plain);
+        }
     }
 
     #[test]

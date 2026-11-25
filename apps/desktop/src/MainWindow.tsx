@@ -1016,6 +1016,8 @@ import type { KeybindingScheme } from "./keybindingSettings";
 import { nativeMenuShortcutOverrides } from "./customKeyboardShortcuts";
 import { useShortcutPreference } from "./useShortcutPreference";
 import { aboutCommand, openAbout } from "./about/aboutCommand";
+import { documentWindowTitle } from "./appVersionLabel";
+import packageInfo from "../package.json";
 import { availableTourPluginCommands, SHOW_TOUR_COMMAND, TOUR_NAME_COMMAND, TOUR_SAMPLE_COMMAND, TOUR_TITLE, type TourAction, type TourPluginCommand } from "./tour/tourCommands";
 import type { TourMode } from "./tour/tourState";
 import { buildTourSample } from "./tour/tourSample";
@@ -1902,7 +1904,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.25.06.50-opus";
+const CURRENT_BUILD_STAMP = "11.25.08.00-opus";
 
 /**
  * Sets `target` to `markIds`. A commit updater fills its policy's `IndependentMarkMoves` this way:
@@ -16943,7 +16945,9 @@ export function MainWindow({
   const activeDocumentName = documentTabs.find((tab) => tab.id === activeDocumentTabId)?.title ?? document.title;
   const nativeTitleWriteRef = useRef(Promise.resolve());
   useEffect(() => {
-    const title = `${activeDocumentName}${fileState.dirty ? " •" : ""} — ChemDraft${__WORKTREE_LABEL__ ? ` — ${__WORKTREE_LABEL__}` : ""}`;
+    // The Linux desktop build shows its version as "1.2.3β"; the browser build is not a Linux beta.
+    const title = documentWindowTitle(activeDocumentName, fileState.dirty, __WORKTREE_LABEL__, packageInfo.version,
+      isDesktopRuntime() ? shortcutPlatform ?? detectDesktopShortcutPlatform() : "web");
     window.document.title = title;
     if (!isDesktopRuntime()) return;
     let current = true;
@@ -16953,7 +16957,7 @@ export function MainWindow({
       if (current) await invoke("plugin:window|set_title", { value: title });
     }).catch((error: unknown) => console.warn("Could not update the document window title", error));
     return () => { current = false; };
-  }, [activeDocumentName, fileState.dirty]);
+  }, [activeDocumentName, fileState.dirty, shortcutPlatform]);
 
   const handleOpenFile = (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
