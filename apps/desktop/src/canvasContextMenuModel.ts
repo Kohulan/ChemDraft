@@ -7,6 +7,7 @@ export type CanvasMenuItem =
   | { kind: "submenu"; id: string; label: string; ariaLabel: string; enabled: boolean; items: readonly CanvasMenuItem[] };
 
 export interface ObjectCanvasMenuInput {
+  rotateMoleculeAction?: CommandSpec;
   arrowActions?: readonly CommandSpec[];
   bracketActions?: readonly CommandSpec[];
   layoutActions?: readonly CommandSpec[];
@@ -45,6 +46,7 @@ export function buildObjectCanvasMenu(input: ObjectCanvasMenuInput): readonly Ca
     "table.column.insertLeft", "table.column.insertRight", "table.column.delete"];
   const align = tableActions.filter(action => action.id.startsWith("table.column.align."));
   const items: CanvasMenuItem[] = [
+    ...(input.rotateMoleculeAction?.enabled ? [actionItem(input.rotateMoleculeAction, "Rotate molecule…")] : []),
     ...bracketActions.map(action => actionItem(action)),
     ...tableActions.filter(action => rowColumnIds.includes(action.id)).map(action => actionItem(action))
   ];

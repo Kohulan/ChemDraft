@@ -8267,3 +8267,12 @@ body.file-warnings-window {
 .plugin-text-prompt-native > .cd-dialog-fit-body { margin: 0; padding: 0; overflow-wrap: anywhere; }
 .plugin-text-prompt-form .plugin-prompt-body p { margin: 0; color: var(--cd-text-secondary); }
 .plugin-text-prompt-form .plugin-prompt-body p[role="alert"] { color: var(--cd-danger); }
+.document-zoom-controls {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  height: 24px;
+  white-space: nowrap;
+}
+.document-zoom-controls .icon-button { width: 24px; height: 24px; padding: 2px; flex: 0 0 24px; }
+.document-zoom-controls select { width: 76px; height: 24px; font-size: 12px; }
