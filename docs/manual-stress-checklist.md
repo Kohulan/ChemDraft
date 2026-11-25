@@ -1961,3 +1961,41 @@ Run under KDE Plasma (Wayland session, so the app uses XWayland) and on GNOME.
   list, and the dropdown also offers ChemDraft and CDX. Repeat with a `.chemdraft` and a `.cdx`
   file, and with a new untitled document. Export (File ▸ Export) dialogs show their format name.
   macOS and Windows Save dialogs list their file types in the same order as before.
+
+## Image drag and drop (macOS and Windows, 1.2.3)
+
+Run on macOS (Retina and a 1x external display) and on Windows at 100%, 150% and 200% display
+scaling. Prepare a small and a large PNG, a phone JPEG with an EXIF rotation, an animated GIF, a
+lossy and a lossless WebP, an SVG with gradients and `<use href="#id">`, a BMP, a TIFF, a HEIC, a
+`.svgz`, a picture over 20 MB, and a `.cdxml`.
+
+- Each format: drag it from Finder / Explorer onto the page. It appears centred under the pointer,
+  at its natural size, selected; the status names it. The JPEG stands upright (EXIF honoured); the
+  GIF and WebP show their first frame. A picture larger than the page is shrunk to fit inside it.
+- Drop point: repeat at 50%, 100% and 400% zoom, scrolled, near each page edge (the picture is
+  shifted fully onto the page) and over the pasteboard beside the page and over the toolbar (it goes
+  to the nearest point of the visible page). Move the window between displays with different
+  scaling and drop again: the picture still lands under the pointer.
+- Several files: drop five PNGs at once. They cascade down and to the right from the drop point in
+  one "Insert Image" undo entry, all selected. Undo removes all five; Redo restores them exactly.
+  The first Cmd/Ctrl+Z after the drop undoes the drop.
+- Mixed: drop a PNG and a `.cdxml` together. The picture lands in the current tab and the document
+  opens in its own tab; the status reports both. Drop only a `.cdxml`: it opens as before.
+- Refusals: the BMP, TIFF, HEIC, `.svgz` and 20 MB+ files are refused by name with a specific
+  reason, immediately (no read of the large file). A `.png` renamed from a text file is refused as
+  not a picture. A drop of a refused file and a good one inserts the good one.
+- Untrusted SVG: an SVG with `<script>`, `onload`, `<foreignObject>`, a link, `<use
+  href="other.svg#x">`, a `url(https://…)` fill and an `@import` inserts with "scripts and animation
+  were removed" / "external content was removed"; nothing runs, no network request is made
+  (watch the network log in the web build), and Save + reopen keeps the cleaned picture.
+- Tabs and guards: start a drop of the large JPEG and switch tabs before it appears: it is not
+  inserted anywhere and the status says so. Drops during a text, label or table-cell edit, with
+  a dialog open or while quitting are refused with a reason.
+- Resize: drag every corner handle of a picture, with and without Shift, rotated, and inside a
+  group: the aspect ratio never changes. Move, Delete, Cut/Paste still work.
+- Export and save: export to every available format with dropped PNG, JPEG and SVG pictures; save as
+  `.chemdraft` and `.cdxml`, reopen, compare.
+- Nothing navigates: drop a file, a browser link and selected text onto the toolbar, the tab strip,
+  every floating palette, a popover, the Preferences and Export dialogs, and (web build) anywhere
+  in the page. The app never replaces itself with the file or URL; text can still be dropped into a
+  text field.
