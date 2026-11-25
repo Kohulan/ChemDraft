@@ -14,8 +14,8 @@ const testers: AboutTesters = testerData;
 const repository = "https://github.com/jgassens/ChemDraft";
 const sections = ["ChemDraft", "Contributors", "Open-source components and provenance"] as const;
 
-function ExternalLink({ href, children }: { href: string; children: ReactNode }) {
-  return <a href={href} target="_blank" rel="noopener noreferrer">{children}</a>;
+function ExternalLink({ href, className, children }: { href: string; className?: string; children: ReactNode }) {
+  return <a href={href} className={className} target="_blank" rel="noopener noreferrer">{children}</a>;
 }
 
 interface AboutWindowProps {
@@ -87,7 +87,7 @@ export function AboutWindow({ version, buildStamp, error, platform, web, onReady
           <h2 id="about-section-1" tabIndex={-1}>Contributors</h2>
           <ul className="about-credits">
             {contributors.map(({ name, handle, contribution }) => <li key={name}>
-              <strong>{name}</strong>{handle && <>{" "}<ExternalLink href={"https://github.com/" + handle}>@{handle}</ExternalLink></>}
+              <strong>{name}</strong>{handle && <>{" "}<ExternalLink href={"https://github.com/" + handle} className="about-handle">@{handle}</ExternalLink></>}
               <p>{contribution}</p>
             </li>)}
           </ul>
@@ -96,7 +96,7 @@ export function AboutWindow({ version, buildStamp, error, platform, web, onReady
             <p>Thank you to everyone who reported problems or commented on the project's GitHub issues and pull requests.</p>
             <ul className="about-handles">
               {testers.handles.map(handle => <li key={handle}>
-                <ExternalLink href={"https://github.com/" + handle}>@{handle}</ExternalLink>
+                <ExternalLink href={"https://github.com/" + handle} className="about-handle">@{handle}</ExternalLink>
               </li>)}
             </ul>
           </details>

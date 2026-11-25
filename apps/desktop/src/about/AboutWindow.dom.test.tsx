@@ -125,7 +125,7 @@ it("shows the Linux beta version as 1.2.3β and macOS and Windows versions uncha
   }
 });
 
-it("keeps every link target; standalone links underline on hover or focus, inline links stay underlined", async () => {
+it("keeps every link target; standalone links and @handles underline only on hover or focus, inline prose links stay underlined", async () => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   vi.stubGlobal("__ABOUT_PROVENANCE__", {
     components: [{ name: "example-package", version: "1.0.0", license: "MIT", holders: ["see license"], purpose: "Test package",
@@ -172,37 +172,55 @@ it("keeps every link target; standalone links underline on hover or focus, inlin
     selectors: selector!.replace(/^[\s\S]*\{/, "").split(",").map(part => part.trim()), body: body!
   }));
   const ruleFor = (selector: string, property: RegExp) => rules.filter(rule => rule.selectors.includes(selector) && property.test(rule.body)).at(-1);
-  // Every link starts underlined, so a link inside running text (an @handle beside a contributor's name, a
-  // package name) is never told apart by color alone.
+  // The default link rule underlines, so a link inside running prose is never told apart by color alone.
   const linkRule = ruleFor(".about-window a", /text-decoration/)!;
   expect(linkRule.body).toMatch(/text-decoration:\s*underline/);
   expect(linkRule.body).toMatch(/color:\s*#154c8f/);
-  // Standalone links drop the underline until hover or keyboard focus; inline ones are not in that list.
-  const standalone = [".about-window nav a", ".about-window .about-links a", ".about-window .about-links button", ".about-window .about-handles a"];
+  // Standalone links, @handles included, drop the underline until hover or keyboard focus.
+  const standalone = [".about-window nav a", ".about-window .about-links a", ".about-window .about-links button",
+    ".about-window .about-handle", ".about-window h3 a"];
   const plain = rules.find(rule => /text-decoration:\s*none/.test(rule.body))!;
   expect(plain.selectors.sort()).toEqual([...standalone].sort());
+  expect(plain.selectors).not.toContain(".about-window a");
   const hovered = rules.filter(rule => /text-decoration:\s*underline/.test(rule.body) && rule !== linkRule);
   expect(hovered).toHaveLength(1);
   expect(hovered[0]!.selectors.sort()).toEqual(standalone.flatMap(selector => [selector + ":hover", selector + ":focus-visible"]).sort());
-  expect(plain.selectors).not.toContain(".about-window a");
-  expect(plain.selectors.some(selector => /(^|[\s>+~])(li|h3)\b|about-credits/.test(selector))).toBe(false);
-  // The rendered contributor handle sits inside a list item next to the name, not in a standalone list.
-  const handle = contributors.find(({ handle }) => handle)?.handle;
-  if (handle) {
-    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
-    vi.stubGlobal("__ABOUT_PROVENANCE__", { components: [], licenseTexts: {} });
-    const inline = document.createElement("div");
-    document.body.append(inline);
-    const inlineRoot = createRoot(inline);
-    try {
-      await act(async () => inlineRoot.render(<AboutWindow version="1.2.3" buildStamp="test" platform="macos" onCopy={async () => {}} />));
-      const link = inline.querySelector('a[href="https://github.com/' + handle + '"]')!;
-      expect(standalone.some(selector => link.matches(selector))).toBe(false);
-    } finally {
-      act(() => inlineRoot.unmount());
-      inline.remove();
-      vi.unstubAllGlobals();
+  // A handle is marked at rest without color: the leading '@' and a medium weight.
+  expect(ruleFor(".about-window .about-handle", /font-weight/)!.body).toMatch(/font-weight:\s*500/);
+  // Every rendered @handle (contributors beside their names, and the tester list) carries the handle look, and any
+  // other link that is not standalone (a link in running prose) falls back to the underlined default.
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  vi.stubGlobal("__ABOUT_PROVENANCE__", {
+    components: [{ name: "example-package", version: "1.0.0", license: "MIT", holders: ["see license"], purpose: "Test package",
+      sourceUrl: "https://example.com/package" }],
+    licenseTexts: {}
+  });
+  const rendered = document.createElement("div");
+  document.body.append(rendered);
+  const renderedRoot = createRoot(rendered);
+  try {
+    await act(async () => renderedRoot.render(<AboutWindow version="1.2.3" buildStamp="test" platform="macos" onCopy={async () => {}} />));
+    const handleLinks = [...rendered.querySelectorAll("a")].filter(link => link.textContent!.startsWith("@"));
+    expect(handleLinks).toHaveLength(contributors.filter(({ handle }) => handle).length + testers.handles.length);
+    for (const link of handleLinks) {
+      expect(link.classList.contains("about-handle")).toBe(true);
+      expect(link.getAttribute("href")).toBe("https://github.com/" + link.textContent!.slice(1));
     }
+    const contributorHandle = contributors.find(({ handle }) => handle)?.handle;
+    if (contributorHandle) {
+      const link = rendered.querySelector('.about-credits a[href="https://github.com/' + contributorHandle + '"]')!;
+      expect(link.previousElementSibling?.tagName).toBe("STRONG");
+      expect(link.matches(".about-handle")).toBe(true);
+    }
+    // Inline prose links: none today. Any that appear must not be caught by a standalone selector, so they keep
+    // the underline from the default rule.
+    const inProse = [...rendered.querySelectorAll(".about-window p a")]
+      .filter(link => !link.closest(".about-links"));
+    for (const link of inProse) expect(standalone.some(selector => link.matches(selector))).toBe(false);
+  } finally {
+    act(() => renderedRoot.unmount());
+    rendered.remove();
+    vi.unstubAllGlobals();
   }
   // Same look as the Guided Tour link (tour/TourForm.css .guided-tour-url a).
   const tour = readFileSync("apps/desktop/src/tour/TourForm.css", "utf8");
