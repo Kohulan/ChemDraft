@@ -42,6 +42,20 @@ describe("document open status", () => {
       .toBe("Could not open notes.txt: it is not JSON.");
   });
 
+  it("names each failed document of a drop with its own reason", () => {
+    expect(formatDocumentOpenDropOutcome([
+      { displayName: "/drawings/a.txt", error: "it is not JSON." },
+      { displayName: "C:\\Drawings\\b.cdx", error: new Error("unsupported bond") }
+    ])).toBe("Opened 0 of 2 files. Could not open a.txt: it is not JSON.; Could not open b.cdx: unsupported bond");
+    expect(formatDocumentOpenDropOutcome([
+      { displayName: "a.txt", error: "it is not JSON." },
+      { displayName: "c.cdxml" },
+      { displayName: "b.cdx", error: "unsupported bond" }
+    ])).toBe("Opened c.cdxml; Opened 1 of 3 files. Could not open a.txt: it is not JSON.; Could not open b.cdx: unsupported bond");
+    expect(formatDocumentOpenDropOutcome([{ displayName: "a.txt", error: "it is not JSON." }, { displayName: "c.cdxml" }]))
+      .toBe("Opened c.cdxml; Opened 1 of 2 files. Could not open a.txt: it is not JSON.");
+  });
+
   it("lists several failed files on one line with the first reason", () => {
     expect(formatDocumentOpenBatchStatus([
       { displayName: "/drawings/a.txt", error: "it is not JSON." },

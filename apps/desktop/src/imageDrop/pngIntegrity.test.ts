@@ -250,6 +250,19 @@ describe("pngImageDataError keeps the window responsive and honours the file's d
     expect(posts).not.toHaveBeenCalled();
   });
 
+  it("gives turns between IDAT chunks just under 1 MiB, each CRC'd in one piece", async () => {
+    // Twenty of them, then a bad IEND CRC, so every chance to pause comes from walking the chunks.
+    const header = zeroPng(1, 1).subarray(16, 29);
+    const data = Array.from({ length: 20 }, (): TestPngChunk => ({ type: "IDAT", data: new Uint8Array(1024 * 1024 - 1) }));
+    const png = writeTestPng([{ type: "IHDR", data: header }, ...data, { type: "IEND", data: new Uint8Array(), crc: 0 }]);
+    steppingClock();
+    const chances = pauseAtEveryChance();
+    const posts = vi.spyOn(MessagePort.prototype, "postMessage");
+    expect(await pngImageDataError(png)).toBe(DAMAGED_PNG_IMAGE_DATA);
+    expect(chances.mock.calls.length).toBeGreaterThanOrEqual(19);
+    expect(posts).toHaveBeenCalledTimes(chances.mock.calls.length);
+  });
+
   it("rejects with the abort reason when the deadline passes mid-check", async () => {
     const controller = new AbortController();
     const reason = new Error("reading it took longer than 30 seconds.");

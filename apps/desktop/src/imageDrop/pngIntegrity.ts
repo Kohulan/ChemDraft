@@ -171,6 +171,9 @@ async function readPngLayout(bytes: Uint8Array, turns: EventLoopTurns): Promise<
   let palette = false;
   let inData = false;
   let afterData = false;
+  // Bytes CRC'd since the clock was last looked at for them: the clock is looked at before a chunk
+  // that would take them past `CRC_PIECE`, so many chunks just under it cannot run without a turn.
+  let crcBytes = 0;
   for (let offset = 8, chunks = 1; ; chunks += 1) {
     if (offset + 12 > bytes.length) return undefined;
     const length = view.getUint32(offset);
@@ -181,6 +184,10 @@ async function readPngLayout(bytes: Uint8Array, turns: EventLoopTurns): Promise<
     // Decoders ignore a bad CRC on an ancillary chunk, so only the critical ones are checked.
     const critical = type === TYPE_IHDR || type === TYPE_PLTE || type === TYPE_IDAT || type === TYPE_IEND;
     if (critical) {
+      if (length <= CRC_PIECE && (crcBytes += length) > CRC_PIECE) {
+        crcBytes = length;
+        if (turns.due()) await turns.pause();
+      }
       const crc = length > CRC_PIECE ? await chunkCrc(bytes, offset + 4, end, turns) : crc32(bytes.subarray(offset + 4, end));
       if (crc !== view.getUint32(end)) return undefined;
     }

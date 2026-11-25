@@ -319,10 +319,12 @@ describe("checkZlibStream refuses what zlib refuses", () => {
       await expectDamage(`${length} bytes`, stream.subarray(0, length), "truncated");
     }
     for (let index = stream.length - 4; index < stream.length; index += 1) {
-      const wrong = stream.slice();
+      // A copy: a Buffer's slice() shares its bytes, so damaging it would damage `stream` too.
+      const wrong = new Uint8Array(stream);
       wrong[index] ^= 0x10;
       await expectDamage(`Adler byte ${index}`, wrong, "adler");
     }
+    await expect(verdictOf(stream)).resolves.toMatchObject({ ok: true });
     // Zero bits past the end are not data: here an all-zero code is literal 0, which must not run on to the cap.
     const literalLengths = completeLiteralLengths();
     const writer = new BitWriter().bytes(ZLIB_HEADER);
@@ -348,10 +350,13 @@ describe("checkZlibStream under hostile input", () => {
         bases.push(deflateSync(slice, options));
       }
     }
+    // Each trial damages a copy (a Buffer's slice() would share the base's bytes), so every one starts undamaged.
+    const pristine = bases.map(base => new Uint8Array(base));
+    for (const base of bases) await expectSameAsNode("undamaged base", base);
     const cap = 1024 * 1024;
     for (let trial = 0; trial < 1500; trial += 1) {
       const base = bases[trial % bases.length];
-      let damaged = base.slice();
+      let damaged = new Uint8Array(base);
       const kind = next();
       const flips = 1 + Math.floor(next() * 3);
       if (kind < 0.7 || kind >= 0.9) {
@@ -375,6 +380,7 @@ describe("checkZlibStream under hostile input", () => {
         expect(result.ok, label).toBe(false);
       }
     }
+    bases.forEach((base, index) => expect(new Uint8Array(base), `base ${index} untouched`).toEqual(pristine[index]));
   }, HEAVY_TIMEOUT_MS);
 
   it("stops a bomb at the cap, with fixed memory", async () => {

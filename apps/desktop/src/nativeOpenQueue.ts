@@ -81,11 +81,13 @@ export function formatDocumentOpenBatchStatus(results: readonly DocumentOpenResu
 }
 
 /**
- * What a drop's outcome says of its documents: every one that opened, by its own status line, then
- * the batch summary, which names the failures. Undefined for no documents.
+ * What a drop's outcome says of its documents: every one that opened, by its own status line, then,
+ * when any failed, the count of those opened and each failure with its own reason. Undefined for no documents.
  */
 export function formatDocumentOpenDropOutcome(results: readonly DocumentOpenResult[]): string | undefined {
   const opened = results.flatMap(result => "error" in result ? [] : [result.status ?? `Opened ${openFileName(result.displayName)}`]);
-  const parts = [...opened, formatDocumentOpenBatchStatus(results)].filter((part): part is string => !!part);
+  const failures = results.flatMap(result => "error" in result ? [formatDocumentOpenFailure(result.displayName, result.error)] : []);
+  if (failures.length && results.length > 1) failures[0] = `Opened ${opened.length} of ${results.length} files. ${failures[0]}`;
+  const parts = [...opened, ...failures];
   return parts.length ? parts.join("; ") : undefined;
 }
