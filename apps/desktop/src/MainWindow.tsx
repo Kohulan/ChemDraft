@@ -1900,7 +1900,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.25.00.26-opus";
+const CURRENT_BUILD_STAMP = "11.25.00.38-opus";
 
 /**
  * Sets `target` to `markIds`. A commit updater fills its policy's `IndependentMarkMoves` this way:
@@ -11364,6 +11364,10 @@ export function MainWindow({
   const dropNativePaths = useCallback((paths: readonly string[], client: DropClientPoint | undefined) =>
     runFileDrop(paths, client, { nameOf: nativePathBasename, imageSource: nativeDroppedImageSource,
       openDocuments: openDroppedDocumentPaths }), [openDroppedDocumentPaths, runFileDrop]);
+  // The native drop listener below is registered once per mount and calls the latest handler, so a
+  // re-created `dropNativePaths` (after a page-size change, say) never leaves a gap with no listener.
+  const dropNativePathsRef = useRef(dropNativePaths);
+  dropNativePathsRef.current = dropNativePaths;
 
   const dropBrowserFiles = useCallback((files: readonly File[], client: DropClientPoint | undefined) =>
     runFileDrop(files, client, { nameOf: file => file.name, imageSource: browserDroppedImageSource,
@@ -11381,13 +11385,13 @@ export function MainWindow({
       if (disposed || closeTabPromptRef.current || quitInteractionRef.current) return;
       // Pixels per CSS pixel right now, including any webview zoom, for Windows' physical position.
       const client = nativeDropClientPoint(event.payload, window.devicePixelRatio);
-      void dropNativePaths(event.payload.paths, client);
+      void dropNativePathsRef.current(event.payload.paths, client);
     }).then((stop) => {
       if (disposed) stop();
       else unlisten = stop;
     }).catch(() => undefined);
     return () => { disposed = true; unlisten?.(); };
-  }, [dropNativePaths]);
+  }, []);
 
   // The web build: a file dropped anywhere in the document window (the canvas, a toolbar, the tab
   // strip) is taken here. `main.tsx` keeps every other drop from navigating. The desktop webviews

@@ -347,4 +347,159 @@ mod tests {
         };
         assert_eq!(mac_top_inset(&geometry), 0.0);
     }
+
+    /// Source text with every run of whitespace (line endings included) made one space, so the
+    /// wiring checks below read the same on every host and checkout.
+    fn squashed(source: &str) -> String {
+        source.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// The Builder's window-event handler: everything between `.on_window_event(` and `.setup(`.
+    fn window_event_handler(lib: &str) -> &str {
+        lib.split(".on_window_event(|window, event| {")
+            .nth(1)
+            .expect("the Builder's window-event handler")
+            .split(" .setup(move |app| {")
+            .next()
+            .unwrap()
+    }
+
+    const DROP_ARM: &str = "WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, position }) => { file_drop::emit_document_drop(window, paths, *position); }";
+
+    #[test]
+    fn the_document_window_alone_sends_each_drop_through_emit_document_drop() {
+        let lib = squashed(include_str!("lib.rs"));
+        let handler = window_event_handler(&lib);
+        assert_eq!(
+            handler.matches(DROP_ARM).count(),
+            1,
+            "one DragDrop Drop arm"
+        );
+        // Nothing else in the app sends the event, so a drop reaches the page once.
+        assert_eq!(lib.matches("file_drop::emit_document_drop(").count(), 1);
+        // The arm is inside the document window's branch, which returns before any other window's.
+        let main_start = handler
+            .find("if window.label() == MAIN_WINDOW_LABEL {")
+            .expect("the document window's branch");
+        let main_end = main_start
+            + handler[main_start..]
+                .find("_ => {} } return; }")
+                .expect("the end of the document window's branch");
+        let arm = handler.find(DROP_ARM).unwrap();
+        assert!(main_start < arm && arm < main_end);
+        assert_eq!(super::super::MAIN_WINDOW_LABEL, "main");
+        // The geometry check ahead of the match takes only moves and resizes, never a drop.
+        let drop = tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop {
+            paths: vec![PathBuf::from("mol.png")],
+            position: tauri::PhysicalPosition::new(1.0, 2.0),
+        });
+        assert!(!super::super::on_main_window_geometry_event_with(
+            &super::super::QUIT,
+            &drop,
+            || panic!("a drop is not a geometry change")
+        ));
+        assert!(handler[main_start..arm]
+            .contains("if on_main_window_geometry_event_with(&QUIT, event, || {"));
+    }
+
+    #[test]
+    fn file_drop_reads_the_mac_geometry_live_at_each_drop() {
+        let source = squashed(include_str!("file_drop.rs"));
+        let emit = source
+            .split("pub(crate) fn emit_document_drop<R: tauri::Runtime>(")
+            .nth(1)
+            .unwrap()
+            .split("fn mac_drop_geometry<R: tauri::Runtime>(")
+            .next()
+            .unwrap();
+        assert!(emit.contains(
+            "#[cfg(target_os = \"macos\")] let geometry = match mac_drop_geometry(window) {"
+        ));
+        assert!(emit.contains(
+            "#[cfg(not(target_os = \"macos\"))] let geometry: Option<MacDropGeometry> = None;"
+        ));
+        assert!(emit.contains("geometry.as_ref(),"));
+        assert!(emit.contains("let units = if cfg!(windows) { DropPositionUnits::Physical } else { DropPositionUnits::Css };"));
+        assert!(emit.contains("window.emit_to(window.label(), DOCUMENT_FILE_DROP_EVENT, payload)"));
+        // Read from the window each time, never kept: the title bar changes with full screen and tabs.
+        let read = source
+            .split("fn mac_drop_geometry<R: tauri::Runtime>(")
+            .nth(1)
+            .unwrap()
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        for live in [
+            "window.ns_window()",
+            "native.contentLayoutRect()",
+            "native .styleMask()",
+            "native.titlebarAppearsTransparent()",
+        ] {
+            assert!(
+                read.contains(live),
+                "mac_drop_geometry no longer reads {live}"
+            );
+        }
+        let code = source.split("#[cfg(test)]").next().unwrap();
+        for cache in ["static ", "OnceLock", "LazyLock", "thread_local!"] {
+            assert!(!code.contains(cache), "file_drop.rs keeps state: {cache}");
+        }
+    }
+
+    /// The inset rule (`automatic_inset`) assumes the document window's own title bar: no
+    /// `titleBarStyle`, hidden title or transparent window from its config or its builder.
+    #[test]
+    fn file_drop_document_window_keeps_its_standard_title_bar() {
+        for (name, config) in [
+            ("tauri.conf.json", include_str!("../tauri.conf.json")),
+            (
+                "tauri.intel.conf.json",
+                include_str!("../tauri.intel.conf.json"),
+            ),
+            (
+                "tauri.windows.conf.json",
+                include_str!("../tauri.windows.conf.json"),
+            ),
+            (
+                "tauri.allusers.conf.json",
+                include_str!("../tauri.allusers.conf.json"),
+            ),
+        ] {
+            let config: serde_json::Value = serde_json::from_str(config).unwrap();
+            let windows = config["app"]["windows"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            for window in windows {
+                for key in ["titleBarStyle", "hiddenTitle", "transparent", "decorations"] {
+                    assert!(window.get(key).is_none(), "{name}: a window sets {key}");
+                }
+            }
+        }
+        let lib = squashed(include_str!("lib.rs"));
+        let create = lib
+            .split("fn create_main_window<R: Runtime>(")
+            .nth(1)
+            .unwrap()
+            .split(" fn ")
+            .next()
+            .unwrap();
+        assert!(create.contains("WebviewWindowBuilder::from_config(app, config)"));
+        for style in [
+            "title_bar_style",
+            "hidden_title",
+            "transparent",
+            "decorations",
+        ] {
+            assert!(!create.contains(style), "create_main_window sets {style}");
+        }
+        // The one title-bar style in lib.rs is the dialogs' own, and nothing restyles a live window.
+        assert_eq!(
+            lib.matches(".title_bar_style(").count(),
+            lib.matches(".title_bar_style(dialog_windows::macos_dialog_title_bar_style())")
+                .count()
+        );
+        assert!(!lib.contains("set_title_bar_style("));
+        assert!(!lib.contains("setTitlebarAppearsTransparent"));
+    }
 }

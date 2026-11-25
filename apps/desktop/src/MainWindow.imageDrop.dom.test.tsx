@@ -14,6 +14,8 @@ import { MemoryStorage } from "./testSupport/memoryStorage";
 const native = vi.hoisted(() => ({
   desktop: false,
   events: new Map<string, (payload: unknown) => void>(),
+  /** Every listen and unlisten, by event name, in order. */
+  subscriptions: [] as string[],
   files: new Map<string, Uint8Array>(),
   stat: vi.fn<(path: string) => Promise<{ size: number }>>()
 }));
@@ -38,7 +40,11 @@ vi.mock("./window-manager/tauriEvents", async (original) => {
   const listen = async (name: string, handler: (event: { payload: unknown }) => void) => {
     const callback = (payload: unknown) => handler({ payload });
     native.events.set(name, callback);
-    return () => { if (native.events.get(name) === callback) native.events.delete(name); };
+    native.subscriptions.push(`listen ${name}`);
+    return () => {
+      native.subscriptions.push(`unlisten ${name}`);
+      if (native.events.get(name) === callback) native.events.delete(name);
+    };
   };
   return { ...await original<typeof import("./window-manager/tauriEvents")>(), listenTauriEvent: listen, listenCurrentWindowEvent: listen };
 });
@@ -95,6 +101,7 @@ describe("dropping picture files on the document window", { timeout: 3 * DROP_WA
   beforeEach(() => {
     native.desktop = false;
     native.events.clear();
+    native.subscriptions.length = 0;
     native.files.clear();
     native.stat.mockReset();
     vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
@@ -405,6 +412,35 @@ describe("dropping picture files on the document window", { timeout: 3 * DROP_WA
         position: { x: 10, y: 10 }, units: "physical", topInsetRemoved: 0 }));
       await eventually(() => expect(status()).toBe("No pictures were inserted; Couldn't drop \"big.png\": it is 21.0 MB; a dropped picture can be at most 20.0 MB."));
       expect(snapshot().title).toBe("Native document");
+    });
+
+    it("listens once per mount, so a page-size change leaves no gap, and a later drop uses the current page", async () => {
+      native.desktop = true;
+      const wide = createPhase4Document("Wide page");
+      const page = wide.pages[0]!;
+      wide.pages[0] = { ...page, width: page.width * 2, height: page.height * 2,
+        ...page.layout ? { layout: { ...page.layout, widthPx: page.width * 2, heightPx: page.height * 2 } } : {} };
+      native.files.set("/Users/me/Drawings/wide.chemdraft", new TextEncoder().encode(serializeDocument(wide)));
+      native.files.set("/Users/me/Pictures/mol.png", pngBytes());
+      native.stat.mockImplementation(async path => ({ size: native.files.get(path)?.length ?? 0 }));
+      await mount(createPhase4Document("Desktop"), "linux");
+      await eventually(() => expect(native.events.has(DOCUMENT_FILE_DROP_EVENT)).toBe(true));
+      const dropSubscriptions = () => native.subscriptions.filter(entry => entry.endsWith(` ${DOCUMENT_FILE_DROP_EVENT}`));
+      expect(dropSubscriptions()).toEqual([`listen ${DOCUMENT_FILE_DROP_EVENT}`]);
+      // A document with another page size comes to the front: the drop handler is re-created.
+      await act(async () => native.events.get(DOCUMENT_FILE_DROP_EVENT)!({ paths: ["/Users/me/Drawings/wide.chemdraft"],
+        position: { x: 10, y: 10 }, units: "css", topInsetRemoved: 0 }));
+      await eventually(() => expect(snapshot().title).toBe("Wide page"));
+      expect(snapshot().pages[0]!.width).toBe(wide.pages[0]!.width);
+      await settle();
+      expect(dropSubscriptions()).toEqual([`listen ${DOCUMENT_FILE_DROP_EVENT}`]);
+      stubLayout(0);
+      await act(async () => native.events.get(DOCUMENT_FILE_DROP_EVENT)!({ paths: ["/Users/me/Pictures/mol.png"],
+        position: { x: 300, y: 200 }, units: "css", topInsetRemoved: 0 }));
+      await eventually(() => expect(status()).toBe("Inserted picture mol.png"));
+      expect(snapshot().title).toBe("Wide page");
+      expect(pictures()).toHaveLength(1);
+      expect(centre(pictures()[0]!)).toEqual({ x: 300, y: 200 });
     });
   });
 });
