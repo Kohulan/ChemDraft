@@ -15,9 +15,10 @@ export const TOOLTIP_RESHOW_WINDOW_MS = 300;
 
 export type ClearTooltipOptions = { onlyMatchingPending?: boolean };
 
-/** Window event that clears every palette tooltip in this webview, as a window blur does. Only the
- *  Linux palette windows send it, when the pointer has left the palette without a DOM pointerleave
- *  (paletteTooltipDismissal.ts). */
+/** Window event that clears every palette tooltip in this webview, as a window blur does. The
+ *  palette windows send it when the pointer has left the palette without a DOM pointerleave: the
+ *  native leave on every platform that reports one, a hovered node re-rendered away under the
+ *  cursor (PaletteWindow), and Linux's page-hidden and idle fallbacks (paletteTooltipDismissal.ts). */
 export const PALETTE_TOOLTIP_DISMISS_DOM_EVENT = "chemdraft:palette-tooltip-dismiss";
 
 export function usePaletteTooltipState() {

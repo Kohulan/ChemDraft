@@ -3783,6 +3783,21 @@ fn close_toolset_window(
 
     let state = mark_toolset_window_closed(&app, &toolset_id)?;
 
+    // The shared tooltip window outlives any one palette: once the close proceeds, hide it on
+    // every platform when it was shown for THIS palette, so it cannot stay floating at its spot.
+    // A tooltip another palette shows under the pointer stays. Best-effort: hiding must never
+    // veto the close, and the next hover shows a tooltip again.
+    let owns_tooltip = toolset_tooltip_owned_by(
+        TOOLSET_TOOLTIP_OWNER
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_deref(),
+        &toolset_id,
+    );
+    if owns_tooltip {
+        let _ = hide_toolset_tooltip(&app);
+    }
+
     if let Some(window) = window {
         // The pin held this map only; a reopen pins the palette again, from the position saved
         // here when a pin was live.
@@ -7199,6 +7214,25 @@ fn start_window_drag(window: tauri::WebviewWindow, grab_x: f64, grab_y: f64) -> 
 
 const TOOLSET_TOOLTIP_WINDOW_LABEL: &str = "toolset-tooltip";
 
+/// The toolset whose palette the shared tooltip is showing for, set by each reveal and cleared by
+/// every hide (hide_toolset_tooltip). Closing a palette hides only its own tooltip.
+static TOOLSET_TOOLTIP_OWNER: Mutex<Option<String>> = Mutex::new(None);
+
+fn toolset_tooltip_owned_by(owner: Option<&str>, toolset_id: &str) -> bool {
+    owner == Some(toolset_id)
+}
+
+/// A reveal names the palette it was measured for. Its show may land after that palette closed or
+/// hid (a keyboard or programmatic close while the tooltip webview was still measuring), and must
+/// not bring the tooltip back then. `source_visible` is None when the palette's window is gone.
+/// A reveal that names no palette keeps the old behavior.
+fn toolset_tooltip_reveal_allowed(
+    source_toolset_id: Option<&str>,
+    source_visible: impl FnOnce(&str) -> Option<bool>,
+) -> bool {
+    source_toolset_id.is_none_or(|toolset_id| source_visible(toolset_id).unwrap_or(false))
+}
+
 /// Read current native visibility rather than keeping a second open/closed ledger: prewarming,
 /// click-away, app deactivation, and closing a palette can all hide a popover independently.
 fn toolset_tooltip_suppressed<'a>(windows: impl IntoIterator<Item = (&'a str, bool)>) -> bool {
@@ -7222,6 +7256,7 @@ fn show_toolset_tooltip_window(
     y: Option<f64>,
     width: Option<f64>,
     height: Option<f64>,
+    source_toolset_id: Option<String>,
 ) -> Result<(), String> {
     if utility_windows_suspended() {
         return Ok(());
@@ -7237,6 +7272,12 @@ fn show_toolset_tooltip_window(
             .filter(|(label, _)| label.starts_with("toolset-popover-"))
             .map(|(label, window)| (label.as_str(), window.is_visible().unwrap_or(false))),
     ) {
+        return Ok(());
+    }
+    if !toolset_tooltip_reveal_allowed(source_toolset_id.as_deref(), |toolset_id| {
+        app.get_webview_window(&toolset_window_label(toolset_id))
+            .map(|palette| palette.is_visible().unwrap_or(false))
+    }) {
         return Ok(());
     }
     let Some(window) = app.get_webview_window(TOOLSET_TOOLTIP_WINDOW_LABEL) else {
@@ -7273,6 +7314,9 @@ fn show_toolset_tooltip_window(
         // On Linux Tao queues this after the position request, so it maps at the new anchor.
         window.show().map_err(|error| error.to_string())?;
     }
+    *TOOLSET_TOOLTIP_OWNER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = source_toolset_id;
     // SW_SHOWNOACTIVATE keeps the hidden window's old z-order, which left the tooltip behind the
     // palette it describes.
     raise_among_owned_windows(&window)
@@ -7449,6 +7493,17 @@ fn hide_toolset_tooltip_window(app: tauri::AppHandle) -> Result<(), String> {
 }
 
 fn hide_toolset_tooltip<R: Runtime>(app: &tauri::AppHandle<R>) -> Result<(), String> {
+    // A hidden tooltip belongs to no palette. Whatever hid it (the pointer left, its palette
+    // closed, the palette's own hide), it must not come back when a dialog's suspension ends:
+    // drop its restore entry, as a closed utility's (UtilitySuspension::closed).
+    TOOLSET_TOOLTIP_OWNER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    UTILITY_SUSPENSION
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .closed(TOOLSET_TOOLTIP_WINDOW_LABEL);
     let Some(window) = app.get_webview_window(TOOLSET_TOOLTIP_WINDOW_LABEL) else {
         return Ok(());
     };
@@ -12113,6 +12168,11 @@ fn start_palette_pointer_feed(app: tauri::AppHandle) {
     }
 
     fn emit_leave(app: &tauri::AppHandle, label: &str, toolset_id: String) {
+        // Hide the shared tooltip natively first, as Linux does on its native leave
+        // (install_toolset_pointer_leave). The palette's own hide depends on a synthetic
+        // pointerout reaching a node React still renders; when that node was re-rendered away,
+        // the tooltip stayed on screen. Best-effort: the palette still hears the leave below.
+        let _ = hide_toolset_tooltip(app);
         let _ = app.emit_to(
             label,
             PALETTE_POINTER_LEAVE_EVENT,
@@ -12186,39 +12246,43 @@ fn start_palette_pointer_feed(app: tauri::AppHandle) {
                 break;
             }
 
-            let Ok(mut state) = state.lock() else {
-                return;
-            };
-            match hovered {
-                Some((label, payload)) => {
-                    let changed = state
-                        .last
-                        .as_ref()
-                        .map(|(last_label, _)| last_label != &label)
-                        .unwrap_or(true);
-                    let moved = (payload.x - state.last_x).abs() >= 1.0
-                        || (payload.y - state.last_y).abs() >= 1.0;
-                    if changed {
-                        if let Some((previous_label, previous_toolset)) = state.last.take() {
-                            emit_leave(&app_handle, &previous_label, previous_toolset);
+            // Decide under the feed's lock, then release it before any native tooltip hide or
+            // window event, so no window call ever runs while the feed state is held.
+            let mut leave: Option<(String, String)> = None;
+            let mut enter: Option<(String, PalettePointerPayload)> = None;
+            {
+                let Ok(mut state) = state.lock() else {
+                    return;
+                };
+                match hovered {
+                    Some((label, payload)) => {
+                        let changed = state
+                            .last
+                            .as_ref()
+                            .map(|(last_label, _)| last_label != &label)
+                            .unwrap_or(true);
+                        let moved = (payload.x - state.last_x).abs() >= 1.0
+                            || (payload.y - state.last_y).abs() >= 1.0;
+                        if changed {
+                            leave = state.last.take();
+                        }
+                        if changed || moved {
+                            state.last_x = payload.x;
+                            state.last_y = payload.y;
+                            state.last = Some((label.clone(), payload.toolset_id.clone()));
+                            enter = Some((label, payload));
                         }
                     }
-                    if changed || moved {
-                        let _ = app_handle.emit_to(
-                            label.as_str(),
-                            PALETTE_POINTER_EVENT,
-                            payload.clone(),
-                        );
-                        state.last_x = payload.x;
-                        state.last_y = payload.y;
-                        state.last = Some((label, payload.toolset_id));
+                    None => {
+                        leave = state.last.take();
                     }
                 }
-                None => {
-                    if let Some((previous_label, previous_toolset)) = state.last.take() {
-                        emit_leave(&app_handle, &previous_label, previous_toolset);
-                    }
-                }
+            }
+            if let Some((previous_label, previous_toolset)) = leave {
+                emit_leave(&app_handle, &previous_label, previous_toolset);
+            }
+            if let Some((label, payload)) = enter {
+                let _ = app_handle.emit_to(label.as_str(), PALETTE_POINTER_EVENT, payload);
             }
         });
     });
@@ -18138,6 +18202,115 @@ mod tests {
         expect_true(
             handler.find("pins.forget(window.label())").unwrap()
                 < handler.find("if utility_windows_suspended()").unwrap(),
+        );
+    }
+
+    #[test]
+    fn closing_a_palette_hides_only_the_tooltip_shown_for_it() {
+        expect_true(toolset_tooltip_owned_by(Some("core.art"), "core.art"));
+        // Palette B's tooltip under the pointer survives palette A's close.
+        expect_false(toolset_tooltip_owned_by(Some("core.rings"), "core.art"));
+        // A hidden tooltip has no owner, so there is nothing to hide.
+        expect_false(toolset_tooltip_owned_by(None, "core.art"));
+    }
+
+    #[test]
+    fn a_pending_tooltip_reveal_cannot_show_for_a_closed_or_hidden_palette() {
+        let mut asked = Vec::new();
+        expect_true(toolset_tooltip_reveal_allowed(Some("core.art"), |id| {
+            asked.push(id.to_owned());
+            Some(true)
+        }));
+        assert_eq!(asked, ["core.art"]);
+        // Closed (hidden) after the reveal was requested, or its window is already gone.
+        expect_false(toolset_tooltip_reveal_allowed(Some("core.art"), |_| {
+            Some(false)
+        }));
+        expect_false(toolset_tooltip_reveal_allowed(Some("core.art"), |_| None));
+        // A reveal that names no palette keeps the old behavior and queries nothing.
+        expect_true(toolset_tooltip_reveal_allowed(None, |_| unreachable!()));
+        // Wiring: the show checks its source after the popover guard and before any placement,
+        // on every platform, and records the owner only once the tooltip is shown.
+        let source = include_str!("lib.rs");
+        let start = source.find("fn show_toolset_tooltip_window(").unwrap();
+        let show = &source[start..start + source[start..].find("\n}\n").unwrap()];
+        let guard = show.find("toolset_tooltip_reveal_allowed(").unwrap();
+        expect_true(show.find("toolset_tooltip_suppressed(").unwrap() < guard);
+        expect_true(guard < show.find("set_window_global_logical_position").unwrap());
+        expect_true(guard < show.find("#[cfg(").unwrap());
+        let owner = show.find("*TOOLSET_TOOLTIP_OWNER").unwrap();
+        expect_true(show.find("window.show()").unwrap() < owner);
+        expect_true(show.find("orderFront(None)").unwrap() < owner);
+    }
+
+    #[test]
+    fn a_hidden_tooltip_is_not_restored_when_a_dialog_ends() {
+        let mut state = utility_suspension::UtilitySuspension::default();
+        state.begin(
+            [
+                ("toolset-core-art".into(), true, false, false),
+                (TOOLSET_TOOLTIP_WINDOW_LABEL.into(), true, false, false),
+            ],
+            None,
+        );
+        expect_true(state.needs_restore(TOOLSET_TOOLTIP_WINDOW_LABEL));
+        // What hide_toolset_tooltip does while the dialog is up (the pointer left, or the palette
+        // hid its tooltip): the palette still comes back, the tooltip does not.
+        state.closed(TOOLSET_TOOLTIP_WINDOW_LABEL);
+        assert_eq!(
+            state.release(false),
+            Some(vec!["toolset-core-art".to_string()])
+        );
+        // Every hide drops the restore entry and the owner before hiding the window.
+        let source = include_str!("lib.rs");
+        let start = source.find("fn hide_toolset_tooltip<R: Runtime>(").unwrap();
+        let hide = &source[start..start + source[start..].find("\n}\n").unwrap()];
+        let window = hide.find("window.hide()").unwrap();
+        expect_true(hide.find(".closed(TOOLSET_TOOLTIP_WINDOW_LABEL)").unwrap() < window);
+        expect_true(hide.find(".take()").unwrap() < window);
+        expect_false(hide.contains("#[cfg("));
+    }
+
+    #[test]
+    fn the_shared_tooltip_hides_when_its_palette_closes_or_the_pointer_leaves() {
+        let source = include_str!("lib.rs");
+        let body = |signature: &str| {
+            let start = source.find(signature).unwrap();
+            let rest = &source[start..];
+            &rest[..rest.find("\n}\n").unwrap()]
+        };
+        // Closing a palette hides the tooltip on every platform, but only once the close proceeds
+        // (past the suspension gate and the closed mark) and only when the tooltip is this
+        // palette's: another palette's tooltip under the pointer stays.
+        let close = body("fn close_toolset_window(");
+        let hide = close.find("hide_toolset_tooltip(&app)").unwrap();
+        expect_true(close.find("if utility_windows_suspended()").unwrap() < hide);
+        expect_true(
+            close
+                .find("mark_toolset_window_closed(&app, &toolset_id)?")
+                .unwrap()
+                < hide,
+        );
+        let owned = close
+            .find("let owns_tooltip = toolset_tooltip_owned_by(")
+            .unwrap();
+        expect_true(owned < hide);
+        expect_true(close[owned..hide].contains("TOOLSET_TOOLTIP_OWNER"));
+        expect_true(close[owned..hide].contains("if owns_tooltip {"));
+        expect_false(close[..hide].contains("#[cfg("));
+        // macOS: the pointer feed's leave hides the native tooltip before telling the palette,
+        // mirroring the Linux native leave (install_toolset_pointer_leave).
+        let feed = body("fn start_palette_pointer_feed(app: tauri::AppHandle)");
+        let leave = &feed[feed.find("fn emit_leave(").unwrap()..];
+        let leave = &leave[..leave.find("\n    }\n").unwrap()];
+        expect_true(
+            leave.find("hide_toolset_tooltip(app)").unwrap()
+                < leave.find("PALETTE_POINTER_LEAVE_EVENT").unwrap(),
+        );
+        let linux = body("fn install_toolset_pointer_leave<");
+        expect_true(
+            linux.find("hide_toolset_tooltip(&app)").unwrap()
+                < linux.find("PALETTE_POINTER_LEAVE_EVENT").unwrap(),
         );
     }
 

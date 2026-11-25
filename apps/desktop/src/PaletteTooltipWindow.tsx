@@ -39,11 +39,15 @@ function hideTooltipWindow(isCurrent: () => boolean) {
 export function paletteTooltipShowArgs(
   position: { x: number; y: number },
   size: { width: number; height: number },
-  platform: ShortcutPlatform
-): { x: number; y: number; width?: number; height?: number } {
-  return platform === "linux"
+  platform: ShortcutPlatform,
+  sourceToolsetId?: string
+): { x: number; y: number; width?: number; height?: number; sourceToolsetId?: string } {
+  const args = platform === "linux"
     ? { x: position.x, y: position.y, width: size.width, height: size.height }
     : { x: position.x, y: position.y };
+  // The palette that asked: Rust refuses the reveal when that palette closed or hid while this
+  // window was still measuring (a keyboard close sends no hide here), on every platform.
+  return sourceToolsetId === undefined ? args : { ...args, sourceToolsetId };
 }
 
 function showTooltipWindow(
@@ -179,7 +183,10 @@ export function PaletteTooltipWindow({
         height,
         bounds
       });
-      showTooltipWindow(paletteTooltipShowArgs({ x, y }, { width, height }, platform), () => !superseded());
+      showTooltipWindow(
+        paletteTooltipShowArgs({ x, y }, { width, height }, platform, payload.sourceToolsetId),
+        () => !superseded()
+      );
     })().catch(() => undefined);
     return () => {
       cancelled = true;
