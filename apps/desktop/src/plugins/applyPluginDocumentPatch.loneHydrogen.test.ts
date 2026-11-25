@@ -325,8 +325,7 @@ describe("verifying a plugin insert of a lone H's cache", () => {
   }, 60_000);
 
   // Ethane beside a lone H whose stored structure is a V2000 molfile carrying the H's radical as an
-  // `M  RAD` doublet (RDKit reads CC.[H], the drawing), beside today's chemistry record. It already
-  // states the drawing: the refresh leaves it to the verifier, which reads it as the drawing.
+  // `M  RAD` doublet (RDKit reads CC.[H], the drawing), beside today's chemistry record.
   const radicalCtab = (radicals: string) => {
     const drawn = ethane("CC.[H]");
     const molfile = moleculeToMolfileV2000(drawn, { kekuleBondOrders: new Map() }).contents.replace("M  END", `${radicals}\nM  END`);
@@ -335,11 +334,13 @@ describe("verifying a plugin insert of a lone H's cache", () => {
 
   // Known, deliberate limitation (as on release/1.2.3, deferred to 1.2.4): the verifier does not read
   // a radical doublet, so a stored molfile carrying one is refused, loudly.
-  it.each([false, true])("keeps an M  RAD doublet molfile as authored, with no warning, and the verifier refuses it (accepted: %s)", async (accepted) => {
+  // The refresh cannot confirm a CTAB that is not ChemDraft's own writing of the drawing without parsing
+  // it, so it keeps it as authored and names it.
+  it.each([false, true])("keeps an M  RAD doublet molfile as authored, warns once, and the verifier refuses it (accepted: %s)", async (accepted) => {
     vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const stored = radicalCtab("M  RAD  1   3   2");
     const { applied, inserted, verified } = verify(stored, accepted);
-    expect(applied.warnings).toEqual([]);
+    expect(applied.warnings).toEqual([impliedRadicalCacheDeclinedLine("ethane")]);
     expect(cacheOf(inserted())).toEqual(cacheOf(stored));
     expect(verified).toBeDefined();
     await expect(verified!).rejects.toThrow(/stored structure carries annotations that can't be checked/);
@@ -366,12 +367,12 @@ describe("verifying a plugin insert of a lone H's cache", () => {
     return { ...drawn, ...refreshedAt123(drawn), structureFormat: "molfile-v3000" as const, structure: molfile };
   };
 
-  it("keeps a V3000 molfile with RAD=2 on the lone H's atom line as authored, and the verifier refuses it (deferred to 1.2.4)", async () => {
+  it("keeps a V3000 molfile with RAD=2 on the lone H's atom line as authored, warns once, and the verifier refuses it (deferred to 1.2.4)", async () => {
     vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const stored = radicalCtabV3000((molfile) => molfile.replace(/^(M {2}V30 3 H .*)$/m, "$1 RAD=2"));
     expect(stored.structure).toMatch(/^M {2}V30 3 H .* RAD=2$/m);
     const { applied, inserted, verified } = verify(stored, false);
-    expect(applied.warnings).toEqual([]);
+    expect(applied.warnings).toEqual([impliedRadicalCacheDeclinedLine("ethane")]);
     expect(cacheOf(inserted())).toEqual(cacheOf(stored));
     expect(verified).toBeDefined();
     await expect(verified!).rejects.toThrow(/stored structure carries annotations that can't be checked/);
@@ -389,6 +390,49 @@ describe("verifying a plugin insert of a lone H's cache", () => {
     expect(inserted().structure).toBe(stored.structure);
     expect(verified).toBeDefined();
     await expect(verified!).rejects.toThrow(/stored structure carries annotations that can't be checked/);
+  }, 60_000);
+
+  // Ethane beside a lone H as a molfile in ChemDraft's own CTAB writing of the drawing (the lone H at the
+  // zero-valence sentinel, which RDKit reads as H•), beside today's record; `edit` applied to the text.
+  const ownCtab = (flavor: "v2000" | "v3000", edit: (molfile: string) => string = (molfile) => molfile) => {
+    const drawn = ethane("CC.[H]");
+    const write = flavor === "v2000" ? moleculeToMolfileV2000 : moleculeToMolfileV3000;
+    const molfile = edit(write(drawn, { kekuleBondOrders: new Map() }).contents);
+    return { ...drawn, ...refreshedAt123(drawn), structureFormat: `molfile-${flavor}` as const, structure: molfile };
+  };
+
+  it.each([
+    ["v2000", false], ["v2000", true], ["v3000", false], ["v3000", true]
+  ] as const)("keeps ChemDraft's own %s writing of the drawing (lone H as H•) with no warning, and the verifier accepts it (accepted: %s)", async (flavor, accepted) => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const stored = ownCtab(flavor);
+    expect(stored.structure).toMatch(flavor === "v2000" ? /^ .* H {3}0 {2}0 {2}0 {2}0 {2}0 15 /m : /^M {2}V30 3 H .* VAL=-1$/m);
+    const { applied, inserted, normalized, verified } = verify(stored, accepted);
+    expect(applied.warnings).toEqual([]);
+    expect(cacheOf(inserted())).toEqual(cacheOf(stored));
+    const document = (await verified) ?? normalized;
+    const kept = document.pages[0]!.objects.find((candidate): candidate is MoleculeObject => candidate.type === "molecule")!;
+    expect(kept.structure).toBe(stored.structure);
+    expect(warn).not.toHaveBeenCalled();
+  }, 60_000);
+
+  // The verifier compares no radical, so a stored CTAB whose lone H is written with no radical (read as
+  // H2: stale) beside a record stating H• must never pass silently: the refresh cannot confirm it, so
+  // it keeps it as authored and names it, and the verifier refuses it as on release/1.2.3.
+  it.each([
+    ["v2000", false], ["v2000", true], ["v3000", false], ["v3000", true]
+  ] as const)("keeps a %s molfile whose lone H is unmarked (read as H2) as authored, warns once, and the verifier refuses it (accepted: %s)", async (flavor, accepted) => {
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const stored = ownCtab(flavor, (molfile) => flavor === "v2000"
+      ? molfile.replace(/^(.* H {3}0 {2}0 {2}0 {2}0 {2}0) 15/m, "$1  0")
+      : molfile.replace(/^(M {2}V30 3 H .*) VAL=-1$/m, "$1"));
+    expect(stored.structure).toMatch(flavor === "v2000" ? /^ .* H {3}0 {2}0 {2}0 {2}0 {2}0 {2}0 /m : /^M {2}V30 3 H [^A-Z]*$/m);
+    expect(stored.chemistry?.radicalCount).toBe(1);
+    const { applied, inserted, verified } = verify(stored, accepted);
+    expect(applied.warnings).toEqual([impliedRadicalCacheDeclinedLine("ethane")]);
+    expect(cacheOf(inserted())).toEqual(cacheOf(stored));
+    expect(verified).toBeDefined();
+    await expect(verified!).rejects.toThrow(/stored structure doesn't match the drawn atoms/);
   }, 60_000);
 
   // (The commit's verification then refuses any dative bond, which a V2000 molfile cannot carry; only
