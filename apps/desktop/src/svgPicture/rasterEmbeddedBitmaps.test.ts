@@ -2,7 +2,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { SvgPictureRasterRequest } from "@chemdraft/export-engine/pdf";
 import {
-  bytesToBase64, prepareRasterPictures, RasterPictureMaxCount, RasterPictureMaxSidePx, readPngSize,
+  bytesToBase64, prepareRasterPictures, RasterPictureMaxCount, RasterPictureOverCountHref, RasterPictureMaxSidePx, readPngSize,
   type PicturePixelDecoder
 } from "../rasterPictureDecode";
 import { picturePngBase64 } from "../testSupport/imageFixture";
@@ -163,10 +163,12 @@ describe("embeddedBitmapPictureStep", () => {
     // Distinct pictures, so the per-export cache cannot absorb the calls.
     const failing = Array.from({ length: RasterPictureMaxCount + 1 }, (_, index) => picture(dataUri(BITMAP_SVG(`data-n="${index}"`))));
     const png = `<image width="1" height="1" href="data:image/png;base64,${picturePngBase64}"/>`;
-    const { pictures } = await prepare(page([...failing, png]), { rasterize });
+    const { svg, pictures } = await prepare(page([...failing, png]), { rasterize });
     expect(rasterize).toHaveBeenCalledTimes(RasterPictureMaxCount);
     // The slots are spent: the PNG after them is past the limit and is not decoded.
     expect(pictures).toHaveLength(0);
+    // ...and reaches Rust marked as over the count, not as a generic omission.
+    expect(images(svg).at(-1)!.getAttribute("href")).toBe(RasterPictureOverCountHref);
   });
 
   describe("one budget in drawing order", () => {
