@@ -199,7 +199,14 @@ export interface DroppedFilesHandler<T> {
    */
   whenIdle?<R>(commit: () => R): Promise<R>;
   decoders: DroppedImageDecoders;
+  /** A status for the tab the drop landed on, whichever tab is active by then. */
   setStatus(status: string): void;
+  /**
+   * The drop's whole outcome (the pictures' result joined with the documents' summary), for the tab
+   * active once any documents have opened, which may not be the one the drop landed on: a refusal is
+   * never shown only on a tab out of sight. `setStatus` when absent.
+   */
+  showOutcome?(status: string): void;
   /** Runs the picture work after any earlier drop's, so two drops never interleave their commits. */
   serialize?: <R>(task: () => Promise<R>) => Promise<R>;
 }
@@ -246,6 +253,8 @@ export async function handleDroppedFiles<T>(files: readonly T[], handler: Droppe
     // Not queued behind an earlier drop still being read: the refusal shows now.
     ? formatImageDropStatus({ inserted: [], refusals: split.refusals, notInserted: `The dropped pictures were not inserted: ${refusedNow}` })
     : await (handler.serialize ? handler.serialize(pictures) : pictures());
+  // The pictures' result replaces "Reading…" on their own tab before any document opens a new one.
+  handler.setStatus(status);
   const documentStatus = split.documents.length ? await handler.openDocuments(split.documents) : undefined;
-  handler.setStatus(joinStatusParts([status, documentStatus]));
+  (handler.showOutcome ?? handler.setStatus)(joinStatusParts([status, documentStatus]));
 }
