@@ -1,6 +1,8 @@
 import { clearStoredCtabReference, storedCtabReference } from "@chemdraft/plugin-host";
 import type { Anchor, MoleculeObject } from "@chemdraft/chem-core";
-import { chemicalIdentitySource, moleculeSmiles, nativeSingleBondGraphMetadata } from "@chemdraft/document-workflow-core";
+import {
+  ATOM_MAPS_WRITE_REFUSAL_REASON, chemicalIdentitySource, moleculeSmiles, moleculeSourceHasAtomMaps, nativeSingleBondGraphMetadata
+} from "@chemdraft/document-workflow-core";
 import type { ExportWarning } from "@chemdraft/export-engine";
 import { nativeElementFromAtomLabel, nativeEnhancedStereoAtomIndicators } from "@chemdraft/layout-engine";
 import { refreshNativeSingleBondGraph } from "../../documentWorkflow";
@@ -74,12 +76,19 @@ export async function verifyStoredSources(context: StructureInspectionContext, m
   }
   const check = async (format: Exclude<MoleculeObject["structureFormat"], "unknown">, value: string) => {
     validateInspectionSource({ format, structure: value });
+    // Drawn atoms have no map field, so a mapped stored source never matches them: when a refusal
+    // follows, name that cause before any generic one (an AAMAP= keyword is also an unchecked field).
+    const mapsRefusal = () => moleculeSourceHasAtomMaps({ ...molecule, structureFormat: format, structure: value, compatibility: undefined })
+      ? new ChemistryRefusal(ATOM_MAPS_WRITE_REFUSAL_REASON, `The stored ${format} of "${molecule.id}" carries atom-map numbers the editable graph cannot keep.`)
+      : undefined;
     if (replacementIdentity !== undefined && (format === "smiles" ? value.includes("|") : hasExtraCtabFields(value, format))) {
-      throw new ChemistryRefusal("the stored structure carries annotations that can't be checked against the drawn atoms", `The stored ${format} of "${molecule.id}" contains annotations the graph writer cannot verify.`);
+      throw mapsRefusal() ?? new ChemistryRefusal("the stored structure carries annotations that can't be checked against the drawn atoms", `The stored ${format} of "${molecule.id}" contains annotations the graph writer cannot verify.`);
     }
     const result = await context.chemistry.inspectStructure(format === "smiles" ? "smiles" : "molfile", value);
     if (!result.valid || !result.orderedIdentity ||
         replacementIdentity !== undefined && (result.hasStoredGroups !== false || result.identitySmiles !== replacementIdentity)) {
+      const refusal = result.valid ? mapsRefusal() : undefined;
+      if (refusal) throw refusal;
       throw new ChemistryRefusal("the stored structure doesn't match the drawn atoms", `The stored ${format} of "${molecule.id}" has chemistry the editable graph cannot verify.`);
     }
     if (format !== "smiles" && graph) {

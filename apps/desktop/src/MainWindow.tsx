@@ -13,7 +13,7 @@ import { createBracketCommands, selectedBracketPair, toggleBracketRepeatUnit, se
 import { bracketLabelPlan, bracketLabelContainsPoint, lonePairDragDirection, transformPointForObject } from "@chemdraft/layout-engine";
 import { useCanvasHandwritingFont } from "./canvasHandwritingFont";
 import { nativeTemplateForToolCommand } from "./ringTemplates";
-import { documentDrawingDefaults } from "@chemdraft/document-workflow-core";
+import { ATOM_MAPS_REMOVED_STATUS, documentDrawingDefaults, stripSmilesAtomMaps } from "@chemdraft/document-workflow-core";
 import { nativeStylePresetPatchForSelection } from "./nativeStylePresetCommand";
 import { AtomProblemMarker } from "./AtomProblemMarker";
 import { atomProblemCommandId, atomProblemCommands, atomProblemSnapshot, type AtomProblemTarget } from "./atomProblemCommands";
@@ -346,9 +346,9 @@ import { createRdkitAdapter } from "@chemdraft/rdkit-adapter/adapter";
 import { buildAnalysisReport, type AnalysisReport, type AnalysisRun } from "@chemdraft/analysis-core";
 import { analysisClient } from "./analysisClient";
 import { clipboardChemistrySizeRefusal, guardClipboardPayload, inspectClipboardPayload, isVectorArtworkType, looksLikeSmiles, smilesListCandidates, type ClipboardDetectedPayload } from "@chemdraft/clipboard-adapter";
-import { verifySmilesPaste, verifySmilesPasteInput, verifySmilesGridEntries } from "./smilesPasteIdentity";
+import { atomMapStereoLossStatus, verifySmilesPaste, verifySmilesPasteInput, verifySmilesGridEntries } from "./smilesPasteIdentity";
 import {
-  SmilesListPasteError, depictSmilesForPaste, depictSmilesListForPaste, smilesListFailureStatus
+  SmilesListPasteError, depictSmilesForPaste, depictSmilesListForPaste, smilesListAtomMapNotes, smilesListFailureStatus
 } from "./smilesListPaste";
 import type { Generate3DConformerResult, StructureAnalysisResult } from "@chemdraft/chemistry-adapter";
 import {
@@ -1900,7 +1900,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.25.02.10-opus";
+const CURRENT_BUILD_STAMP = "11.25.02.46-opus";
 
 /**
  * Sets `target` to `markIds`. A commit updater fills its policy's `IndependentMarkMoves` this way:
@@ -8037,20 +8037,29 @@ export function MainWindow({
       if (signal.aborted) return { outcome: "terminal" as const };
     };
     setStatus("Drawing the pasted SMILES…");
+    // Atom maps have no native field yet: draw, verify and store the SMILES without them, so the
+    // identity check compares like with like and still refuses any other change.
+    const { smiles: pasteSmiles, removed: removedAtomMaps } = stripSmilesAtomMaps(smilesText);
     try {
-      await verifySmilesPasteInput(smilesText, signal);
+      await verifySmilesPasteInput(pasteSmiles, signal);
       let terminal = pictureFallback ? terminalResult() : undefined;
       if (terminal) return terminal;
       const layoutDocument = documentRef.current;
       const point = anchor.point;
-      const parsed = await depictSmilesForPaste(smilesText, { signal }, {
+      const parsed = await depictSmilesForPaste(pasteSmiles, { signal }, {
         document: layoutDocument, centre: point, reservedObjectIds: new Set<string>()
       });
       terminal = terminalResult();
       if (terminal) return terminal;
       if (!parsed) return { outcome: "no-structure" };
       const { depiction } = parsed;
-      await verifySmilesPaste(depiction, smilesText);
+      await verifySmilesPaste(depiction, pasteSmiles);
+      terminal = terminalResult();
+      if (terminal) return terminal;
+      // Compare stereo whenever the text changed: a class 0 is not a map (no "removed" note), but
+      // removing it can still leave a centre or an alkene without stereo.
+      const atomMapNotes = pasteSmiles !== smilesText ? [...(removedAtomMaps ? [ATOM_MAPS_REMOVED_STATUS] : []),
+        ...[await atomMapStereoLossStatus(smilesText, pasteSmiles, undefined, signal)].filter((note): note is string => note !== undefined)] : [];
       terminal = terminalResult();
       if (terminal) return terminal;
       const pasteDocument = documentRef.current;
@@ -8067,7 +8076,7 @@ export function MainWindow({
         pasteDocument,
         point,
         depiction,
-        smilesText,
+        pasteSmiles,
         SMILES_PASTE_OPTIONS
       ), status: undefined };
       const nextDocument = inserted.document;
@@ -8096,7 +8105,7 @@ export function MainWindow({
       resetPasteUiState();
       setPageFitPrompt(undefined);
       const pasteStatus = `Pasted SMILES structure — ${depiction.atoms.length} atoms${stereoStatus}`;
-      setStatus([pasteStatus, ...(inserted.status ? [inserted.status] : []), ...(parsed.warnings ?? []), ...stereoWarnings].join("; "));
+      setStatus([pasteStatus, ...(inserted.status ? [inserted.status] : []), ...(parsed.warnings ?? []), ...stereoWarnings, ...atomMapNotes].join("; "));
       return { outcome: "success" };
     } catch (error) {
       const terminal = terminalResult();
@@ -8148,6 +8157,7 @@ export function MainWindow({
       setStatus(`Parsing SMILES list: ${completed} of ${total} tokens`);
     }, {
       signal, inspectInput: verifySmilesPasteInput,
+      inspectAtomMapStereo: (mapped, stripped, stereoSignal) => atomMapStereoLossStatus(mapped, stripped, undefined, stereoSignal),
       templatePlacement: { document: pasteDocument, centre: anchor.point }
     });
     if (!pendingList) return undefined;
@@ -8179,7 +8189,9 @@ export function MainWindow({
       const failures = smilesListFailureStatus(displayedFailures);
       const failureCount = displayedFailures.length;
       const makeStatus = (placementStatus: string) => {
-        const baseStatus = [placementStatus, ...new Set(entries.flatMap(entry => entry.molecule ? [structureTemplateLayoutMessage(entry.molecule)!] : [])), ...(parsed.warnings ?? [])].join("; ");
+        const baseStatus = [placementStatus, ...new Set(entries.flatMap(entry => entry.molecule ? [structureTemplateLayoutMessage(entry.molecule)!] : [])), ...(parsed.warnings ?? []),
+          // Only the entries that passed identity verification were pasted; only they add a note.
+          ...smilesListAtomMapNotes(entries)].join("; ");
         return failures ? `${baseStatus}; ${failureCount} item${failureCount === 1 ? "" : "s"} failed: ${failures}` +
           (engineUnavailable ? "; pasted as text" : "") : baseStatus;
       };

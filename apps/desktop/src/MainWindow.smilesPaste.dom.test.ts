@@ -11,6 +11,7 @@ import { getAssistantHistoryPort } from "./assistant/historyPort";
 import { MainWindow } from "./MainWindow";
 import { createPhase4Document, pastedStructureDepictionFromMolfile } from "./documentWorkflow";
 import * as depictionClient from "./depiction2d/client";
+import * as smilesIdentity from "./smilesPasteIdentity";
 import { installDomRdkitLoader } from "./testSupport/rdkitIdentity";
 import { inspectStructureOffThread } from "./depiction2d/identityClient";
 import { IdentityWorkerUnavailableError } from "./depiction2d/identityWorkerClient";
@@ -345,6 +346,83 @@ describe("MainWindow SMILES paste", () => {
     expect(status).toContain("1 item failed");
     expect(container.querySelectorAll(".molecule-object")).toHaveLength(3);
     expect(container.querySelectorAll(".text-object")).toHaveLength(0);
+  }, 20_000);
+
+  function pastedMolecules() {
+    return getAssistantHistoryPort().read("initial")!.pages[0]!.objects.flatMap(object => object.type === "molecule" ? [object] : []);
+  }
+  const mapsRemoved = "Atom-map numbers removed; ChemDraft does not keep them yet.";
+
+  it.each([
+    ["[CH3:1]/[CH:2]=[CH:3]/[CH3:4]", "[CH3]/[CH]=[CH]/[CH3]"],
+    ["[CH3:1][C:2](=[O:3])[OH:4]", "[CH3][C](=[O])[OH]"]
+  ])("pastes the atom-mapped SMILES %s without its maps and says so", async (mapped, stripped) => {
+    const status = await paste(mapped, "text/plain", mapsRemoved);
+    expect(status).toMatch(/^Pasted SMILES structure — 4 atoms/);
+    expect(status!.split(mapsRemoved)).toHaveLength(2);
+    expect(status).not.toContain("refused");
+    const molecules = pastedMolecules();
+    expect(molecules).toHaveLength(1);
+    expect(molecules[0]!.structure).not.toMatch(/:\d+\]/);
+    expect(molecules[0]!.compatibility?.unknown).toEqual({ smiles: stripped });
+    expect(container.querySelectorAll(".text-object")).toHaveLength(0);
+  }, 20_000);
+
+  it("says when removing the maps leaves a centre without stereo", async () => {
+    const status = await paste("[CH3:1][C@:2]([CH3:3])(F)Cl", "text/plain", mapsRemoved);
+    expect(status).toContain("Without atom-map numbers, 1 stereocenter in the pasted SMILES is no longer stereogenic and was drawn without stereo");
+    expect(pastedMolecules()).toHaveLength(1);
+  }, 20_000);
+
+  it("leaves the status of an unmapped paste unchanged", async () => {
+    const status = await paste("CC(=O)O", "text/plain", "Pasted SMILES structure");
+    expect(status).toBe("Pasted SMILES structure — 4 atoms");
+  }, 20_000);
+
+  it("pastes a list of mapped tokens without maps and says so once", async () => {
+    const status = await paste("[CH3:1][OH:2]\n[CH3:1][C:2](=[O:3])[OH:4]\nCCN", "text/plain", mapsRemoved);
+    expect(status).toContain("Pasted 3 SMILES structures");
+    expect(status!.split(mapsRemoved)).toHaveLength(2);
+    expect(status).not.toContain("failed");
+    const molecules = pastedMolecules();
+    expect(molecules).toHaveLength(3);
+    expect(molecules.map(molecule => molecule.compatibility?.unknown?.smiles).sort())
+      .toEqual(["CCN", "[CH3][C](=[O])[OH]", "[CH3][OH]"]);
+    for (const molecule of molecules) expect(molecule.structure).not.toMatch(/:\d+\]/);
+  }, 20_000);
+
+  it.each([
+    ["[CH3:0][C@](C)(F)Cl", "1 stereocenter"],
+    ["[CH3:0]/C(C)=C/F", "1 double-bond E/Z assignment"]
+  ])("reports stereo lost by removing the class 0 of %s, which is not a map", async (input, lost) => {
+    // Class 0 is unmapped, but RDKit still tells the two methyls apart by it.
+    const status = await paste(input, "text/plain", "Without atom-map numbers");
+    expect(status).toContain(`Without atom-map numbers, ${lost} in the pasted SMILES is no longer stereogenic and was drawn without stereo`);
+    expect(status).not.toContain(mapsRemoved);
+    expect(pastedMolecules()).toHaveLength(1);
+    expect(pastedMolecules()[0]!.compatibility?.unknown).toEqual({ smiles: input.replace(":0", "") });
+  }, 20_000);
+
+  it("reports stereo lost by removing a class 0 in a list paste", async () => {
+    const status = await paste("[CH3:0][C@](C)(F)Cl\nCCO\nCCN", "text/plain", "Without atom-map numbers");
+    expect(status).toContain("Pasted 3 SMILES structures");
+    expect(status).toContain("[CH3:0][C@](C)(F)Cl: Without atom-map numbers, 1 stereocenter in the pasted SMILES is no longer stereogenic");
+    expect(status).not.toContain(mapsRemoved);
+  }, 20_000);
+
+  it("adds no atom-map note for a mapped list entry that identity verification refused", async () => {
+    const verify = smilesIdentity.verifySmilesGridEntries;
+    vi.spyOn(smilesIdentity, "verifySmilesGridEntries").mockImplementation(async (entries, inspect, signal) => {
+      const refused = entries.filter(entry => entry.smiles === "[CH3][C@]([CH3])(F)Cl");
+      const verified = await verify(entries.filter(entry => !refused.includes(entry)), inspect, signal);
+      return { entries: verified.entries,
+        failures: [...verified.failures, ...refused.map(entry => ({ input: entry.smiles, error: "identity refused for the test" }))] };
+    });
+    const status = await paste("[CH3:1][C@:2]([CH3:3])(F)Cl\nCCO\nCCN", "text/plain", "failed");
+    expect(status).toContain("Pasted 2 SMILES structures");
+    expect(status).not.toContain(mapsRemoved);
+    expect(status).not.toContain("Without atom-map numbers");
+    expect(pastedMolecules()).toHaveLength(2);
   }, 20_000);
 
   it("names the skipped line for C1CC while placing the other list entries", async () => {

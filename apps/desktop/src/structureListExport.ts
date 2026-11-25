@@ -6,7 +6,7 @@ import {
 } from "@chemdraft/chem-core";
 import {
   assertMolfileExportIdentity, documentDrawingDefaults, moleculeToInteropMolfile, expandNativeMoleculeLabelGroups,
-  nativeSingleHeavyElementLabelValence
+  nativeSingleHeavyElementLabelValence, pushAtomMapsDroppedWarning
 } from "@chemdraft/document-workflow-core";
 import { getExportFormatDescriptor, repeatUnitExportWarnings, repeatUnitMolfileGroups, type ExportWarning, type TextExportResult } from "@chemdraft/export-engine";
 import { nativeBondOrderResolution } from "@chemdraft/layout-engine";
@@ -122,6 +122,8 @@ export async function exportStructureListSdf(
       severity: "warning",
       objectId: molecule.id
     })));
+    // The connection table (and the SMILES field below) come from native atoms, which have no maps.
+    pushAtomMapsDroppedWarning(warnings, molecule, "SDF");
     let smiles: string | undefined;
     try {
       smiles = await moleculeSmiles(molecule, index, warnings, computeStructureIdentifiers, ctab);
@@ -154,6 +156,8 @@ export async function exportStructureListSmi(document: ChemDraftDocument): Promi
   for (const [index, molecule] of molecules.entries()) {
     try {
       const smiles = await moleculeSmiles(molecule, index, warnings, computeStructureIdentifiers);
+      // The stored-SMILES fallback writes a mapped source as it is; every other route drops the maps.
+      if (smiles !== molecule.structure) pushAtomMapsDroppedWarning(warnings, molecule, "SMILES");
       lines.push(`${smiles}\t${moleculeName(molecule) ?? index + 1}\n`);
     } catch (error) {
       warnings.push(smilesWriteFailure(molecule, error));

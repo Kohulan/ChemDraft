@@ -1,4 +1,7 @@
-import { changedElectronMarkAssignments, moleculeSmiles, nativeSingleBondGraphMetadata, nativeSingleBondGraphSmiles } from "@chemdraft/document-workflow-core";
+import {
+  ATOM_MAPS_WRITE_REFUSAL_REASON, changedElectronMarkAssignments, moleculeSmiles, nativeSingleBondGraphMetadata,
+  nativeSingleBondGraphSmiles, smilesAtomMapNumbers
+} from "@chemdraft/document-workflow-core";
 import { adoptDerivedDocument, type ChemDraftDocument, type DocumentObject, type MoleculeObject } from "@chemdraft/chem-core";
 import { retainedCtabCompatibility, RequestWriteError, type RequestHistory } from "@chemdraft/plugin-host";
 import { normalizeCommittedDocument } from "../../documentWorkflow";
@@ -128,6 +131,10 @@ export async function verifyNormalizedWrite(context: StructureInspectionContext,
       const declared = await inspectWriteSmiles(context, expected);
       if (declared.identitySmiles !== graph.identitySmiles || declared.hasStoredGroups !== false ||
           (!equal(authored, molecule) && (await inspectMolecule(context, authored)).orderedIdentity !== graph.orderedIdentity)) {
+        // The drawn atoms have no map field, so a mapped expected SMILES never matches them: name the cause.
+        if (declared.identitySmiles !== graph.identitySmiles && smilesAtomMapNumbers(expected).length) {
+          throw new ChemistryRefusal(ATOM_MAPS_WRITE_REFUSAL_REASON, `The expected SMILES of "${id}" carries atom-map numbers the editable graph cannot keep.`);
+        }
         throw new Error(`The authored or normalized chemistry of "${id}" differs from the expected structure.`);
       }
     }
