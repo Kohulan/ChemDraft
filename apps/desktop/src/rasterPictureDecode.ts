@@ -127,6 +127,25 @@ export async function prepareRasterPictures(
   return { svg: new XMLSerializer().serializeToString(parsed), pictures };
 }
 
+/**
+ * The decoded bytes `prepareRasterPictures` charges for this href when `remainingBytes` are left, if it
+ * decodes: 0 for a PNG it refuses by size (it still takes a count slot), undefined for an href it does
+ * not take as a PNG picture. Lets the pass that rasterises SVG pictures share this call's one budget.
+ */
+export function rasterPictureCharge(href: string, remainingBytes: number): number | undefined {
+  const match = PngDataUri.exec(href);
+  if (!match) return undefined;
+  const size = pngSizeOfBase64(match[1]);
+  if (!size || size.width > RasterPictureMaxSidePx || size.height > RasterPictureMaxSidePx) return 0;
+  const bytes = size.width * size.height * 4;
+  return bytes > remainingBytes ? 0 : bytes;
+}
+
+/** Read the size from the first base64 characters, before decoding anything else. */
+function pngSizeOfBase64(base64: string): { width: number; height: number } | undefined {
+  return base64.length % 4 === 0 ? readPngSize(base64ToBytes(base64.slice(0, PngSizeHeaderBase64Length))) : undefined;
+}
+
 /** Decodes one picture within the limits and returns its pixels as base64, or why it was refused. */
 async function encodeWithinLimits(
   base64: string,
@@ -134,8 +153,7 @@ async function encodeWithinLimits(
   decode: PicturePixelDecoder
 ): Promise<{ width: number; height: number; rgbaBase64: string } | { refused: RasterPictureRefusal }> {
   try {
-    // Read the size from the first base64 characters, before decoding anything else.
-    const size = base64.length % 4 === 0 ? readPngSize(base64ToBytes(base64.slice(0, PngSizeHeaderBase64Length))) : undefined;
+    const size = pngSizeOfBase64(base64);
     if (!size) return { refused: "decodeFailed" };
     if (size.width > RasterPictureMaxSidePx || size.height > RasterPictureMaxSidePx) return { refused: "tooLarge" };
     if (size.width * size.height * 4 > remainingBytes) return { refused: "overBudget" };

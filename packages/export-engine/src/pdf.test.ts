@@ -1010,6 +1010,18 @@ describe("SVG pictures in PDF export", () => {
     expect(corrupted.warnings).toEqual([notDrawn("svg-picture", "the rasterised PNG could not be embedded (Error while decompressing the data: -3)")]);
   });
 
+  it("warns by picture, and exports the rest, when a native PNG picture cannot be embedded", async () => {
+    // Well-framed PNG whose pixels cannot decode: the structure check passes it, jsPDF refuses it.
+    const png = Buffer.from(redPng());
+    png.fill(0x55, png.indexOf("IDAT") + 4, png.indexOf("IDAT") + 12);
+    const broken = { ...createImageGraphicObject({ id: "broken", mimeType: "image/png", dataBase64: png.toString("base64"), center: { x: 0, y: 0 } }),
+      x: 300, y: 120, width: 96, height: 48, rotation: 0 };
+    const result = await pdfOf(documentOf(pictureOf("fine", "image/png", { x: 10 }), broken));
+    expect(result.warnings).toEqual([{ code: "export.pdf.picture_not_drawn", severity: "warning", objectId: "broken",
+      message: "PDF export: picture broken was not drawn: the PNG could not be embedded (Error while decompressing the data: -3)" }]);
+    expect(pdfPictureFrames(Buffer.from(result.bytes).toString("latin1"))).toHaveLength(1);
+  });
+
   it("rejects a rasteriser result larger than the size cap", async () => {
     const chunk = (type: string, data: Buffer) => {
       const bytes = Buffer.alloc(data.length + 12);
