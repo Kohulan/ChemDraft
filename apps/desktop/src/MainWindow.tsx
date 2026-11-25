@@ -64,6 +64,8 @@ import { acquireNativeUtilitySuspension } from "./nativeUtilitySuspension";
 import { loadAskToSaveBeforeQuit } from "./quitSettings";
 import { loadStartWithFreshDocument } from "./startupSettings";
 import { nativePrompt, useNativePrompt } from "./nativePrompt";
+import { collapseRepeatedFileExtension, DOCUMENT_SAVE_EXTENSIONS, type RepeatedExtensionSaveTarget } from "./repeatedSaveExtension";
+import { resolveNativeSavePanelPath, resolveNativeSavePanelTarget, writeNativeSavePanelGrant } from "./nativeSavePanelPath";
 import { notifyNativeDocumentCompatibility } from "./nativeDocumentNotice";
 import { formatDocumentOpenBatchStatus, formatDocumentOpenFailure, listenAndDrainNativeOpenQueue, type DocumentOpenResult } from "./nativeOpenQueue";
 import { useInAppModalUtilitySuspension } from "./useInAppModalUtilitySuspension";
@@ -1902,7 +1904,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.25.07.55-opus";
+const CURRENT_BUILD_STAMP = "11.25.08.00-opus";
 
 /**
  * Sets `target` to `markIds`. A commit updater fills its policy's `IndependentMarkMoves` this way:
@@ -3113,7 +3115,9 @@ export function MainWindow({
   const browserExportTabRef = useRef<string | undefined>(undefined);
   const browserExportSessionRef = useRef<string | undefined>(undefined);
   const browserExportPendingRef = useRef(false);
-  const exportGrantsRef = useRef(new Map<string, { path: string; filename: string; format: string }>());
+  // `recheck`: the path is a collapsed repeated-extension path that was free at pick time; the
+  // panel never asked about it, so it is checked again immediately before the write.
+  const exportGrantsRef = useRef(new Map<string, { path: string; filename: string; format: string; recheck: boolean }>());
   const exportToTabRef = useRef<(tabId: string, options: ExportOptions, live: () => boolean, progress?: (notice: string) => Promise<void>) => Promise<ExportDialogResult>>(async () => { throw new Error("Export is unavailable"); });
   const exportPreviewEnabled = useExportPreviewEnabled(true);
   const exportPreviewEnabledRef = useRef(exportPreviewEnabled);
@@ -12190,7 +12194,8 @@ export function MainWindow({
       if (restoreNotice) setStatus(restoreNotice);
       let path = forceSaveAs || restoreNotice ? undefined : savingFileState.path;
       if (!path) path = await pickNativeSavePath(savingFileState.path ?? payload.filename,
-        restoreNotice ? { title: "Save As — restored file unavailable", extension: "chemdraft" } : undefined);
+        restoreNotice ? { title: "Save As — restored file unavailable", extension: "chemdraft" } : undefined,
+        savingFileState.path, shortcutPlatform);
       if (!path) {
         const canceled = `${restoreNotice ? `${restoreNotice} ` : ""}Save canceled. The tab is still open.`;
         if (savingTabId === activeDocumentTabIdRef.current) setStatus(restoreNotice ? canceled : "Save canceled");
@@ -12211,7 +12216,7 @@ export function MainWindow({
       if (closeTabPromptRef.current === savingTabId) setCloseTabSaveMessage(message);
       return false;
     }
-  }, [documentForFlush]);
+  }, [documentForFlush, shortcutPlatform]);
 
   const saveCurrentDocument = useCallback((forceSaveAs: boolean) =>
     saveDocumentTabById(activeDocumentTabIdRef.current, forceSaveAs), [saveDocumentTabById]);
@@ -12400,12 +12405,13 @@ export function MainWindow({
       const defaultPath = options.destinationPath ?? nativePathJoin(lastExportDirectoryRef.current, options.filename) ?? options.filename;
       // Runs in main, so the native panel's grant belongs to the writer. The shared wrapper
       // suspends and restores live dialog windows on both platforms without changing placement.
-      const path = await pickNativeExportPath(defaultPath, descriptor.menuLabel, descriptor.extensions, dialogCoordinatorRef.current?.exportSessionId(tabId));
+      const target = await pickNativeExportTarget(defaultPath, descriptor.menuLabel, descriptor.extensions, dialogCoordinatorRef.current?.exportSessionId(tabId), shortcutPlatform);
       if (!live()) throw new Error("The originating drawing was closed or replaced.");
-      if (!path) return { status: "cancelled", notice: "Export location unchanged" };
+      if (!target) return { status: "cancelled", notice: "Export location unchanged" };
+      const { path } = target;
       if (path.length > 1024 || nativePathBasename(path).length > 256 || new TextEncoder().encode(JSON.stringify([path, nativePathBasename(path)])).length > 2400) throw new Error("The chosen export path is too long for the dialog. Choose a shorter path.");
       const filename = nativePathBasename(path);
-      exportGrantsRef.current.set(tabId, { path, filename, format: options.format });
+      exportGrantsRef.current.set(tabId, { path, filename, format: options.format, recheck: target.recheck });
       setTabStatus(tabId, `Export location: ${filename}`);
       return { status: "picked", destinationPath: path, filename };
     } catch (error) {
@@ -12428,7 +12434,7 @@ export function MainWindow({
       // The dialog may not have received the preference change yet. The owner decides
       // whether sizing is enabled at export time, including after the progress await.
       if (!exportPreviewEnabledRef.current) options = { ...options, presentation: undefined };
-      const title = stripExportFileExtension(documentTabsRef.current.find(tab => tab.id === tabId)?.title ?? "Untitled");
+      const title = stripExportFileExtension(collapseRepeatedFileExtension(documentTabsRef.current.find(tab => tab.id === tabId)?.title ?? "Untitled", DOCUMENT_SAVE_EXTENSIONS));
       const result = await createDialogExportResult(source, { ...options, busy: false }, false, title);
       if (!live()) throw new Error("The originating drawing was closed or replaced.");
       const filename = exportDefaultPath(options.filename, descriptor.extensions);
@@ -12447,7 +12453,14 @@ export function MainWindow({
         // Write exactly the path granted by the panel, including its chosen extension.
         await progress?.("Writing export…");
         if (!live()) throw new Error("The originating drawing was closed or replaced.");
-        await writeNativeExportResult(path, result);
+        // A collapsed repeated-extension path was only checked at pick time, so it is written with
+        // exclusive creation; a file that appeared there since is confirmed first, and declining
+        // cancels. The re-check is cleared only after a successful write.
+        const written = await writeNativeSavePanelGrant(exportGrantsRef.current, tabId, path, async (target, { createNew }) => {
+          if (!live()) throw new Error("The originating drawing was closed or replaced.");
+          await writeNativeExportResult(target, result, createNew);
+        }, { platform: shortcutPlatform });
+        if (!written) return { status: "cancelled", notice: `${descriptor.menuLabel} export canceled` };
         lastExportDirectoryRef.current = nativePathDirname(path) ?? lastExportDirectoryRef.current;
       }
       const notice = formatExportStatus(descriptor.menuLabel, result.format, result.warnings);
@@ -35215,14 +35228,15 @@ function downloadExportResult(filename: string, result: ExportResult): void {
   downloadBlob(filename, new Blob([arrayBufferFromBytes(result.bytes)], { type: result.mimeType }));
 }
 
-async function writeNativeExportResult(path: string, result: ExportResult): Promise<void> {
+/** With `createNew`, fails instead of replacing a file already at `path`. */
+async function writeNativeExportResult(path: string, result: ExportResult, createNew = false): Promise<void> {
   if (result.kind === "text") {
-    await writeNativeTextFile(path, result.contents);
+    await writeNativeTextFile(path, result.contents, createNew);
     if (perfProbe) perfHook(() => perfProbe?.signal("export-written"));
     return;
   }
 
-  await writeNativeBinaryFile(path, result.bytes);
+  await writeNativeBinaryFile(path, result.bytes, createNew);
   if (perfProbe) perfHook(() => perfProbe?.signal("export-written"));
 }
 
@@ -35265,7 +35279,9 @@ async function pickNativeOpenPaths(): Promise<string[]> {
 
 async function pickNativeSavePath(
   defaultPath: string,
-  options?: { title: string; extension: string }
+  options?: { title: string; extension: string },
+  ownPath?: string,
+  platform?: ShortcutPlatform
 ): Promise<string | undefined> {
   const { save } = await loadTauriDialogModule();
   const selected = await save({
@@ -35277,22 +35293,33 @@ async function pickNativeSavePath(
       { name: "CDX (*.cdx)", extensions: ["cdx"] }
     ]
   });
-  return selected ?? undefined;
+  return selected ? resolveNativeSavePanelPath(selected, options ? [options.extension] : DOCUMENT_SAVE_EXTENSIONS, { ownPath, platform }) : undefined;
 }
 
-async function pickNativeExportPath(
+async function pickNativeExportTarget(
   defaultPath: string,
   formatLabel: string,
   extensions: readonly string[],
-  focusExportSessionId?: string
-): Promise<string | undefined> {
+  focusExportSessionId?: string,
+  platform?: ShortcutPlatform
+): Promise<RepeatedExtensionSaveTarget | undefined> {
   const { save } = await loadTauriDialogModule();
   const selected = await save({
     title: `Export ${formatLabel}`,
     defaultPath: exportDefaultPath(defaultPath, extensions),
     filters: [{ name: formatLabel, extensions: [...extensions] }]
   }, focusExportSessionId);
-  return selected ?? undefined;
+  return selected ? resolveNativeSavePanelTarget(selected, extensions, { platform }) : undefined;
+}
+
+/** For callers that write right after the pick. */
+async function pickNativeExportPath(
+  defaultPath: string,
+  formatLabel: string,
+  extensions: readonly string[],
+  focusExportSessionId?: string
+): Promise<string | undefined> {
+  return (await pickNativeExportTarget(defaultPath, formatLabel, extensions, focusExportSessionId))?.path;
 }
 
 async function pickNativeMoleculeTemplateOpenPath(): Promise<string | undefined> {
@@ -35317,7 +35344,8 @@ async function pickNativeMoleculeTemplateSavePath(defaultPath: string): Promise<
     defaultPath,
     filters: [{ name: "Drawn Structure Settings Template", extensions: ["template"] }]
   });
-  return selected ? ensureExportFileExtension(selected, ["template"]) : undefined;
+  const resolved = selected ? await resolveNativeSavePanelPath(selected, ["template"]) : undefined;
+  return resolved ? ensureExportFileExtension(resolved, ["template"]) : undefined;
 }
 
 type TauriDialogModule = typeof import("./nativeFileDialog");
@@ -35372,14 +35400,16 @@ function isNativeOpenDocumentPayload(value: unknown): value is NativeOpenDocumen
   );
 }
 
-async function writeNativeTextFile(path: string, contents: string): Promise<void> {
+async function writeNativeTextFile(path: string, contents: string, createNew = false): Promise<void> {
   const { writeTextFile } = await import("@tauri-apps/plugin-fs");
-  await writeTextFile(path, contents);
+  if (createNew) await writeTextFile(path, contents, { createNew: true });
+  else await writeTextFile(path, contents);
 }
 
-async function writeNativeBinaryFile(path: string, bytes: Uint8Array): Promise<void> {
+async function writeNativeBinaryFile(path: string, bytes: Uint8Array, createNew = false): Promise<void> {
   const { writeFile } = await import("@tauri-apps/plugin-fs");
-  await writeFile(path, bytes);
+  if (createNew) await writeFile(path, bytes, { createNew: true });
+  else await writeFile(path, bytes);
 }
 
 function ensureChemDraftFileExtension(path: string): string {
@@ -35442,7 +35472,8 @@ function downloadBlob(filename: string, blob: Blob): void {
 }
 
 function createExportFilename(document: ChemDraftDocument, extension: string, savedDocumentPath?: string): string {
-  const stem = stripExportFileExtension(savedDocumentPath ? nativePathBasename(savedDocumentPath) : document.title);
+  const stem = stripExportFileExtension(collapseRepeatedFileExtension(
+    savedDocumentPath ? nativePathBasename(savedDocumentPath) : document.title, DOCUMENT_SAVE_EXTENSIONS));
   const baseName = stem.trim().replace(/[^a-z0-9._-]+/gi, "-") || "Untitled";
   // The dialog contract caps filenames at 256 UTF-16 units. The sanitized stem is
   // ASCII, so slicing it cannot split a surrogate pair. Preserve the full extension.

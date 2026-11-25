@@ -2009,6 +2009,7 @@ lossy and a lossless WebP, an SVG with gradients and `<use href="#id">`, a BMP, 
   large picture and switch tabs while it is read: the tab you are on reports the drop's outcome, and
   so does the receiving tab when you return. Hover a long status (several refusals) that ends in an
   ellipsis: the tooltip shows it in full, with any file warnings on the lines after it.
+  Drop 13 files with 6 refused: the status and its tooltip name every refused file (no "more files").
 - Refusals: the BMP, TIFF, HEIC, `.svgz`, `.ai` and 20 MB+ files are refused by name with a specific
   reason, immediately (no read of the large file); the `.ai` reason names the extension only. A
   `.png` renamed from a text file is refused as not a picture. A PNG whose chunks are intact but
