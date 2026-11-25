@@ -287,7 +287,7 @@ import { canvasOverlayPrompt, OVERLAY_BUSY_MESSAGE, pluginCanvasOverlayOpenComma
 import type { PluginPanelActionRequest, PluginPanelActionResult } from "./plugins/pluginPanelActionTypes";
 import { handleSpectrumWindowAction, saveBinaryFileHere, saveTextFileHere, spectrumToPdf } from "./plugins/spectrumExport";
 import type { QueuedProposedPatch } from "@chemdraft/plugin-host";
-import { hoverKeyFromEvent, isBlockedByModalDialog, shouldIgnoreShortcutTarget, subscribeToModalDialogChanges, type ShortcutPlatform } from "@chemdraft/shortcut-engine";
+import { hoverKeyFromEvent, isBlockedByModalDialog, resolveHoverKey, shouldIgnoreShortcutTarget, subscribeToModalDialogChanges, type ShortcutPlatform } from "@chemdraft/shortcut-engine";
 import {
   atomLabelAnchorOffset,
   nativeHoverAtomLabelCompletion,
@@ -1900,7 +1900,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.25.00.38-opus";
+const CURRENT_BUILD_STAMP = "11.25.02.10-opus";
 
 /**
  * Sets `target` to `markIds`. A commit updater fills its policy's `IndependentMarkMoves` this way:
@@ -16130,10 +16130,11 @@ export function MainWindow({
       }
 
       if (!event.metaKey && !event.ctrlKey && !event.altKey) {
-        const key = hoverKeyFromEvent(event);
         const tables = hoverShortcutsRef.current;
+        // The literal key decides the re-hit below; the shifted alternate ("+" for a Shift+= some
+        // input paths report as "=") is never a letter or digit, so it would decide the same way.
+        const literalKey = hoverKeyFromEvent(event);
         const assignment = hoverLabelAssignmentRef.current;
-        let labelContinues = false;
         // Over a different atom, element keys (either case) and digits act on that atom; other
         // letters continue the original label ("M" and "e" in OMe), even after pointer drift.
         // Bond shortcuts use the pointer's bond. Other keys follow hoverLabelContinuesForKey.
@@ -16144,32 +16145,36 @@ export function MainWindow({
           const current = hoveredNativeDeleteTargetRef.current;
           const continuingOnAtom = assignment !== undefined && current?.kind === "atom" &&
             current.objectId === assignment.objectId && current.atomId === assignment.atomId &&
-            /^[a-z0-9]$/i.test(key) && !Object.prototype.hasOwnProperty.call(numericBondDrawingHotkeys, key);
+            /^[a-z0-9]$/i.test(literalKey) && !Object.prototype.hasOwnProperty.call(numericBondDrawingHotkeys, literalKey);
           if (retarget && !activeAtomLabelEditRef.current &&
-            (!continuingOnAtom || hasBondHoverShortcut(retarget.pointerTarget, key, tables))) {
+            (!continuingOnAtom || hasBondHoverShortcut(retarget.pointerTarget, literalKey, tables))) {
             labelHoverRetargetRef.current = undefined;
             rederiveNativeCanvasHoverRef.current?.(documentRef.current);
           }
-          // Decide against the pointer's current target before retargeting: element keys (either
-          // case) and digits act on a different atom; non-element letters continue the label there.
-          // Preserve that decision when the hover moves to the atom being labelled.
-          const pointerTarget = hoveredNativeDeleteTargetRef.current;
-          const followsSchemeDefault = hoveredNativeTargetShortcutCommand(pointerTarget, key, keybindingSchemeRef.current, tables) ===
-            hoveredNativeTargetShortcutCommand(pointerTarget, key, keybindingSchemeRef.current);
-          labelContinues = assignment !== undefined && followsSchemeDefault &&
-            hoverLabelContinuesForKey(documentRef.current, pointerTarget, assignment, key);
-          const labelAtom = hoverLabelAtomTargetForKey(
-            documentRef.current,
-            pointerTarget,
-            hoverPagePointRef.current,
-            labelContinues ? assignment : undefined,
-            key,
-            tables
-          );
-          if (labelAtom) {
-            assignHoveredNativeDeleteTarget(labelAtom);
-            labelHoverRetargetRef.current ??= { pointerTarget };
-          }
+        }
+        // Each candidate key (the configured literal binding first, then the shifted alternate) runs
+        // the whole hover route, a label key over a bond moving to the nearer atom included, and the
+        // first that does something wins, before the global registry (which folds +/=) can claim it.
+        const pointerTarget = hoveredNativeDeleteTargetRef.current;
+        const routeFor = (candidate: string) => hoverKeyRoute(
+          documentRef.current,
+          selectedNativeMoleculePart,
+          pointerTarget,
+          hoverPagePointRef.current,
+          assignment,
+          candidate,
+          keybindingSchemeRef.current,
+          tables
+        );
+        const resolved = resolveHoverKey(event, (candidate) => {
+          const route = routeFor(candidate);
+          return route.labelContinues || route.commandId !== undefined ? route : undefined;
+        });
+        const key = resolved.key;
+        const { labelContinues, labelAtom, commandId: hoveredTargetCommandId } = resolved.match ?? routeFor(key);
+        if (labelAtom) {
+          assignHoveredNativeDeleteTarget(labelAtom);
+          labelHoverRetargetRef.current ??= { pointerTarget };
         }
         const hoveredTarget = hoveredNativeDeleteTargetRef.current;
         if (key !== "Shift") {
@@ -16197,14 +16202,6 @@ export function MainWindow({
             return;
           }
         }
-        const hoveredTargetCommandId = activeNativeTargetShortcutCommand(
-          documentRef.current,
-          selectedNativeMoleculePart,
-          hoveredNativeDeleteTargetRef.current,
-          key,
-          keybindingSchemeRef.current,
-          tables
-        );
         if (hoveredTargetCommandId) {
           event.preventDefault();
           const beforeObject = hoveredTarget ? findDocumentObject(documentRef.current, hoveredTarget.objectId) : undefined;
@@ -26740,6 +26737,38 @@ export function hoverLabelAtomTargetForKey(
   const distance = (atom: MoleculeAtom) => pointer ? Math.hypot(atom.x - pointer.x, atom.y - pointer.y) : 0;
   const nearer = distance(to) < distance(from) ? to : from;
   return { objectId: target.objectId, kind: "atom", atomId: nearer.id, distanceToPointer: distance(nearer) };
+}
+
+/**
+ * Where a hover key goes, the same way for every candidate key: in the ChemDraft scheme a key may
+ * continue a hover label or (an element key over a bond) move to the bond's nearer atom; then the
+ * command it runs on that target, if any. Decided against the pointer's target before retargeting.
+ */
+function hoverKeyRoute(
+  document: ChemDraftDocument,
+  selectedPart: NativeMoleculeSelectionPart | undefined,
+  pointerTarget: NativeMoleculeDeleteTarget | undefined,
+  pointer: ClientPoint | undefined,
+  assignment: HoverLabelAssignment | undefined,
+  key: string,
+  scheme: KeybindingScheme,
+  tables?: HoverShortcutTables
+): { labelContinues: boolean; labelAtom?: NativeMoleculeDeleteTarget; commandId?: string } {
+  if (scheme !== "chemdraft") {
+    return { labelContinues: false, commandId: activeNativeTargetShortcutCommand(document, selectedPart, pointerTarget, key, scheme, tables) };
+  }
+  // Element keys (either case) and digits act on a different atom; non-element letters continue the
+  // label there. A remapped key keeps its own meaning rather than continuing a label.
+  const followsSchemeDefault = hoveredNativeTargetShortcutCommand(pointerTarget, key, scheme, tables) ===
+    hoveredNativeTargetShortcutCommand(pointerTarget, key, scheme);
+  const labelContinues = assignment !== undefined && followsSchemeDefault &&
+    hoverLabelContinuesForKey(document, pointerTarget, assignment, key);
+  const labelAtom = hoverLabelAtomTargetForKey(document, pointerTarget, pointer, labelContinues ? assignment : undefined, key, tables);
+  return {
+    labelContinues,
+    labelAtom,
+    commandId: activeNativeTargetShortcutCommand(document, selectedPart, labelAtom ?? pointerTarget, key, scheme, tables)
+  };
 }
 
 export function activeNativeTargetShortcutCommand(
