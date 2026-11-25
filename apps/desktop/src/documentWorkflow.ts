@@ -8416,8 +8416,9 @@ export interface ImpliedRadicalCacheDecline {
  * same instance when nothing was refreshed.
  *
  * `storedCtabVerified`: the caller verifies each target's stored CTAB against its drawing before it
- * commits (a plugin insert: `refreshPluginPatchChemistry`), so a CTAB beside a chemistry record that
- * already states today's reading is left to that check, with no warning (`statesTodaysReading`).
+ * commits (a plugin insert: `refreshPluginPatchChemistry`), so a CTAB that is ChemDraft's own writing
+ * of the drawing (each lone H as H•), beside a chemistry record that already states today's reading,
+ * is left to that check, with no warning (`statesTodaysReading`).
  */
 export function rederiveImpliedRadicalChemistryOf(
   document: ChemDraftDocument,
@@ -8555,7 +8556,7 @@ type ImpliedRadicalCacheRefresh =
  * 3. a cache that already states today's reading (`statesTodaysReading`): unchanged, kept as stored
  *    with no warning. With `storedCtabVerified` (a plugin insert, whose verifier checks a stored
  *    CTAB against the drawing before it commits) that includes a stored CTAB beside a record stating
- *    today's reading;
+ *    today's reading, where the CTAB is ChemDraft's own writing of the drawing, every lone H as H•;
  * 4. anything else (stereo, other chemistry, a mix of readings, a record the native writer would not
  *    have written): declined, so the molecule keeps its whole stored cache and the caller warns.
  * May throw (the derivation).
@@ -8641,18 +8642,42 @@ function pageBracketNotes(document: ChemDraftDocument, page: DocumentPage): Map<
  * `storedCacheIs`: an empty structure or copy and an absent record field count as equal). Nothing
  * stored is parsed.
  *
- * A stored CTAB (molfile V2000 or V3000) cannot be compared: the native writer writes SMILES only,
- * so the refresh never wrote that CTAB and never replaces it. Only where the caller verifies it
- * against the drawing before committing (`storedCtabVerified`: a plugin insert, whose verifier
- * reads it with RDKit and refuses it unless it reads as the drawing) is it left to that check, and
- * only beside a chemistry record that states the radical count, so the record itself reads the
- * lone H as H•. Anywhere else (open, restore, paste: nothing verifies it) such a molecule is
- * declined, so the user is told its cache was kept.
+ * A stored CTAB (molfile V2000 or V3000) is not the native writer's (it writes SMILES only), so the
+ * refresh never wrote that CTAB and never replaces it. It states today's reading only where this
+ * code confirms it does without parsing it (`storedCtabIsOwnWriting`: it is, string for string,
+ * ChemDraft's own CTAB writing of the drawing, which writes each lone H, D or T as H•), and is then
+ * left as stored only where the caller also verifies it against the drawing before committing
+ * (`storedCtabVerified`: a plugin insert, whose verifier reads it with RDKit), beside a chemistry
+ * record that states the radical count, so the record itself reads the lone H as H•. The verifier
+ * does not compare radicals, so a CTAB this cannot confirm (a lone H written with no radical, which a
+ * reader takes as H2; any other writer's CTAB) is declined, and so is every CTAB anywhere else (open,
+ * restore, paste: nothing verifies it), so the user is told its cache was kept.
  */
 function statesTodaysReading(object: MoleculeObject, today: LoneHydrogenCache, storedCtabVerified: boolean): boolean {
   const ctab = object.structure !== "" && (object.structureFormat === "molfile-v2000" || object.structureFormat === "molfile-v3000");
-  if (ctab && (!storedCtabVerified || object.chemistry?.radicalCount === undefined)) return false;
+  if (ctab && (!storedCtabVerified || object.chemistry?.radicalCount === undefined || !storedCtabIsOwnWriting(object))) return false;
   return storedCacheIs(ctab ? { ...object, structure: "" } : object, today);
+}
+
+/**
+ * Whether `object`'s stored CTAB is exactly what ChemDraft's own CTAB writer writes for its drawing
+ * in the stored format (`moleculeToMolfileV2000` / `moleculeToMolfileV3000`, with the drawing's
+ * Kekulé orders), with nothing the writer reports as lost. That writer writes each lone H, D or T
+ * (`atomImpliedRadicalCount`) at the zero-valence sentinel (V2000 valence 15, V3000 VAL=-1), which a
+ * reader takes as one atom carrying one radical electron, so an equal CTAB states every lone H as
+ * today's H•. Nothing stored is parsed: the stored text is only compared with the writer's. A CTAB
+ * the writer cannot write, or writes only with a loss, is not confirmed.
+ */
+function storedCtabIsOwnWriting(object: MoleculeObject): boolean {
+  try {
+    const options = { kekuleBondOrders: nativeBondOrderResolution(object.atoms, object.bonds).kekuleOrders };
+    const written = object.structureFormat === "molfile-v2000"
+      ? moleculeToMolfileV2000(object, options)
+      : moleculeToMolfileV3000(object, options);
+    return written.warnings.length === 0 && written.contents === object.structure;
+  } catch {
+    return false;
+  }
 }
 
 /**
