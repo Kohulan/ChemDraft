@@ -503,6 +503,12 @@ describe("handleDroppedFiles", () => {
 });
 
 describe("formatImageDropStatus", () => {
+  it("does not throw for a very large refusal list", () => {
+    const refusals = Array.from({ length: 150_000 }, (_, index) => ({ name: `f${index}.png`, reason: `r${index}.` }));
+    const status = formatImageDropStatus({ inserted: [], refusals });
+    expect(status).toContain("f0.png");
+    expect(status).toContain("f149999.png");
+  });
   it("lists a few names, then counts the rest", () => {
     const images = Array.from({ length: 7 }, (_, index) => ({ name: `p${index}.png`, mimeType: "image/png" as const, dataBase64: "", notes: [] }));
     expect(formatImageDropStatus({ inserted: images, refusals: [], scaledToPage: ["p1.png"] }))

@@ -204,7 +204,7 @@ export function formatImageDropStatus(outcome: {
     }
     if (outcome.scaledToPage?.length) parts.push(`scaled to fit the page: ${listNames(outcome.scaledToPage)}`);
   }
-  parts.push(...refusalParts(outcome.refusals));
+  for (const part of refusalParts(outcome.refusals)) parts.push(part);
   return joinStatusParts(parts);
 }
 
