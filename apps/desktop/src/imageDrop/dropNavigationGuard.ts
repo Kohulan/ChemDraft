@@ -18,17 +18,34 @@ export function dragCarriesFiles(types: ArrayLike<string> | readonly string[] | 
   return !!types && Array.from(types).includes("Files");
 }
 
-/** Inputs, text areas and content-editable regions accept text drops natively. */
+const NON_TEXT_INPUT_TYPES = ["button", "checkbox", "color", "file", "hidden", "image", "radio", "range", "reset", "submit"];
+
+/**
+ * Inputs, text areas and content-editable regions accept text drops natively. The nearest explicit
+ * editing boundary decides: a `contenteditable="false"` island inside an editable region is not
+ * editable, and an invalid `contenteditable` value inherits from its parent, as the HTML spec says.
+ */
 export function isEditableDropTarget(target: EventTarget | null): boolean {
   if (typeof Element === "undefined" || !(target instanceof Element)) return false;
-  const editable = target.closest("input, textarea, [contenteditable]:not([contenteditable='false'])");
-  if (!editable) return false;
-  if (editable instanceof HTMLInputElement) {
-    return !editable.disabled && !editable.readOnly &&
-      !["button", "checkbox", "color", "file", "hidden", "image", "radio", "range", "reset", "submit"].includes(editable.type);
+  for (let element: Element | null = target; element; element = element.parentElement) {
+    if (element instanceof HTMLInputElement) {
+      return !element.disabled && !element.readOnly && !NON_TEXT_INPUT_TYPES.includes(element.type);
+    }
+    if (element instanceof HTMLTextAreaElement) return !element.disabled && !element.readOnly;
+    const state = element.getAttribute("contenteditable");
+    if (state === null) continue;
+    const normalized = state.trim().toLowerCase();
+    if (normalized === "false") return false;
+    if (normalized === "" || normalized === "true" || normalized === "plaintext-only") return true;
   }
-  if (editable instanceof HTMLTextAreaElement) return !editable.disabled && !editable.readOnly;
-  return true;
+  return false;
+}
+
+/** Drags an editable field inserts as text; anything else (a picture, a file promise) is refused. */
+const TEXT_DROP_TYPES = new Set(["text/plain", "text/uri-list", "text/html"]);
+
+export function dragIsTextCompatible(types: ArrayLike<string> | readonly string[] | undefined | null): boolean {
+  return !!types && Array.from(types).some(type => TEXT_DROP_TYPES.has(type.toLowerCase()));
 }
 
 export interface DropGuardOptions {
@@ -47,7 +64,7 @@ export function guardDropEvent(event: DropGuardEventLike, options: DropGuardOpti
     return;
   }
   // A link, text or HTML drag: allowed into editable fields, never a navigation anywhere else.
-  if (isEditableDropTarget(event.target)) return;
+  if (dragIsTextCompatible(transfer.types) && isEditableDropTarget(event.target)) return;
   event.preventDefault();
   if (event.type === "dragover") transfer.dropEffect = "none";
 }

@@ -1,10 +1,10 @@
 import {
-  MAX_IMAGE_DECODED_BYTES, MAX_IMAGE_OBJECT_BYTES, MAX_IMAGE_SIDE, isSvgImageSource, readPngInfo,
-  validatePngImage, validateSvgImage, type ImageObjectData
+  MAX_IMAGE_OBJECT_BYTES, isSvgImageSource, readPngInfo, validatePngImage, validateSvgImage, type ImageObjectData
 } from "@chemdraft/chem-core";
 import { formatDropBytes, rewordPictureError } from "./dropFiles";
 import { readRasterHeaderSize, sniffBinaryImageFormat, type SniffedImageFormat } from "./imageSniff";
-import type { RasterToPng } from "./rasterDecode";
+import { dropPixelLimitError } from "./pixelLimits";
+import type { DecodeOptions, DroppedImageDecoders } from "./rasterDecode";
 import { decodeSvgBytes, encodeSvgText } from "./svgText";
 import { sanitizeDroppedSvg } from "./svgSanitizer";
 
@@ -44,16 +44,9 @@ export function bytesToBase64(bytes: Uint8Array): string {
   return btoa(chunks.join(""));
 }
 
-/** The paste caps, worded for a drop. */
-export function dropPixelLimitError(width: number, height: number): string | undefined {
-  if (width > MAX_IMAGE_SIDE || height > MAX_IMAGE_SIDE) {
-    return `it is ${width} × ${height} pixels; the limit is ${MAX_IMAGE_SIDE} pixels on a side.`;
-  }
-  if (width * height * 4 > MAX_IMAGE_DECODED_BYTES) {
-    return `it is ${width} × ${height} pixels; the decoded limit is ${MAX_IMAGE_DECODED_BYTES / (1024 * 1024)} MiB.`;
-  }
-  return undefined;
-}
+export { dropPixelLimitError };
+
+const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
 
 function payloadSizeError(bytes: number): string | undefined {
   return bytes > MAX_IMAGE_OBJECT_BYTES
@@ -62,13 +55,16 @@ function payloadSizeError(bytes: number): string | undefined {
 }
 
 /**
- * Recognise a dropped picture by its bytes and turn it into PNG or sanitized SVG. PNG is kept byte
- * for byte. Every refusal is a reason without the file name; the caller names the file.
+ * Recognise a dropped picture by its bytes and turn it into PNG or sanitized SVG. A PNG is kept byte
+ * for byte once the webview has decoded it; an SVG once the webview has drawn the sanitized text.
+ * Every decoder call carries `options.signal`, the file's deadline. Every refusal is a reason without
+ * the file name; the caller names the file.
  */
 export async function prepareDroppedImage(
   name: string,
   bytes: Uint8Array,
-  rasterToPng: RasterToPng
+  decoders: DroppedImageDecoders,
+  options: DecodeOptions = {}
 ): Promise<PrepareDroppedImageResult> {
   const format = sniffBinaryImageFormat(bytes);
   const refused = format && REFUSED_CONTENT[format];
@@ -82,6 +78,16 @@ export async function prepareDroppedImage(
     if (result.error) return { ok: false, reason: rewordPictureError(result.error) };
     const sizeError = payloadSizeError(bytes.length);
     if (sizeError) return { ok: false, reason: sizeError };
+    // Chunk framing is not pixels: a PNG whose image data cannot be decoded would draw nothing.
+    let decoded;
+    try {
+      decoded = await decoders.decodeCheck(bytes, "image/png", options);
+    } catch (error) {
+      return { ok: false, reason: `the PNG could not be decoded: ${errorText(error)}` };
+    }
+    if (!(decoded.width > 0 && decoded.height > 0)) return { ok: false, reason: "the PNG could not be decoded: the webview could not decode it." };
+    const decodedLimit = dropPixelLimitError(decoded.width, decoded.height);
+    if (decodedLimit) return { ok: false, reason: decodedLimit };
     return { ok: true, image: { name, mimeType: "image/png", dataBase64: bytesToBase64(bytes), notes: [] } };
   }
 
@@ -92,10 +98,9 @@ export async function prepareDroppedImage(
     if (limit) return { ok: false, reason: limit };
     let encoded;
     try {
-      encoded = await rasterToPng(bytes, RASTER_MIME[format], MAX_IMAGE_OBJECT_BYTES);
+      encoded = await decoders.rasterToPng(bytes, RASTER_MIME[format], MAX_IMAGE_OBJECT_BYTES, options);
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      return { ok: false, reason: `the ${FORMAT_LABEL[format]} could not be converted: ${message}` };
+      return { ok: false, reason: `the ${FORMAT_LABEL[format]} could not be converted: ${errorText(error)}` };
     }
     const decodedLimit = dropPixelLimitError(encoded.sourceWidth, encoded.sourceHeight);
     if (decodedLimit) return { ok: false, reason: decodedLimit };
@@ -126,6 +131,11 @@ export async function prepareDroppedImage(
   const svgBytes = encodeSvgText(sanitized.svg);
   const sizeError = payloadSizeError(svgBytes.length);
   if (sizeError) return { ok: false, reason: sizeError };
+  try {
+    await decoders.decodeCheck(svgBytes, "image/svg+xml", options);
+  } catch (error) {
+    return { ok: false, reason: `the SVG could not be drawn: ${errorText(error)}` };
+  }
   const notes = [
     ...(sanitized.removedExternal ? ["external content was removed"] : []),
     ...(sanitized.removedActive ? ["scripts and animation were removed"] : [])

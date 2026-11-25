@@ -119,6 +119,23 @@ export function readWebpHeaderSize(bytes: Uint8Array): HeaderPixelSize | undefin
   return undefined;
 }
 
-export function readRasterHeaderSize(format: "jpeg" | "gif" | "webp", bytes: Uint8Array): HeaderPixelSize | undefined {
-  return format === "jpeg" ? readJpegHeaderSize(bytes) : format === "gif" ? readGifHeaderSize(bytes) : readWebpHeaderSize(bytes);
+/** The IHDR chunk, which a PNG must start with. */
+export function readPngHeaderSize(bytes: Uint8Array): HeaderPixelSize | undefined {
+  if (sniffBinaryImageFormat(bytes) !== "png" || bytes.length < 24) return undefined;
+  if (!startsWith(bytes, [0, 0, 0, 13], 8) || ascii(bytes, 12, 4) !== "IHDR") return undefined;
+  const u32 = (offset: number) => ((bytes[offset]! << 24) >>> 0) + (bytes[offset + 1]! << 16) + (bytes[offset + 2]! << 8) + bytes[offset + 3]!;
+  const width = u32(16);
+  const height = u32(20);
+  return width > 0 && height > 0 ? { width, height } : undefined;
+}
+
+export type RasterHeaderFormat = "png" | "jpeg" | "gif" | "webp";
+
+export function readRasterHeaderSize(format: RasterHeaderFormat, bytes: Uint8Array): HeaderPixelSize | undefined {
+  switch (format) {
+    case "png": return readPngHeaderSize(bytes);
+    case "jpeg": return readJpegHeaderSize(bytes);
+    case "gif": return readGifHeaderSize(bytes);
+    case "webp": return readWebpHeaderSize(bytes);
+  }
 }

@@ -2,11 +2,12 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { serializeDocument, type ChemDraftDocument, type GraphicObject } from "@chemdraft/chem-core";
+import { createImageGraphicObject, serializeDocument, type ChemDraftDocument, type GraphicObject } from "@chemdraft/chem-core";
 import { MainWindow, objectResizeStretches } from "./MainWindow";
 import { createPhase4Document } from "./documentWorkflow";
 import { browserRasterToPng } from "./imageDrop/rasterDecode";
 import { jpegHeader, pngBytes, svgBytes } from "./imageDrop/testFixtures";
+import { picturePngBase64 } from "./testSupport/imageFixture";
 import { MemoryStorage } from "./testSupport/memoryStorage";
 
 const native = vi.hoisted(() => ({
@@ -20,8 +21,11 @@ vi.mock("./rdkitWasmLoader", () => ({ registerRdkitWasmLoader: vi.fn() }));
 // jsdom has no canvas: the webview decoder is replaced by one returning a real 1 × 1 PNG.
 vi.mock("./imageDrop/rasterDecode", async (original) => {
   const { pngBytes: png } = await import("./imageDrop/testFixtures");
+  const browserRasterToPng = vi.fn(async () => ({ png: png(), width: 1, height: 1, sourceWidth: 1, sourceHeight: 1, downscaled: false }));
+  // The PNG and SVG decode checks: jsdom cannot decode, so every picture decodes.
+  const browserDecodeCheck = vi.fn(async () => ({ width: 1, height: 1 }));
   return { ...await original<typeof import("./imageDrop/rasterDecode")>(),
-    browserRasterToPng: vi.fn(async () => ({ png: png(), width: 1, height: 1, sourceWidth: 1, sourceHeight: 1, downscaled: false })) };
+    browserRasterToPng, browserDecodeCheck, browserImageDecoders: { rasterToPng: browserRasterToPng, decodeCheck: browserDecodeCheck } };
 });
 vi.mock("./window-manager", async (original) => ({
   ...await original<typeof import("./window-manager")>(),
@@ -113,22 +117,23 @@ describe("dropping picture files on the document window", () => {
     vi.unstubAllGlobals();
   });
 
-  async function mount(initialDocument = createPhase4Document("Drop target"), platform: "macos" | "windows" | "linux" = "macos") {
+  async function mount(initialDocument = createPhase4Document("Drop target"), platform: "macos" | "windows" | "linux" = "macos",
+    options: { scrollbar?: number } = {}) {
     await act(async () => root.render(<MainWindow initialDocument={initialDocument} initialActiveToolCommandId="tool.select"
       initialPaletteMode="hidden" initialRulersVisible={false} initialCrosshairsVisible={false}
       nativePalette={false} shortcutPlatform={platform} />));
-    stubLayout();
+    stubLayout(options.scrollbar ?? 0);
     await settle();
   }
 
-  /** jsdom has no layout: the page and canvas are drawn 1:1 from (0, 0). */
-  function stubLayout() {
+  /** jsdom has no layout: the page and canvas are drawn 1:1 from (0, 0), less any scrollbars. */
+  function stubLayout(scrollbar: number) {
     const rect = { x: 0, y: 0, left: 0, top: 0, right: 900, bottom: 700, width: 900, height: 700, toJSON() {} };
     for (const element of container.querySelectorAll(".page, .canvas-region")) {
       vi.spyOn(element, "getBoundingClientRect").mockReturnValue(rect as DOMRect);
     }
-    vi.spyOn(canvas(), "clientWidth", "get").mockReturnValue(rect.width);
-    vi.spyOn(canvas(), "clientHeight", "get").mockReturnValue(rect.height);
+    vi.spyOn(canvas(), "clientWidth", "get").mockReturnValue(rect.width - scrollbar);
+    vi.spyOn(canvas(), "clientHeight", "get").mockReturnValue(rect.height - scrollbar);
   }
 
   async function settle() {
@@ -182,6 +187,57 @@ describe("dropping picture files on the document window", () => {
     await browserDrop([dropFile("edge.png", pngBytes())], { x: -50, y: -80 }, container.querySelector("main") ?? canvas());
     const [picture] = pictures();
     expect(picture).toMatchObject({ x: 0, y: 0, width: 1, height: 1 });
+  });
+
+  it("puts a drop over a ruler or a scrollbar at the nearest drawable point, as the pointer check reads the canvas", async () => {
+    await mount(createPhase4Document("Rulers"), "macos", { scrollbar: 15 });
+    // The ruler widget needs a real canvas to draw; the strips it occupies are what matter here.
+    canvas().classList.add("rulers-visible");
+    // Over the top ruler (32 px), then over the bottom scrollbar (the last 15 px).
+    await browserDrop([dropFile("ruler.png", pngBytes())], { x: 300, y: 5 });
+    await browserDrop([dropFile("scrollbar.png", pngBytes())], { x: 400, y: 695 });
+    expect(pictures().map(centre)).toEqual([{ x: 300, y: 32 }, { x: 400, y: 685 }]);
+  });
+
+  it("waits for a live resize to finish, then inserts the picture as its own entry on top", async () => {
+    const drawing = createPhase4Document("Gesture");
+    drawing.pages[0]!.objects = [{
+      id: "rect-a", type: "graphic", graphicKind: "rect", x: 100, y: 100, width: 80, height: 50, rotation: 0, style: {}, data: {}
+    }];
+    drawing.selection.objectIds = ["rect-a"];
+    await mount(drawing);
+    const page = container.querySelector<HTMLElement>(".page")!;
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const slow: DropFile = { name: "slow.png", size: pngBytes().length, arrayBuffer: async () => { await gate; return pngBytes().buffer as ArrayBuffer; } };
+    await browserDrop([slow], { x: 400, y: 400 });
+    async function pointer(target: Element, type: string, x: number, y: number) {
+      const event = new MouseEvent(type, { button: 0, buttons: type === "pointerup" ? 0 : 1, clientX: x, clientY: y, bubbles: true, cancelable: true });
+      Object.defineProperty(event, "pointerId", { value: 7 });
+      await act(async () => target.dispatchEvent(event));
+    }
+    const handle = container.querySelector('[data-object-resize-corner="bottom-right"]')!;
+    expect(handle).not.toBeNull();
+    await pointer(handle, "pointerdown", 180, 150);
+    await pointer(page, "pointermove", 220, 175);
+    // The picture is read and decoded while the resize is still live: nothing is written yet.
+    release();
+    await settle();
+    expect(pictures()).toHaveLength(0);
+    await pointer(page, "pointermove", 260, 200);
+    await pointer(page, "pointerup", 260, 200);
+    await settle();
+    const [picture] = pictures();
+    expect(picture).toBeDefined();
+    expect(status()).toMatch(/^Inserted picture slow\.png/);
+    const resized = snapshot().pages[0]!.objects.find(object => object.id === "rect-a") as GraphicObject;
+    expect(resized.width).toBeGreaterThan(80);
+    // Two entries: the picture on top of the resize, each undone on its own.
+    await command("edit.undo");
+    expect(pictures()).toHaveLength(0);
+    expect((snapshot().pages[0]!.objects.find(object => object.id === "rect-a") as GraphicObject).width).toBe(resized.width);
+    await command("edit.undo");
+    expect((snapshot().pages[0]!.objects.find(object => object.id === "rect-a") as GraphicObject).width).toBe(80);
   });
 
   it("refuses BMP, TIFF and oversize files by name before reading them, and inserts the rest", async () => {
@@ -277,6 +333,55 @@ describe("dropping picture files on the document window", () => {
       expect(status()).toBe("No pictures were inserted; Couldn't drop \"big.png\": it is 21.0 MB; a dropped picture can be at most 20.0 MB.");
       expect(snapshot().title).toBe("Native document");
     });
+  });
+});
+
+describe("picture stretch entry", () => {
+  let container: HTMLDivElement;
+  let root: Root;
+  beforeEach(() => {
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    vi.stubGlobal("localStorage", new MemoryStorage());
+    vi.stubGlobal("ResizeObserver", class { observe() {} unobserve() {} disconnect() {} });
+    window.history.replaceState(null, "", "/?agentBridge=1");
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+  });
+  afterEach(async () => {
+    await act(async () => root.unmount());
+    container.remove();
+    delete window.__CHEMDRAFT_AGENT__;
+    window.history.replaceState(null, "", "/");
+    vi.unstubAllGlobals();
+  });
+
+  it("links X and Y for a picture, so the typed value is the scale applied", async () => {
+    const base = createPhase4Document("Stretch");
+    const picture = createImageGraphicObject({ mimeType: "image/png", dataBase64: picturePngBase64, center: { x: 300, y: 300 }, id: "image-1" });
+    const drawing = { ...base, pages: [{ ...base.pages[0]!, objects: [picture] }], selection: { ...base.selection, objectIds: ["image-1"] } };
+    await act(async () => root.render(<MainWindow initialDocument={drawing} initialActiveToolCommandId="tool.select"
+      initialPaletteMode="hidden" initialRulersVisible={false} initialCrosshairsVisible={false} nativePalette={false} shortcutPlatform="macos" />));
+    const handle = container.querySelector('[data-object-resize-corner]');
+    expect(handle).not.toBeNull();
+    await act(async () => handle!.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })));
+    const x = container.querySelector<HTMLInputElement>('[aria-label="X stretch percent"]')!;
+    const y = container.querySelector<HTMLInputElement>('[aria-label="Y stretch percent"]')!;
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(x, "200");
+      x.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    // The readout and the entry agree with what the picture actually does.
+    expect(y.value).toBe("200");
+    const stretched = window.__CHEMDRAFT_AGENT__!.snapshot().document.pages[0]!.objects[0] as GraphicObject;
+    expect([stretched.width, stretched.height]).toEqual([picture.width * 2, picture.height * 2]);
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(y, "50");
+      y.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    expect(x.value).toBe("50");
+    const shrunk = window.__CHEMDRAFT_AGENT__!.snapshot().document.pages[0]!.objects[0] as GraphicObject;
+    expect([shrunk.width, shrunk.height]).toEqual([picture.width / 2, picture.height / 2]);
   });
 });
 

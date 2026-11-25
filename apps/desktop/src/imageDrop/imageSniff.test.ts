@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
-  readGifHeaderSize, readJpegHeaderSize, readWebpHeaderSize, sniffBinaryImageFormat
+  readGifHeaderSize, readJpegHeaderSize, readPngHeaderSize, readRasterHeaderSize, readWebpHeaderSize, sniffBinaryImageFormat
 } from "./imageSniff";
-import { gifHeader, jpegHeader, pngBytes, webpVp8Header, webpVp8lHeader, webpVp8xHeader } from "./testFixtures";
+import { gifHeader, jpegHeader, pngBytes, pngWithSize, webpVp8Header, webpVp8lHeader, webpVp8xHeader } from "./testFixtures";
 
 const bytes = (...values: number[]) => new Uint8Array(values);
 const text = (value: string) => new TextEncoder().encode(value);
@@ -88,5 +88,18 @@ describe("WebP header size", () => {
     expect(readWebpHeaderSize(badLossless)).toBeUndefined();
     expect(readWebpHeaderSize(webpVp8xHeader(4, 4).subarray(0, 29))).toBeUndefined();
     expect(readWebpHeaderSize(webpVp8Header(0, 5))).toBeUndefined();
+  });
+});
+
+describe("readPngHeaderSize", () => {
+  it("reads IHDR, including sizes past the caps, and refuses a PNG that does not start with it", () => {
+    expect(readPngHeaderSize(pngBytes())).toEqual({ width: 1, height: 1 });
+    expect(readPngHeaderSize(pngWithSize(300, 7))).toEqual({ width: 300, height: 7 });
+    expect(readRasterHeaderSize("png", pngWithSize(20_000, 1))).toEqual({ width: 20_000, height: 1 });
+    expect(readPngHeaderSize(pngBytes().subarray(0, 23))).toBeUndefined();
+    const notIhdr = pngBytes();
+    notIhdr[12] = 0x78;
+    expect(readPngHeaderSize(notIhdr)).toBeUndefined();
+    expect(readPngHeaderSize(jpegHeader(4, 4))).toBeUndefined();
   });
 });

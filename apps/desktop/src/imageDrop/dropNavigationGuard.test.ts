@@ -65,6 +65,42 @@ describe("installDropNavigationGuard", () => {
     expect(text.event.defaultPrevented).toBe(true);
   });
 
+  it("uses the nearest editing boundary and lets only text-compatible drags edit", () => {
+    remove = installDropNavigationGuard(window);
+    const editable = document.createElement("div");
+    editable.setAttribute("contenteditable", "true");
+    const island = document.createElement("div");
+    island.setAttribute("contenteditable", "false");
+    const islandChild = document.createElement("span");
+    island.append(islandChild);
+    // An invalid value inherits: inside the island it is still not editable.
+    const inherited = document.createElement("span");
+    inherited.setAttribute("contenteditable", "maybe");
+    island.append(inherited);
+    const reopened = document.createElement("span");
+    reopened.setAttribute("contenteditable", "plaintext-only");
+    island.append(reopened);
+    editable.append(island);
+    document.body.append(editable);
+    for (const target of [island, islandChild, inherited]) {
+      const link = dragEvent("drop", ["text/uri-list"]);
+      target.dispatchEvent(link.event);
+      expect(link.event.defaultPrevented, target.nodeName).toBe(true);
+    }
+    const text = dragEvent("drop", ["text/plain"]);
+    reopened.dispatchEvent(text.event);
+    expect(text.event.defaultPrevented).toBe(false);
+    // An editable target still refuses a drag that is not text.
+    const opaque = dragEvent("drop", ["application/x-custom"]);
+    editable.dispatchEvent(opaque.event);
+    expect(opaque.event.defaultPrevented).toBe(true);
+    const field = document.createElement("input");
+    document.body.append(field);
+    const none = dragEvent("dragover", []);
+    field.dispatchEvent(none.event);
+    expect([none.event.defaultPrevented, none.dataTransfer.dropEffect]).toEqual([true, "none"]);
+  });
+
   it("keeps a nearer handler's own drop effect and stops after removal", () => {
     remove = installDropNavigationGuard(window);
     const target = document.createElement("div");

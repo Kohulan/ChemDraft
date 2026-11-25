@@ -11,9 +11,32 @@ export interface PagePointLike { x: number; y: number }
 export interface DropFrame { x: number; y: number; width: number; height: number; scaled: boolean }
 
 /**
- * Frames for the pictures of one drop. The first is centred on `point`, the rest cascade from it.
- * Each keeps its natural size unless larger than the page, when it shrinks uniformly to fit (never
- * grows), and is then shifted so it lies wholly on the page.
+ * Centres along one axis for a cascade of `extents` (each no longer than `pageExtent`). The first is
+ * at `point`; the rest step towards whichever side of the page has room (down/right by preference),
+ * the step shrinks when even that cannot hold the whole cascade, and the batch is then shifted as a
+ * unit onto the page. Pictures keep distinct positions whenever the page is longer than the longest.
+ */
+function cascadeCentres(point: number, extents: readonly number[], pageExtent: number, cascade: number): number[] {
+  const count = extents.length;
+  const longest = Math.max(0, ...extents);
+  const step = count > 1 ? Math.min(cascade, Math.max(0, (pageExtent - longest) / (count - 1))) : 0;
+  const layout = (direction: 1 | -1) => {
+    const centres = extents.map((_, index) => point + direction * index * step);
+    const low = Math.min(...centres.map((centre, index) => centre - extents[index]! / 2));
+    const high = Math.max(...centres.map((centre, index) => centre + extents[index]! / 2));
+    const shift = low < 0 ? -low : high > pageExtent ? pageExtent - high : 0;
+    return { centres, shift };
+  };
+  const forward = layout(1);
+  const backward = layout(-1);
+  const chosen = Math.abs(backward.shift) < Math.abs(forward.shift) ? backward : forward;
+  return chosen.centres.map(centre => centre + chosen.shift);
+}
+
+/**
+ * Frames for the pictures of one drop. The first is centred on `point`, the rest cascade from it
+ * (see `cascadeCentres`). Each keeps its natural size unless larger than the page, when it shrinks
+ * uniformly to fit (never grows), and lies wholly on the page.
  */
 export function placeDroppedImages(
   page: { width: number; height: number },
@@ -21,18 +44,18 @@ export function placeDroppedImages(
   sizes: readonly { width: number; height: number }[],
   cascade = DROP_CASCADE_OFFSET
 ): DropFrame[] {
-  return sizes.map((size, index) => {
+  const fitted = sizes.map(size => {
     const fit = Math.min(1, page.width / size.width, page.height / size.height);
-    const width = size.width * fit;
-    const height = size.height * fit;
-    const centre = { x: point.x + index * cascade, y: point.y + index * cascade };
-    const clamp = (value: number, max: number) => Math.min(Math.max(value, 0), Math.max(0, max));
-    return {
-      x: clamp(centre.x - width / 2, page.width - width),
-      y: clamp(centre.y - height / 2, page.height - height),
-      width, height, scaled: fit < 1
-    };
+    return { width: size.width * fit, height: size.height * fit, scaled: fit < 1 };
   });
+  const xs = cascadeCentres(point.x, fitted.map(size => size.width), page.width, cascade);
+  const ys = cascadeCentres(point.y, fitted.map(size => size.height), page.height, cascade);
+  const clamp = (value: number, max: number) => Math.min(Math.max(value, 0), Math.max(0, max));
+  return fitted.map(({ width, height, scaled }, index) => ({
+    x: clamp(xs[index]! - width / 2, page.width - width),
+    y: clamp(ys[index]! - height / 2, page.height - height),
+    width, height, scaled
+  }));
 }
 
 export interface InsertDroppedImagesResult {

@@ -2,7 +2,7 @@
 
 import { describe, expect, it } from "vitest";
 import { hasUnsafeCssReference, sanitizeDroppedSvg, sanitizeSvgStylesheet, type SvgSanitizeResult } from "./svgSanitizer";
-import { PNG_1X1_BASE64 } from "./testFixtures";
+import { PNG_1X1_BASE64, jpegHeader, pngWithSize } from "./testFixtures";
 
 const NS = 'xmlns="http://www.w3.org/2000/svg"';
 const XLINK = 'xmlns:xlink="http://www.w3.org/1999/xlink"';
@@ -186,5 +186,139 @@ describe("sanitizeSvgStylesheet", () => {
     expect(sanitizeSvgStylesheet("@keyframes k{from{opacity:0}to{opacity:1}} @supports (fill:red){rect{fill:red}} @namespace x url(y);", state))
       .toBe("@keyframes k{from{opacity:0}\nto{opacity:1}}\n@supports (fill:red){rect{fill:red}}");
     expect(state.removedExternal).toBe(true);
+  });
+});
+
+describe("CSS is checked and kept as the same tokens", () => {
+  const state = () => ({ removedExternal: false, removedActive: false });
+
+  it("keeps comment-like text inside a string as part of the string, so the url after it is checked", () => {
+    // Read with comments stripped first, the mask was `mask:""` and its url looked like a comment.
+    const css = `rect{font-family:"/*";mask:"/*" url(https://e.test/m.svg#m) "*/";stroke:"*/"}`;
+    const kept = sanitizeSvgStylesheet(css, state());
+    expect(kept).not.toContain("e.test");
+    expect(kept).toBe(`rect{font-family:"/*";stroke:"*/"}`);
+    const result = clean(`<svg ${NS}><rect width="1" height="1" style='mask:"/*" url(https://e.test/m.svg#m) "*/";fill:red'/></svg>`);
+    expectInert(result.svg);
+    expect(result.svg).not.toContain("e.test");
+    expect(result.removedExternal).toBe(true);
+  });
+
+  it("reads an unquoted url to its parenthesis, comment-like text included", () => {
+    const s0 = state();
+    expect(sanitizeSvgStylesheet("rect{fill:url(https://e.test/*x*/);stroke:red}", s0)).toBe("rect{stroke:red}");
+    expect(s0.removedExternal).toBe(true);
+    // Here the comment-like text is part of a fragment name: kept exactly, as it was checked.
+    expect(sanitizeSvgStylesheet("rect{fill:url(#g/**/)}", state())).toBe("rect{fill:url(#g/**/)}");
+  });
+
+  it("drops declarations with a bad string or a bad url, and keeps the rest of the rule", () => {
+    expect(sanitizeSvgStylesheet('rect{fill:red;font-family:"abc\n;fill:url(https://e.test/x);stroke:blue}', state()))
+      .toBe("rect{fill:red;stroke:blue}");
+    expect(sanitizeSvgStylesheet('rect{fill:url(a"b);stroke:blue}', state())).toBe("rect{stroke:blue}");
+    expect(sanitizeSvgStylesheet("rect{fill:url(a b);stroke:blue}", state())).toBe("rect{stroke:blue}");
+  });
+
+  it("drops whatever the text cuts off: a block, a string or a url", () => {
+    for (const css of ["rect{fill:red", 'rect[title="x]{fill:red}', "rect{fill:url(#a", "@media print{rect{fill:red}"]) {
+      const s0 = state();
+      expect(sanitizeSvgStylesheet(css, s0), css).toBe("");
+      expect(s0.removedExternal, css).toBe(true);
+    }
+    expect(sanitizeSvgStylesheet("rect{fill:red} /* unterminated", state())).toBe("rect{fill:red}");
+  });
+
+  it("decodes escapes in names wherever CSS does", () => {
+    for (const css of ["@\\69mport url(x.css);rect{fill:red}", "@font\\-face{font-family:x;src:url(f.woff)}rect{fill:red}",
+      "rect{fill:\\75\\72\\6c(x.png)}", "rect{fill:\\55 RL(x.png)}", "rect{fill:i\\6d age(x.png)}"]) {
+      const s0 = state();
+      const kept = sanitizeSvgStylesheet(css, s0);
+      expect(kept, css).not.toMatch(/x\.(css|png)|f\.woff/);
+      expect(s0.removedExternal, css).toBe(true);
+    }
+  });
+
+  it("refuses loading functions and at-rules, in custom properties too, and keeps fragment references", () => {
+    const css = [
+      "rect{--a:image('https://e.test/a.png');--b:url(#g);--c:{fill:red};--d:src('x');fill:var(--b)}",
+      "circle{fill:image-set('a.png' 1x);stroke:-webkit-image-set(url(#g) 1x);mask:attr(data-u url);clip-path:url( \"#c\" )}",
+      "@namespace svg url(http://www.w3.org/2000/svg);",
+      "@font-face{font-family:x}",
+      "@import 'a.css';"
+    ].join("\n");
+    const s0 = state();
+    expect(sanitizeSvgStylesheet(css, s0)).toBe("rect{--b:url(#g);fill:var(--b)}\ncircle{clip-path:url( \"#c\" )}");
+    expect(s0.removedExternal).toBe(true);
+    expect(sanitizeSvgStylesheet('rect{fill:url("#g" x)}', state())).toBe("rect{}");
+    expect(sanitizeSvgStylesheet('rect{fill:url("data:image/png;base64,AAAA")}', state())).toBe("rect{}");
+  });
+
+  it("drops a selector or at-rule prelude that loads something", () => {
+    const s0 = state();
+    expect(sanitizeSvgStylesheet("rect:has(image(x)){fill:red} @media (url(x)){rect{fill:red}} g{fill:red}", s0)).toBe("g{fill:red}");
+    expect(s0.removedExternal).toBe(true);
+  });
+
+  it("checks presentation attributes that can hold a reference, and leaves other attributes as text", () => {
+    const result = clean(`<svg ${NS}><path d="M0 0" fill="url('https://e.test/#g')" stroke="url(#ok)" data-note="url(https://e.test/)" aria-label="it's"/></svg>`);
+    const path = parsed(result.svg).querySelector("path")!;
+    expect(path.hasAttribute("fill")).toBe(false);
+    expect(path.getAttribute("stroke")).toBe("url(#ok)");
+    // Not CSS to any renderer: kept as written.
+    expect(path.getAttribute("data-note")).toBe("url(https://e.test/)");
+    expect(path.getAttribute("aria-label")).toBe("it's");
+    expect(result.removedExternal).toBe(true);
+  });
+});
+
+describe("hostile sizes stay linear", () => {
+  it("sanitizes multi-megabyte identifiers, attributes and styles in bounded time", () => {
+    const run = "a".repeat(2_000_000);
+    const sources = [
+      // Long identifiers that never become a function, in a reference attribute, a style and a sheet.
+      `<svg ${NS}><path d="${run}" fill="${run}" style="${run}:${run}"/></svg>`,
+      `<svg ${NS}><style>${run}{fill:${run}}</style><rect width="1" height="1"/></svg>`,
+      // Escapes, parentheses and quotes by the million.
+      `<svg ${NS}><rect width="1" height="1" style="fill:${"\\61".repeat(400_000)};stroke:${"(".repeat(500_000)}"/></svg>`,
+      `<svg ${NS}><style>rect{fill:${"url(#a)".repeat(200_000)};stroke:${"'x' ".repeat(300_000)}}</style></svg>`,
+      // A data URI whose base64 is whitespace, then one bad character.
+      `<svg ${NS}><image href="data:image/png;base64,${" ".repeat(2_000_000)}!" width="1" height="1"/></svg>`
+    ];
+    for (const source of sources) {
+      const started = performance.now();
+      sanitizeDroppedSvg(source);
+      // Quadratic work on two million characters takes hours; linear work takes well under a second.
+      expect(performance.now() - started, source.slice(0, 60)).toBeLessThan(8000);
+    }
+  }, 60_000);
+});
+
+describe("embedded bitmaps", () => {
+  const embed = (mime: string, bytes: Uint8Array) =>
+    `<image href="data:${mime};base64,${btoa(String.fromCharCode(...bytes))}" width="1" height="1"/>`;
+
+  it("refuses an SVG whose embedded bitmap is not what its label says", () => {
+    expect(sanitizeDroppedSvg(`<svg ${NS}>${embed("image/png", jpegHeader(4, 4))}</svg>`))
+      .toEqual({ ok: false, error: "an embedded picture is labelled image/png but its contents are JPEG." });
+    expect(sanitizeDroppedSvg(`<svg ${NS}>${embed("image/gif", new TextEncoder().encode("<svg/>"))}</svg>`))
+      .toEqual({ ok: false, error: "an embedded picture is labelled image/gif but its contents are not a picture." });
+  });
+
+  it("reads each bitmap's size from its header and enforces the per-picture caps", () => {
+    expect(sanitizeDroppedSvg(`<svg ${NS}>${embed("image/png", pngWithSize(20_000, 1))}</svg>`))
+      .toEqual({ ok: false, error: "an embedded picture is 20000 × 1 pixels; the limit is 16384 pixels on a side." });
+    expect(sanitizeDroppedSvg(`<svg ${NS}><filter id="f"><feImage href="data:image/jpeg;base64,${btoa(String.fromCharCode(...jpegHeader(9000, 9000)))}"/></filter></svg>`))
+      .toEqual({ ok: false, error: "an embedded picture is 9000 × 9000 pixels; the decoded limit is 256 MiB." });
+    const truncated = pngWithSize(2, 2).subarray(0, 20);
+    expect(sanitizeDroppedSvg(`<svg ${NS}>${embed("image/png", truncated)}</svg>`))
+      .toEqual({ ok: false, error: "an embedded PNG picture's header is damaged, so its size can't be read." });
+  });
+
+  it("caps the decoded size of all embedded bitmaps together", () => {
+    // Each 8000 × 2000 picture decodes to 64 MB, within the per-picture cap; five exceed 256 MiB.
+    const one = embed("image/jpeg", jpegHeader(8000, 2000));
+    expect(clean(`<svg ${NS}>${one.repeat(4)}</svg>`).svg).toContain("data:image/jpeg;base64,");
+    expect(sanitizeDroppedSvg(`<svg ${NS}>${one.repeat(5)}</svg>`))
+      .toEqual({ ok: false, error: "its embedded pictures together decode to more than 256 MiB." });
   });
 });

@@ -242,6 +242,7 @@ import {
   placeInsertedObjectsInFreeSpace,
   createPluginWriteGate,
   describePatchFailure,
+  PluginWriteGateTimeoutError,
   type PluginWriteGate
 } from "./plugins/applyPluginDocumentPatch";
 import { AnalyzerNoticeBanner, type AnalyzerNotice } from "./plugins/AnalyzerNotice";
@@ -949,10 +950,11 @@ import {
 import { installBrowserReloadGuard, wasBrowserReloadPrevented } from "./browserReloadGuard";
 import { assertDocumentSize, decodeNativeDocumentContents, documentContentsKey, readBrowserDocumentFile, readNativeDocumentFile, type DocumentContents } from "./documentText";
 import { handleDroppedFiles, type DroppedImageInsertion, type DroppedImageSource } from "./imageDrop/dropHandler";
-import { browserDropClientPoint, dropPagePoint, tauriDropClientPoint, type DropClientPoint } from "./imageDrop/dropPosition";
+import { browserDropClientPoint, drawableCanvasRect, dropPagePoint, tauriDropClientPoint, type DropClientPoint } from "./imageDrop/dropPosition";
 import { insertDroppedImages, type PagePointLike } from "./imageDrop/insertDroppedImages";
 import type { PreparedDroppedImage } from "./imageDrop/prepareDroppedImage";
-import { browserRasterToPng } from "./imageDrop/rasterDecode";
+import { savedDocumentBytes } from "./imageDrop/dropDocumentBudget";
+import { browserImageDecoders } from "./imageDrop/rasterDecode";
 import { browserDroppedImageSource, nativeDroppedImageSource } from "./imageDrop/readDroppedFile";
 import { createDocumentFileSave, exportDocumentCdx } from "./documentFileFormats";
 import { getDesktopExportFormatDescriptor as getExportFormatDescriptor } from "./desktopExportFormats";
@@ -1421,6 +1423,11 @@ type ObjectResizeInputState = {
   draftYPercent: string;
   homeXPercent: string;
   homeYPercent: string;
+  /**
+   * A picture keeps its aspect ratio (it scales by the mean of a stretch), so its X and Y entries are
+   * one value: typing either sets both, and the readout shows the scale actually applied.
+   */
+  linkedAxes?: boolean;
 };
 type ObjectResizeCorner = "top-left" | "top-right" | "bottom-left" | "bottom-right";
 type ObjectResizeDragState = {
@@ -1891,7 +1898,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.24.18.28-opus";
+const CURRENT_BUILD_STAMP = "11.24.19.10-opus";
 
 /**
  * Sets `target` to `markIds`. A commit updater fills its policy's `IndependentMarkMoves` this way:
@@ -11233,22 +11240,26 @@ export function MainWindow({
     return undefined;
   }, []);
   /**
-   * The drop point in page units, read when the drop happens. A drop outside the visible canvas
-   * (toolbar, tab strip, rulers) lands at the nearest point of the visible page; a drop without a
+   * The drop point in page units, read when the drop happens. A drop outside the drawable canvas
+   * (toolbar, tab strip, rulers, scrollbars) lands at the nearest point of the visible page; a drop without a
    * position (a synthetic event) at the visible centre, as Paste Picture does.
    */
   const droppedImagePagePoint = useCallback((client: DropClientPoint | undefined): PagePointLike => {
     const canvas = canvasRegionRef.current;
     const page = pageRef.current;
     if (!client || !canvas || !page) return viewportCentrePagePoint();
-    return dropPagePoint(client, canvas.getBoundingClientRect(), page.getBoundingClientRect(), viewportRef.current.scale,
-      documentRef.current.pages[0]!);
+    // The drawable area, as `isCanvasDrawingPress` reads it: no rulers, no scrollbars.
+    const drawable = drawableCanvasRect(canvas, canvas.classList.contains("rulers-visible") ? RULER_THICKNESS : 0);
+    return dropPagePoint(client, drawable, page.getBoundingClientRect(), viewportRef.current.scale, documentRef.current.pages[0]!);
   }, [viewportCentrePagePoint]);
   /**
    * One drop, either route. The target tab, its document and the point are fixed at drop time; the
    * pictures are committed only into that same document, as one "Insert Image" undo entry, after the
    * asynchronous read and decode. A document that changed tab (or was replaced in its tab) is never
-   * written to: the status says so instead.
+   * written to: the status says so instead. The edit guards are checked at drop time, so a refusal is
+   * reported at once, and again at commit. The commit waits, as a plugin's write does, for any live
+   * canvas gesture to end (a resize, move or drawing commits from its own starting snapshot and would
+   * wipe the pictures), and is refused if the canvas stays busy.
    */
   const runFileDrop = useCallback(<T,>(files: readonly T[], client: DropClientPoint | undefined, route: {
     nameOf(file: T): string;
@@ -11286,7 +11297,27 @@ export function MainWindow({
       return { ok: true, scaledToPage };
     };
     return handleDroppedFiles(files, {
-      ...route, insertImages, rasterToPng: browserRasterToPng, setStatus,
+      ...route, insertImages, decoders: browserImageDecoders, setStatus,
+      insertRefusal: imageDropRefusal,
+      documentBytes: () => {
+        // The session's cached payload when autosave has built one for this very document.
+        const current = documentRef.current;
+        let payload = sessionPayloadCacheRef.current.get(current);
+        if (!payload) {
+          payload = createNativeSavePayload(current);
+          sessionPayloadCacheRef.current.set(current, payload);
+        }
+        return savedDocumentBytes(payload.contents);
+      },
+      whenIdle: <R,>(commit: () => R): Promise<R> => {
+        const gate = pluginWriteGateRef.current;
+        if (!gate) return Promise.resolve().then(commit);
+        return gate.run(commit).catch((error: unknown) => {
+          throw new Error(error instanceof PluginWriteGateTimeoutError
+            ? "the canvas stayed busy with another edit; drop them again."
+            : error instanceof Error ? error.message : String(error));
+        });
+      },
       serialize: task => {
         const run = imageDropQueueRef.current.then(task);
         imageDropQueueRef.current = run.catch(() => undefined);
@@ -21946,7 +21977,8 @@ export function MainWindow({
       draftXPercent: homeXPercent,
       draftYPercent: homeYPercent,
       homeXPercent,
-      homeYPercent
+      homeYPercent,
+      ...(object.type === "graphic" && object.graphicKind === "image" ? { linkedAxes: true } : {})
     });
     setStatus("Stretch entry");
     return true;
@@ -34323,6 +34355,12 @@ function RotationInputPopover({
   );
 }
 
+/** One typed stretch value; for a picture (`linkedAxes`) it sets both axes. */
+function linkedObjectResizeDraft(input: ObjectResizeInputState, axis: "x" | "y", value: string): ObjectResizeInputState {
+  if (input.linkedAxes) return { ...input, draftXPercent: value, draftYPercent: value };
+  return axis === "x" ? { ...input, draftXPercent: value } : { ...input, draftYPercent: value };
+}
+
 function ObjectResizeInputPopover({
   input,
   onKeep,
@@ -34372,7 +34410,7 @@ function ObjectResizeInputPopover({
           inputMode="decimal"
           type="text"
           value={input.draftXPercent}
-          onChange={(event) => onChange({ ...input, draftXPercent: event.currentTarget.value })}
+          onChange={(event) => onChange(linkedObjectResizeDraft(input, "x", event.currentTarget.value))}
         />
       </label>
       <label className="object-scale-input-field">
@@ -34382,7 +34420,7 @@ function ObjectResizeInputPopover({
           inputMode="decimal"
           type="text"
           value={input.draftYPercent}
-          onChange={(event) => onChange({ ...input, draftYPercent: event.currentTarget.value })}
+          onChange={(event) => onChange(linkedObjectResizeDraft(input, "y", event.currentTarget.value))}
         />
       </label>
       <span aria-hidden="true" className="object-scale-input-unit">%</span>

@@ -32,7 +32,7 @@ const REFUSED_EXTENSIONS: Readonly<Record<string, string>> = {
   svgz: "compressed SVG (.svgz) can't be dropped; save it as plain SVG first.",
   pdf: "PDF files can't be placed as pictures; export the page as PNG or SVG first.",
   eps: "EPS files can't be placed as pictures; export it as PNG or SVG first.",
-  ai: "Illustrator files can't be placed as pictures; export it as PNG or SVG first."
+  ai: ".ai files can't be placed as pictures; export it as PNG or SVG first."
 };
 
 export function droppedFileExtension(name: string): string {

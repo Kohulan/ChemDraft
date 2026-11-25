@@ -35,9 +35,32 @@ export function browserDropClientPoint(event: { clientX?: unknown; clientY?: unk
 
 export interface ClientRectLike { left: number; top: number; right: number; bottom: number }
 
+export interface CanvasBoxLike {
+  getBoundingClientRect(): ClientRectLike;
+  clientLeft: number;
+  clientTop: number;
+  clientWidth: number;
+  clientHeight: number;
+}
+
 /**
- * Where a drop lands on the page. A point outside the visible canvas (over a toolbar, the tab strip
- * or the rulers) is first pulled to the nearest visible canvas point, then mapped to page units and
+ * The canvas area a picture can be dropped onto, in client pixels: the border box less its borders,
+ * native scrollbars (`clientWidth`/`clientHeight` exclude them, a leading-edge one included through
+ * `clientLeft`) and the ruler strips, which are pointer-transparent and lie over the canvas. The same
+ * area the canvas pointer check accepts.
+ */
+export function drawableCanvasRect(canvas: CanvasBoxLike, rulerInset: number): ClientRectLike {
+  const rect = canvas.getBoundingClientRect();
+  const left = rect.left + canvas.clientLeft;
+  const top = rect.top + canvas.clientTop;
+  const inset = Number.isFinite(rulerInset) && rulerInset > 0 ? rulerInset : 0;
+  return { left: left + inset, top: top + inset, right: left + canvas.clientWidth, bottom: top + canvas.clientHeight };
+}
+
+/**
+ * Where a drop lands on the page. A point outside the drawable canvas (over a toolbar, the tab
+ * strip, the rulers or a scrollbar; see `drawableCanvasRect`) is first pulled to the nearest drawable
+ * canvas point, then mapped to page units and
  * clamped to the page: the picture goes to the nearest point of the visible page. Without a point
  * the caller uses the visible centre, as Paste Picture does.
  */

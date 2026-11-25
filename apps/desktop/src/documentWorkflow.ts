@@ -21022,8 +21022,16 @@ const nativeSavePayloadCache = new WeakMap<ChemDraftDocument, NativeSavePayload>
  * The CDXML writer warns that a picture is kept only in the embedded ChemDraft data, because another
  * program opening a CDXML or CDX will not show it. A `.chemdraft` file is the embedded data, so the
  * picture is not lost there and the warning would be noise on every save. A picture with no data
- * still warns: nothing of it is saved. Save As and Export CDXML or CDX keep the warning.
+ * still warns: nothing of it is saved. Only the caller knows the destination
+ * (`createDocumentFileSave`): a save to `.cdxml` or `.cdx`, and Export, keep the warning.
  */
+export function withoutEmbeddedPictureWarnings<W extends { code: string; sourceObjectId?: string }>(
+  document: ChemDraftDocument,
+  warnings: readonly W[]
+): W[] {
+  return warnings.filter((warning) => !isPictureKeptByNativePayload(document, warning));
+}
+
 function isPictureKeptByNativePayload(document: ChemDraftDocument, warning: { code: string; sourceObjectId?: string }): boolean {
   if (warning.code !== "cdxml.picture_not_saved") return false;
   return document.pages.some((page) => page.objects.some((object) => object.id === warning.sourceObjectId
@@ -21043,7 +21051,9 @@ export function createNativeSavePayload(document: ChemDraftDocument): NativeSave
     contents: result.contents,
     warnings: [
       ...nativeDocumentExportWarnings(document).map(({ code, message, objectId }) => ({ code, message, sourceObjectId: objectId })),
-      ...result.warnings.filter((warning) => !isPictureKeptByNativePayload(document, warning))
+      // Every codec warning, the picture notes included: whether they apply depends on the
+      // destination's extension (`withoutEmbeddedPictureWarnings`).
+      ...result.warnings
     ],
     // The embedded native document's hash, already computed by the export: hashing the whole
     // envelope again cost ~190 ms per autosave on a large page.

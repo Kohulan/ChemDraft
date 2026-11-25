@@ -1985,28 +1985,47 @@ lossy and a lossless WebP, an SVG with gradients and `<use href="#id">`, a BMP, 
   GIF and WebP show their first frame. A picture larger than the page is shrunk to fit inside it.
 - Drop point: repeat at 50%, 100% and 400% zoom, scrolled, near each page edge (the picture is
   shifted fully onto the page) and over the pasteboard beside the page and over the toolbar (it goes
-  to the nearest point of the visible page). Move the window between displays with different
-  scaling and drop again: the picture still lands under the pointer.
+  to the nearest point of the visible page). With rulers shown and the canvas scrolled, drop over a
+  ruler and over each scrollbar: the picture lands just inside the drawable area, never under the
+  ruler or scrollbar. Move the window between displays with different scaling and drop again: the
+  picture still lands under the pointer.
 - Several files: drop five PNGs at once. They cascade down and to the right from the drop point in
   one "Insert Image" undo entry, all selected. Undo removes all five; Redo restores them exactly.
-  The first Cmd/Ctrl+Z after the drop undoes the drop.
+  The first Cmd/Ctrl+Z after the drop undoes the drop. Drop five near the bottom-right corner: they
+  cascade up and to the left, none on top of another. Drop fifty small pictures: every one has its
+  own position on the page.
 - Mixed: drop a PNG and a `.cdxml` together. The picture lands in the current tab and the document
   opens in its own tab; the status reports both. Drop only a `.cdxml`: it opens as before.
-- Refusals: the BMP, TIFF, HEIC, `.svgz` and 20 MB+ files are refused by name with a specific
-  reason, immediately (no read of the large file). A `.png` renamed from a text file is refused as
-  not a picture. A drop of a refused file and a good one inserts the good one.
+- Refusals: the BMP, TIFF, HEIC, `.svgz`, `.ai` and 20 MB+ files are refused by name with a specific
+  reason, immediately (no read of the large file); the `.ai` reason names the extension only. A
+  `.png` renamed from a text file is refused as not a picture. A PNG whose chunks are intact but
+  whose image data is damaged is refused as "could not be decoded". A drop of a refused file and a
+  good one inserts the good one.
+- Document size: on a document already near 60 MB, drop several large pictures. Those that fit are
+  inserted; the rest are refused by name ("it would make the document larger than 64.0 MB, the most
+  ChemDraft can open"). Save, close and reopen the document: it opens.
 - Untrusted SVG: an SVG with `<script>`, `onload`, `<foreignObject>`, a link, `<use
   href="other.svg#x">`, a `url(https://…)` fill and an `@import` inserts with "scripts and animation
   were removed" / "external content was removed"; nothing runs, no network request is made
-  (watch the network log in the web build), and Save + reopen keeps the cleaned picture.
+  (watch the network log in the web build), and Save + reopen keeps the cleaned picture. An SVG with a
+  `<style>` holding `/*` inside a quoted string before a `url(https://…)` loses that declaration
+  too. An SVG embedding a JPEG labelled `data:image/png`, or a bitmap over 16384 pixels on a side,
+  is refused with that reason.
 - Tabs and guards: start a drop of the large JPEG and switch tabs before it appears: it is not
   inserted anywhere and the status says so. Drops during a text, label or table-cell edit, with
-  a dialog open or while quitting are refused with a reason.
+  a dialog open or while quitting are refused with a reason, shown at once (before the file is read).
+- Live gestures: drop the large JPEG and, before it appears, start resizing (then, separately,
+  moving, rotating and drawing) another object; hold the gesture past the moment the picture would
+  appear, then finish it. The picture appears once the gesture ends, the gesture's result is kept,
+  and Undo removes the picture first, then the gesture.
 - Resize: drag every corner handle of a picture, with and without Shift, rotated, and inside a
-  group: the aspect ratio never changes. Move, Delete, Cut/Paste still work.
+  group: the aspect ratio never changes. Move, Delete, Cut/Paste still work. Double-click a corner
+  handle of a picture for the stretch entry: typing in X fills Y with the same value (and the other
+  way round), and the picture scales by exactly that percentage.
 - Export and save: export to every available format with dropped PNG, JPEG and SVG pictures; save as
-  `.chemdraft` and `.cdxml`, reopen, compare.
+  `.chemdraft` and `.cdxml`, reopen, compare. Saving as `.chemdraft` shows no picture warning; Save
+  As `.cdxml` or `.cdx` and Export CDXML or CDX warn that other programs will not show the picture.
 - Nothing navigates: drop a file, a browser link and selected text onto the toolbar, the tab strip,
   every floating palette, a popover, the Preferences and Export dialogs, and (web build) anywhere
   in the page. The app never replaces itself with the file or URL; text can still be dropped into a
-  text field.
+  text field, but a link dropped on a read-only part inside an editable area does not navigate.

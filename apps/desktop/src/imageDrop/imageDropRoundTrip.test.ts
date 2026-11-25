@@ -10,13 +10,14 @@ import {
   moveDocumentObjects, openNativeDocument, parseSelectionClipboardPayload, pasteSelectionClipboardPayload,
   scaleDocumentObjectsAroundPoint, selectDocumentObjects, serializeSelectionClipboardPayload
 } from "../documentWorkflow";
+import { createDocumentFileSave } from "../documentFileFormats";
 import { graphicArtTransformPreviewSvgDataUrl } from "../MainWindow";
 import { rasterizeSvgNative } from "../nativeRasterExport";
 import { rasterPicturePlaceholderHref, readPngSize } from "../rasterPictureDecode";
 import { picturePngBase64 } from "../testSupport/imageFixture";
 import { insertDroppedImages } from "./insertDroppedImages";
 import { prepareDroppedImage, type PreparedDroppedImage } from "./prepareDroppedImage";
-import type { RasterToPng } from "./rasterDecode";
+import type { DroppedImageDecoders } from "./rasterDecode";
 import { PNG_1X1_BASE64, jpegHeader, pngBytes, svgBytes } from "./testFixtures";
 
 const native = vi.hoisted(() => ({ invoke: vi.fn(), rasterized: vi.fn() }));
@@ -33,11 +34,14 @@ const PICTURE_PNG = bytesOf(picturePngBase64);
 const BITMAP_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="60" height="30"><script>alert(1)</script>`
   + `<image href="data:image/png;base64,${PNG_1X1_BASE64}" width="60" height="30"/></svg>`;
 
-/** The JPEG converter of the webview, replaced by one returning a real 1 × 1 PNG. */
-const jpegToPng: RasterToPng = async () => ({ png: pngBytes(), width: 1, height: 1, sourceWidth: 1, sourceHeight: 1, downscaled: false });
+/** The webview's decoders: the JPEG converter returns a real 1 × 1 PNG, and every check decodes. */
+const decoders: DroppedImageDecoders = {
+  rasterToPng: async () => ({ png: pngBytes(), width: 1, height: 1, sourceWidth: 1, sourceHeight: 1, downscaled: false }),
+  decodeCheck: async () => ({ width: 1, height: 1 })
+};
 
 async function prepared(name: string, bytes: Uint8Array): Promise<PreparedDroppedImage> {
-  const result = await prepareDroppedImage(name, bytes, jpegToPng);
+  const result = await prepareDroppedImage(name, bytes, decoders);
   if (!result.ok) throw new Error(result.reason);
   return result.image;
 }
@@ -74,8 +78,9 @@ describe("a dropped picture through save, reopen and export", () => {
 
   it("(a) .chemdraft save keeps every picture, in order, with no picture warning, and reopens deep-equal", async () => {
     const { edited, ids } = await scene();
-    const saved = createNativeSavePayload(edited);
+    const saved = createDocumentFileSave(edited, "/drawings/dropped.chemdraft");
     expect(saved.warnings.map(warning => warning.code)).not.toContain("cdxml.picture_not_saved");
+    if (saved.kind !== "text") throw new Error("Expected the CDXML envelope");
     const reopened = openNativeDocument(saved.contents).document!;
     expect(pictures(reopened)).toEqual(pictures(edited));
     expect(reopened.pages[0]!.objects.map(object => object.id)).toEqual(edited.pages[0]!.objects.map(object => object.id));
@@ -87,7 +92,8 @@ describe("a dropped picture through save, reopen and export", () => {
   it("(a) still warns for a picture with no data, which a .chemdraft cannot keep", async () => {
     const { edited, ids } = await scene();
     const emptied = applyPatch(edited, { op: "updateObject", objectId: ids[0]!, changes: { data: {} } });
-    const warnings = createNativeSavePayload(emptied).warnings.filter(warning => warning.code === "cdxml.picture_not_saved");
+    const warnings = createDocumentFileSave(emptied, "/drawings/dropped.chemdraft").warnings
+      .filter(warning => warning.code === "cdxml.picture_not_saved") as Array<{ sourceObjectId?: string }>;
     expect(warnings.map(warning => warning.sourceObjectId)).toEqual([ids[0]]);
   });
 

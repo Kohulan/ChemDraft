@@ -25,8 +25,29 @@ describe("placeDroppedImages", () => {
   it("cascades further pictures by a constant offset, still on the page", () => {
     const frames = placeDroppedImages(page, { x: 100, y: 100 }, [{ width: 40, height: 40 }, { width: 40, height: 40 }, { width: 40, height: 40 }]);
     expect(frames.map(frame => [frame.x, frame.y])).toEqual([[80, 80], [80 + DROP_CASCADE_OFFSET, 80 + DROP_CASCADE_OFFSET], [80 + 2 * DROP_CASCADE_OFFSET, 80 + 2 * DROP_CASCADE_OFFSET]]);
+  });
+
+  it("cascades up and left near the bottom-right corner instead of stacking pictures", () => {
     const edge = placeDroppedImages(page, { x: 780, y: 580 }, [{ width: 40, height: 40 }, { width: 40, height: 40 }]);
-    expect(edge.map(frame => [frame.x, frame.y])).toEqual([[760, 560], [760, 560]]);
+    expect(edge.map(frame => [frame.x, frame.y])).toEqual([[760, 560], [760 - DROP_CASCADE_OFFSET, 560 - DROP_CASCADE_OFFSET]]);
+    // Right edge only: down as usual, but left.
+    const right = placeDroppedImages(page, { x: 780, y: 100 }, [{ width: 40, height: 40 }, { width: 40, height: 40 }]);
+    expect(right.map(frame => [frame.x, frame.y])).toEqual([[760, 80], [760 - DROP_CASCADE_OFFSET, 80 + DROP_CASCADE_OFFSET]]);
+  });
+
+  it("keeps every picture at its own position while the page has room, shrinking the step if it must", () => {
+    const sizes = Array.from({ length: 50 }, () => ({ width: 100, height: 100 }));
+    const frames = placeDroppedImages(page, { x: 400, y: 300 }, sizes);
+    expect(new Set(frames.map(frame => `${frame.x},${frame.y}`)).size).toBe(50);
+    for (const frame of frames) {
+      expect(frame.x).toBeGreaterThanOrEqual(0);
+      expect(frame.y).toBeGreaterThanOrEqual(0);
+      expect(frame.x + frame.width).toBeLessThanOrEqual(page.width + 1e-9);
+      expect(frame.y + frame.height).toBeLessThanOrEqual(page.height + 1e-9);
+    }
+    // A picture as large as the page leaves no room: only then do pictures share a position.
+    const full = placeDroppedImages(page, { x: 400, y: 300 }, [page, page]);
+    expect(full.map(frame => [frame.x, frame.y])).toEqual([[0, 0], [0, 0]]);
   });
 });
 
