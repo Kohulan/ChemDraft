@@ -1,6 +1,13 @@
 import type { ChemDraftDocument, DocumentObject } from "@chemdraft/chem-core";
 import type { DocumentSessionEnvelope } from "./documentSession";
 
+/**
+ * The open report's code for a molecule whose lone-H (H•) cache the refresh
+ * (`withImpliedRadicalChemistryRederived`) declined to change. Kept here, so the session restore's
+ * report merge below can name it without loading the document workflow, which re-exports it.
+ */
+export const IMPLIED_RADICAL_CACHE_NOT_REFRESHED_CODE = "document.lone_hydrogen_cache_not_refreshed";
+
 /** Opens and closes the current document's file warning list. */
 export const TOGGLE_OPEN_WARNINGS_COMMAND_ID = "view.toggleOpenWarnings";
 
@@ -41,7 +48,9 @@ export interface OpenWarningsReport {
  * keeps every warning it had (it describes the original file, which the session no longer holds),
  * and gains each reread warning it does not already name, so a warning about what the document
  * holds now (an H atom stating a count it cannot carry) is never hidden behind an older report.
- * Without a saved open report the reread one stands, unless a save report took its place.
+ * Without a saved open report the reread one stands. A save report takes its place only for what
+ * a save report also flags (such an H atom): the reread warnings no save can report
+ * (`readOnlyWarningCodes`: a lone H's cache the restore's refresh keeps stale) still stand.
  */
 export function restoreSessionWarningReports(
   session: Pick<DocumentSessionEnvelope, "openWarnings" | "saveWarnings">,
@@ -53,9 +62,22 @@ export function restoreSessionWarningReports(
   const open = session.openWarnings?.operation === "save" ? undefined : session.openWarnings;
   const save = session.saveWarnings ?? (session.openWarnings?.operation === "save" ? session.openWarnings : undefined);
   return {
-    warnings: open ? mergeOpenWarnings(open, reread?.warnings ?? []) : save ? undefined : reread,
+    warnings: open ? mergeOpenWarnings(open, reread?.warnings ?? []) : save ? readOnlyWarnings(reread) : reread,
     saveWarnings: save
   };
+}
+
+/**
+ * Warnings only a read of the document reports, which a save report never carries: the lone-H
+ * refresh runs on open and restore, never on save, so its declined-refresh warning exists only in
+ * the read's report.
+ */
+const readOnlyWarningCodes: ReadonlySet<string> = new Set([IMPLIED_RADICAL_CACHE_NOT_REFRESHED_CODE]);
+
+/** `report` limited to `readOnlyWarningCodes`, or nothing when none is left. */
+function readOnlyWarnings(report: OpenWarningsReport | undefined): OpenWarningsReport | undefined {
+  const warnings = report?.warnings.filter((warning) => readOnlyWarningCodes.has(warning.code)) ?? [];
+  return report && warnings.length ? { ...report, warnings } : undefined;
 }
 
 /** The same warning: its code and what it names (molecule, atoms, bonds), or its words when it names nothing. */

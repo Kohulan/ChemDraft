@@ -13550,6 +13550,9 @@ export function MainWindow({
   const pluginCommandQueuesRef = useRef(new Map<string, Promise<void>>());
   const [pendingPluginCommands, setPendingPluginCommands] = useState<ReadonlySet<string>>(() => new Set());
   const pluginCommandGenerationsRef = useRef(new Map<string, number>());
+  // Per menu-invoked plugin command: the status of each write it made that carried a warning (a lone-H
+  // cache kept as stored), so the command's final status, which reports its selection warnings, keeps it.
+  const pluginWriteWarningStatusesRef = useRef(new Map<string, string[]>());
   // A refused analyzer run opens no report window; this notice says why (see AnalyzerNotice).
   const [analyzerNotice, setAnalyzerNotice] = useState<AnalyzerNotice | undefined>(undefined);
   const analyzerNoticeIdRef = useRef(0);
@@ -13750,7 +13753,11 @@ export function MainWindow({
           receipt.objectIds.length > 0 && insertedDescription
             ? `${plugin.name}: inserted ${insertedDescription}`
             : `${plugin.name}: applied ${command.title}`;
-        setStatus(sourceStatus ? `${insertionStatus} (${sourceStatus})` : insertionStatus);
+        const writeStatus = sourceStatus ? `${insertionStatus} (${sourceStatus})` : insertionStatus;
+        // A refresh the write declined (a lone-H cache kept as stored) reaches the user (AGENTS.md §7).
+        const finalStatus = applied.warnings.length ? `${writeStatus}. ${applied.warnings.join(" ")}` : writeStatus;
+        setStatus(finalStatus);
+        if (applied.warnings.length) pluginWriteWarningStatusesRef.current.get(command.id)?.push(finalStatus);
         return receipt;
       });
     }
@@ -14078,7 +14085,8 @@ export function MainWindow({
         const before = documentRef.current;
         const documentIdentity = documentIdentityRef.current;
         // The same application the review dry-runs for its warnings (`proposalReviewItem`).
-        let prepared = previewAcceptedPluginProposal(host, proposal.id, before);
+        const applyWarnings: string[] = [];
+        let prepared = previewAcceptedPluginProposal(host, proposal.id, before, applyWarnings);
         if (recognized) {
           const visible = assistantHistoryPort.getViewportRect?.(tab.id);
           const pageRect = pageRef.current?.getBoundingClientRect();
@@ -14115,7 +14123,7 @@ export function MainWindow({
         }
         setSelectedNativeMoleculePart(undefined);
         const message = acceptedProposalMessage(pluginName, proposal,
-          { recognized, screenCapture: Boolean(screenCapture), before, committed });
+          { recognized, screenCapture: Boolean(screenCapture), before, committed, warnings: applyWarnings });
         setStatus(message);
         return { ok: true, message };
       } catch (error) {
@@ -14522,7 +14530,16 @@ export function MainWindow({
         .then(async () => {
           // Collected per invocation: only this command's own selection reads can add to it.
           const selectionWarnings: string[] = [];
-          const result = await invokePluginCommand(commandId, { selectionWarnings, input: options?.input });
+          const writeWarningStatuses: string[] = [];
+          pluginWriteWarningStatusesRef.current.set(commandId, writeWarningStatuses);
+          let result: unknown;
+          try {
+            result = await invokePluginCommand(commandId, { selectionWarnings, input: options?.input });
+          } finally {
+            if (pluginWriteWarningStatusesRef.current.get(commandId) === writeWarningStatuses) {
+              pluginWriteWarningStatusesRef.current.delete(commandId);
+            }
+          }
           if (!mountedRef.current || pluginCommandGenerationsRef.current.get(queueKey) !== generation) {
             return;
           }
@@ -14533,8 +14550,10 @@ export function MainWindow({
           } else {
             // A run that went through supersedes whatever this analyzer refused earlier.
             if (analyzerOwned && owner) clearAnalyzerNoticeFor(owner.id);
-            if (selectionWarnings.length) {
-              setStatus([...new Set(selectionWarnings)].join(" "));
+            if (selectionWarnings.length || writeWarningStatuses.length) {
+              // Keep every write's warning (AGENTS.md section 7), even when a later warning-free write
+              // set the status, beside the selection's.
+              setStatus([...writeWarningStatuses, ...new Set(selectionWarnings)].join(" "));
             }
           }
         })
