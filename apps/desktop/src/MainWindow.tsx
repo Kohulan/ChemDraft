@@ -502,6 +502,7 @@ import {
 import {
   interactive3dPhaseLabel,
   interactive3dSessionStatus,
+  spin3dViewCanceledStatus,
   type Interactive3dPhase
 } from "./interactive3dStatus";
 import type { Engine3DCoordinate } from "@chemdraft/engine3d-api";
@@ -1904,7 +1905,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.25.08.00-opus";
+const CURRENT_BUILD_STAMP = "11.25.08.38-opus";
 
 /**
  * Sets `target` to `markIds`. A commit updater fills its policy's `IndependentMarkMoves` this way:
@@ -5777,6 +5778,14 @@ export function MainWindow({
     }
     return cancelled;
   }, [applySpin]);
+
+  // The open overlay is Interactive 3D when its tug is armed or attached for the molecule the overlay
+  // shows (the tug rides the Spin 3D overlay); otherwise it is Spin 3D. Read when Esc or Undo closes it.
+  const openSpin3dViewCanceledStatus = useCallback((): string => {
+    const objectId = spin3dStateRef.current?.objectId;
+    return spin3dViewCanceledStatus(objectId !== undefined && (
+      interactive3dArmRef.current?.objectId === objectId || interactive3dWorkspaceRef.current?.objectId === objectId));
+  }, []);
 
   useEffect(() => {
     if (!spin3dState) return;
@@ -10324,7 +10333,7 @@ export function MainWindow({
   ]);
 
   const restoreDocumentHistory = useCallback((direction: "undo" | "redo") => {
-    if (cancelSpin3dSession("Spin canceled")) {
+    if (cancelSpin3dSession(openSpin3dViewCanceledStatus())) {
       return;
     }
 
@@ -10398,7 +10407,8 @@ export function MainWindow({
           ? "Undid last document change"
           : "Redid document change"
     );
-  }, [assignHoveredNativeDeleteTarget, atomLabelHistorySnapshot, cancelSpin3dSession, finishActiveNativeTextEdit, installDocumentHistory]);
+  }, [assignHoveredNativeDeleteTarget, atomLabelHistorySnapshot, cancelSpin3dSession, finishActiveNativeTextEdit, installDocumentHistory,
+    openSpin3dViewCanceledStatus]);
 
   const cancelDocumentTabSessions = useCallback(() => {
     // Settle chooser edits before choosing a rollback snapshot. Otherwise the
@@ -16509,7 +16519,7 @@ export function MainWindow({
     if (spin3dStateRef.current) {
       event.preventDefault();
       event.stopPropagation();
-      cancelSpin3dSession("Spin canceled");
+      cancelSpin3dSession(openSpin3dViewCanceledStatus());
       return;
     }
     const pendingSpin = spin3dPendingRef.current;
@@ -16521,7 +16531,7 @@ export function MainWindow({
   };
   window.addEventListener("keydown", handleSpinEscape, { capture: true });
   return () => window.removeEventListener("keydown", handleSpinEscape, { capture: true });
-  }, [cancelSpin3dSession]);
+  }, [cancelSpin3dSession, openSpin3dViewCanceledStatus]);
 
   // Interactive 3D tug rides the Spin 3D overlay, so Esc is handled by the spin Esc handler
   // above (cancelSpin3dSession) and the detach effect tears the sidecar session down when the
