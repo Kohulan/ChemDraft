@@ -10,6 +10,11 @@ export interface ExportDirectoryDependencies {
   dirname: (path: string) => Promise<string>;
   isDirectory: (path: string) => Promise<boolean>;
   save: (options: SaveDialogOptions) => Promise<string | null>;
+  /**
+   * Maps the panel's path to the path to write (undoing a repeated extension, confirming a
+   * replace), or undefined to cancel. Omitted, the panel's path is written unchanged.
+   */
+  resolveSelected?: (path: string, extensions: readonly string[]) => Promise<string | undefined>;
 }
 
 /** A cancelled or failed write must not change the remembered destination. Path operations are
@@ -24,12 +29,14 @@ export async function saveInExportDirectory(
     const { documentDir, join, dirname } = await import("@tauri-apps/api/path");
     const { stat } = await import("@tauri-apps/plugin-fs");
     const { save } = await import("./nativeFileDialog");
+    const { resolveNativeSavePanelPath } = await import("./nativeSavePanelPath");
     dependencies = {
       directory: lastExportDirectory, documentDir, join, dirname, save,
+      resolveSelected: (path, extensions) => resolveNativeSavePanelPath(path, extensions),
       isDirectory: async (path) => (await stat(path)).isDirectory
     };
   }
-  const { directory, documentDir, join, dirname, isDirectory, save } = dependencies;
+  const { directory, documentDir, join, dirname, isDirectory, save, resolveSelected } = dependencies;
   let folder = directory.current;
   if (folder) {
     try {
@@ -39,7 +46,10 @@ export async function saveInExportDirectory(
     }
   }
   const defaultPath = await join(folder ?? await documentDir(), filename);
-  const path = await save({ ...options, defaultPath });
+  const selected = await save({ ...options, defaultPath });
+  if (!selected) return "cancelled";
+  const extensions = (options.filters ?? []).flatMap(filter => filter.extensions);
+  const path = resolveSelected ? await resolveSelected(selected, extensions) : selected;
   if (!path) return "cancelled";
   // Resolve the parent before writing, but commit it only after the write succeeds.
   const parent = await dirname(path);
