@@ -204,3 +204,8 @@ dd { margin: 0; color: var(--muted); }
   .example-card-tall .feature-shot img { max-height: 240px; }
   .feature-shot img { box-shadow: 6px 6px 0 color-mix(in srgb, var(--signal) 14%, transparent); }
 }
+
+.coffee-button { display: inline-flex; align-items: center; gap: 0.55rem; min-height: 44px; padding: 0.6rem 1.1rem; border: 2px solid #111111; border-radius: 999px; background: #ffdd00; color: #111111; font-family: var(--font-ui); font-weight: 700; text-decoration: none; }
+.app-hero .hero-support { margin: 0; }
+.coffee-button:hover { background: #ffe94d; }
+.coffee-button:focus-visible { outline: 3px solid var(--blue); outline-offset: 3px; }

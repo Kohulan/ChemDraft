@@ -17,6 +17,10 @@
 </p>
 
 <p align="center">
+  <a href="https://buymeacoffee.com/gassensmith"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me a Coffee" height="45"></a>
+</p>
+
+<p align="center">
   <img src="site/assets/workspace-reaction-scheme.webp" width="760" alt="A Suzuki coupling drawn in ChemDraft">
 </p>
 
