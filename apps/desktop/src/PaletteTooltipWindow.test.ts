@@ -14,6 +14,14 @@ describe("paletteTooltipShowArgs", () => {
       expect(paletteTooltipShowArgs(position, size, platform)).toEqual({ x: 147, y: 100 });
     }
   });
+
+  it("names the palette that asked, so Rust can refuse a reveal for a palette that closed", () => {
+    expect(paletteTooltipShowArgs(position, size, "macos", "core.art"))
+      .toEqual({ x: 147, y: 100, sourceToolsetId: "core.art" });
+    expect(paletteTooltipShowArgs(position, size, "linux", "core.art"))
+      .toEqual({ x: 147, y: 100, width: 105, height: 22, sourceToolsetId: "core.art" });
+    expect(paletteTooltipShowArgs(position, size, "windows")).not.toHaveProperty("sourceToolsetId");
+  });
 });
 
 // The palette tooltip window positions itself in GLOBAL logical coordinates. The clamp

@@ -787,6 +787,12 @@ export function PaletteWindow({
       }
       const previous = lastElement;
       lastElement = element;
+      if (previous && !previous.isConnected) {
+        // The hovered node was re-rendered away under the cursor: a pointerout on a detached node
+        // never reaches React, so its onPointerLeave (the tooltip hide) would be lost. Dismiss
+        // every palette tooltip instead; the pointerover below re-requests one for the new node.
+        dispatchPaletteTooltipDismiss();
+      }
       if (previous) {
         syntheticPointer("pointerout", previous, element);
       }
@@ -801,7 +807,17 @@ export function PaletteWindow({
         unlistenMove = cleanup;
       })
       .catch(() => undefined);
-    void listenForPalettePointerLeave(toolset.id, handleLeave)
+    // The native leave proves the pointer has gone, so dismiss every palette tooltip even when the
+    // synthetic pointerout cannot deliver a leave (its node was re-rendered away, or nothing was
+    // tracked). Rust hides the native tooltip window on the same leave (start_palette_pointer_feed).
+    // Linux already dismisses on this leave (createPaletteTooltipDismissal, PR #488): once is enough.
+    const handleNativeLeave = () => {
+      handleLeave();
+      if (platform !== "linux") {
+        dispatchPaletteTooltipDismiss();
+      }
+    };
+    void listenForPalettePointerLeave(toolset.id, handleNativeLeave)
       .then((cleanup) => {
         unlistenLeave = cleanup;
       })
@@ -812,7 +828,7 @@ export function PaletteWindow({
       unlistenLeave?.();
       handleLeave();
     };
-  }, [toolset.id]);
+  }, [platform, toolset.id]);
 
   // Relay tooltip visibility from the shells (a DOM CustomEvent — ToolPalette stays
   // runtime-agnostic) into the shared floating tooltip window, converting the shell's client rect
@@ -874,7 +890,8 @@ export function PaletteWindow({
           shortcut,
           anchorCenterX: windowPosition.x + anchor.left + (anchor.right - anchor.left) / 2,
           belowY: windowPosition.y + anchor.bottom + 6,
-          aboveY: windowPosition.y + anchor.top - 6
+          aboveY: windowPosition.y + anchor.top - 6,
+          sourceToolsetId: toolset.id
         });
       })().catch(() => undefined);
     };

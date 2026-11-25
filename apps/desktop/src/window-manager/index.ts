@@ -1707,6 +1707,9 @@ export interface PaletteTooltipPayload {
   anchorCenterX: number;
   belowY: number;
   aboveY: number;
+  /** The palette that asked. Rust refuses a reveal whose palette has since closed or hidden, and
+   *  closing a palette hides only its own tooltip (show_toolset_tooltip_window). */
+  sourceToolsetId?: string;
 }
 
 export async function showPaletteFloatingTooltip(payload: PaletteTooltipPayload): Promise<void> {

@@ -63,6 +63,20 @@ it("does not reveal a tooltip whose measurement finished after it was hidden", a
   expect(container.textContent).toBe("");
 });
 
+it("sends the palette that asked with a reveal that finished measuring after its palette closed", async () => {
+  // A keyboard or programmatic close sends no hide here. The reveal still names its palette, so
+  // show_toolset_tooltip_window refuses it once that palette is closed (hidden) on every platform.
+  let finish!: (bounds: { left: number; top: number; right: number; bottom: number }) => void;
+  native.bounds.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+  await act(async () => native.show!({ ...payload("A"), sourceToolsetId: "core.art" }));
+  expect(native.invoke).not.toHaveBeenCalled();
+  await act(async () => finish({ left: 0, top: 0, right: 1920, bottom: 1080 }));
+  expect(native.invoke).toHaveBeenCalledExactlyOnceWith(
+    "show_toolset_tooltip_window",
+    { x: 150, y: 100, sourceToolsetId: "core.art" }
+  );
+});
+
 it("keeps resizing from the webview before showing on macOS and Windows", async () => {
   await act(async () => native.show!(payload("A")));
   expect(native.setSize).toHaveBeenCalledExactlyOnceWith({ width: 100, height: 26 });
