@@ -833,6 +833,110 @@ mod tests {
         }
     }
 
+    fn exported_pixels(svg: String) -> (image::RgbaImage, RasterExportResponse) {
+        let response = rasterize_svg_impl(RasterExportRequest {
+            svg,
+            background: Some("transparent".to_string()),
+            ..request(RasterExportFormat::Png)
+        })
+        .expect("render page with an SVG picture");
+        let pixels = image::load_from_memory(&response.bytes)
+            .expect("decode exported page")
+            .to_rgba8();
+        (pixels, response)
+    }
+
+    #[test]
+    fn svg_pictures_without_a_viewbox_draw_whatever_their_size_attributes() {
+        // Roots with a size and no viewBox, with neither, and with a viewBox and no size.
+        for root in [
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8">"#,
+            r#"<svg xmlns="http://www.w3.org/2000/svg">"#,
+            r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 8 8">"#,
+        ] {
+            let picture = format!(r#"{root}<rect width="100" height="100" fill="red"/></svg>"#);
+            let (pixels, response) =
+                exported_pixels(svg_picture_page(&svg_data_uri(&picture), "image", "href"));
+            assert!(response.warnings.is_empty(), "{root}");
+            assert_eq!(pixels.get_pixel(4, 4).0, [255, 0, 0, 255], "{root}");
+        }
+    }
+
+    #[test]
+    fn svg_pictures_stretch_to_their_frame_with_preserve_aspect_ratio_none() {
+        // A 2:1 picture in a 4:4 frame fills the frame only when stretched.
+        let picture = r##"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="4" viewBox="0 0 8 4" preserveAspectRatio="none"><rect width="8" height="4" fill="#ff0000"/></svg>"##;
+        let page = format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><image href="{}" width="8" height="8" preserveAspectRatio="none"/></svg>"#,
+            svg_data_uri(picture)
+        );
+        let (pixels, response) = exported_pixels(page);
+        assert!(response.warnings.is_empty());
+        for (x, y) in [(1, 1), (6, 1), (1, 6), (6, 6)] {
+            assert_eq!(pixels.get_pixel(x, y).0, [255, 0, 0, 255], "({x}, {y})");
+        }
+    }
+
+    #[test]
+    fn svg_pictures_with_an_embedded_png_draw_their_vectors_and_warn_about_the_png() {
+        // resvg is built without raster-images, so a PNG inside an SVG picture cannot be decoded here.
+        let png = image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 0, 255, 255]));
+        let mut cursor = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(png)
+            .write_to(&mut cursor, ImageFormat::Png)
+            .expect("encode the embedded PNG");
+        let embedded = base64::engine::general_purpose::STANDARD.encode(cursor.into_inner());
+        let picture = format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><rect width="4" height="8" fill="red"/><image href="data:image/png;base64,{embedded}" x="4" width="4" height="8"/></svg>"#
+        );
+        let (pixels, response) =
+            exported_pixels(svg_picture_page(&svg_data_uri(&picture), "image", "href"));
+        assert_picture_warning(&response, RasterExportFormat::Png);
+        assert_eq!(pixels.get_pixel(2, 4).0, [255, 0, 0, 255]);
+        assert_eq!(pixels.get_pixel(6, 4)[3], 0);
+    }
+
+    #[test]
+    fn hrefs_inside_a_nested_svg_picture_never_resolve_host_files_or_urls() {
+        let directory = std::env::temp_dir().join(format!(
+            "chemdraft-export-nested-images-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).expect("create image fixture directory");
+        let image_path = directory.join("fixture.svg");
+        std::fs::write(
+            &image_path,
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><rect width="8" height="8" fill="red"/></svg>"#,
+        )
+        .expect("write real image fixture");
+        let absolute = image_path.to_string_lossy().replace('\\', "/");
+        for href in [
+            absolute.clone(),
+            format!("file:///{absolute}"),
+            "https://example.invalid/fixture.svg".to_string(),
+            "fixture.svg".to_string(),
+        ] {
+            for attribute in ["href", "xlink:href"] {
+                let nested = svg_picture_page(&href, "image", attribute);
+                // The real file exists at the absolute path: only the resolver stands in the way.
+                let (pixels, _) =
+                    exported_pixels(svg_picture_page(&svg_data_uri(&nested), "image", "href"));
+                assert!(
+                    pixels.pixels().all(|pixel| pixel[3] == 0),
+                    "nested picture must not load {href}"
+                );
+            }
+        }
+        // Control: the same nesting with the fixture inlined as data does draw, so the empty
+        // pages above are the resolver's doing and not an artefact of the nesting.
+        let inlined = std::fs::read_to_string(&image_path).expect("read fixture");
+        let nested = svg_picture_page(&svg_data_uri(&inlined), "image", "href");
+        let (pixels, _) =
+            exported_pixels(svg_picture_page(&svg_data_uri(&nested), "image", "href"));
+        assert_eq!(pixels.get_pixel(4, 4).0, [255, 0, 0, 255]);
+        std::fs::remove_dir_all(&directory).expect("remove fixture directory");
+    }
+
     #[test]
     fn bitmap_pictures_nested_in_svg_pictures_warn() {
         let picture = image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 255]));
