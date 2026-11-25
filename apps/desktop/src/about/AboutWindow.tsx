@@ -3,6 +3,7 @@ import packageInfo from "../../package.json";
 import contributorData from "./contributors.json";
 import testerData from "./testers.json";
 import { componentsForPlatform } from "./aboutPlatforms";
+import { versionLabel } from "../appVersionLabel";
 import type { AboutContributor, AboutPlatform, AboutProvenance, AboutTesters } from "./provenanceTypes";
 import "./about.css";
 
@@ -21,14 +22,16 @@ interface AboutWindowProps {
   version: string;
   buildStamp: string;
   error?: string;
-  /** Whose components to list. Defaults to the running platform; tests pass each one. */
+  /** Whose components to list and how to label the version (Linux: "1.2.3β"). Defaults to the running platform; tests pass each one. */
   platform?: AboutPlatform;
+  /** The browser build, which is never a Linux beta: its version is always shown plain, whatever the user agent. */
+  web?: boolean;
   onReady?: () => void;
   onCopy: () => Promise<void>;
   onClose?: () => void;
 }
 
-export function AboutWindow({ version, buildStamp, error, platform, onReady, onCopy, onClose }: AboutWindowProps) {
+export function AboutWindow({ version, buildStamp, error, platform, web, onReady, onCopy, onClose }: AboutWindowProps) {
   const [copyMessage, setCopyMessage] = useState("");
   const [copying, setCopying] = useState(false);
   const [license, setLicense] = useState<{ path: string; heading: string }>();
@@ -69,7 +72,7 @@ export function AboutWindow({ version, buildStamp, error, platform, onReady, onC
       <div className="about-sections">
         <section aria-labelledby="about-section-0">
           <h1 id="about-section-0" tabIndex={-1}>ChemDraft</h1>
-          <p className="about-version">Version {version} <span>Build {buildStamp}</span></p>
+          <p className="about-version">Version {web ? version : versionLabel(version, platform)} <span>Build {buildStamp}</span></p>
           <p><button type="button" disabled={copying} onClick={() => void copyVersion()}>Copy Version</button>{" "}
             <span role="status">{copyMessage}</span>
           </p>
@@ -128,6 +131,8 @@ export function BrowserAboutWindow() {
   const version = packageInfo.version;
   const buildStamp = new URLSearchParams(window.location.search).get("buildStamp")?.slice(0, 128) || __BUILD_STAMP__;
   useEffect(() => { document.title = "About ChemDraft"; }, []);
-  return <AboutWindow version={version} buildStamp={buildStamp}
+  // Only the Linux desktop (Tauri) build is a beta; the browser About and its copied text keep the plain version
+  // on every user agent, including Linux and iPhone, which platform detection would report as Linux.
+  return <AboutWindow version={version} buildStamp={buildStamp} web
     onCopy={() => navigator.clipboard.writeText("ChemDraft " + version + " (build " + buildStamp + ")")} />;
 }

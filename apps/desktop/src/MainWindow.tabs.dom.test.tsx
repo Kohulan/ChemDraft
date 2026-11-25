@@ -51,6 +51,7 @@ import type { DialogMessage } from "./dialogs/dialogProtocol";
 import { nativeDialogTransport, type DialogDelivery } from "./dialogs/dialogTransport";
 import { createPerfProbe, PerfProbe, type PerfRecord } from "./perf/probe";
 import { invoke as nativeInvoke } from "@tauri-apps/api/core";
+import packageInfo from "../package.json";
 
 const perfState = vi.hoisted(() => ({ current: undefined as import("./perf/probe").PerfProbe | undefined }));
 vi.mock("./perf/runtime", async original => ({
@@ -1138,14 +1139,17 @@ describe("documents in one window", () => {
   });
 
   it.each([
-    { platform: "macOS", first: "/tmp/Probe First.chemdraft", renamed: "/tmp/Probe A.chemdraft" },
-    { platform: "Windows", first: "C:\\Drawings\\Probe First.chemdraft", renamed: "C:\\Drawings\\Probe A.chemdraft" }
-  ])("uses the chosen file name for first Save and Save As on $platform", async ({ first, renamed }) => {
+    { platform: "macos", first: "/tmp/Probe First.chemdraft", renamed: "/tmp/Probe A.chemdraft", product: "ChemDraft" },
+    { platform: "windows", first: "C:\\Drawings\\Probe First.chemdraft", renamed: "C:\\Drawings\\Probe A.chemdraft", product: "ChemDraft" },
+    // Owner rule: a Linux beta is named after its parent version plus β.
+    { platform: "linux", first: "/tmp/Probe First.chemdraft", renamed: "/tmp/Probe A.chemdraft", product: `ChemDraft ${packageInfo.version}β` }
+  ] as const)("uses the chosen file name for first Save and Save As on $platform", async ({ platform, first, renamed, product }) => {
+    act(() => root!.unmount()); container.innerHTML = ""; await mount(undefined, false, platform);
     const expectTitle = (name: string, dirty: boolean) => {
       const tab = tabs()[0]!;
       expect(tab.title).toBe(name);
       expect(Boolean(tab.querySelector('[aria-label="Unsaved changes"]'))).toBe(dirty);
-      const title = `${name}${dirty ? " •" : ""} — ChemDraft — ${__WORKTREE_LABEL__}`;
+      const title = `${name}${dirty ? " •" : ""} — ${product} — ${__WORKTREE_LABEL__}`;
       expect(document.title).toBe(title);
       expect(vi.mocked(nativeInvoke).mock.calls.filter(([id]) => id === "plugin:window|set_title").at(-1))
         .toEqual(["plugin:window|set_title", { value: title }]);

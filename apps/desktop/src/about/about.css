@@ -59,8 +59,58 @@
   margin: 0.35rem 0;
 }
 
-.about-window a {
-  color: LinkText;
+/* Link look, matching the Guided Tour's link (tour/TourForm.css .guided-tour-url a): #154c8f text. Focus uses the
+   app's shared focus ring (App.css button:focus-visible), as the adjacent button does. No shared link style exists in ui-kit or App.css. In
+   the dark scheme the light-only Tour blue is too dark, so links follow the system LinkText there.
+   Links inside running text (a contributor's @handle beside the name, a package name) keep a persistent
+   underline: link blue against body text is below 3:1, so color alone cannot mark them. Standalone links
+   (the section nav, the link rows, the tester handle list) are underlined only on hover or keyboard
+   focus. The Read the license buttons in a link row share the standalone look so the row reads as one set. */
+.about-window a,
+.about-window .about-links button {
+  color: #154c8f;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  border-radius: 2px;
+  cursor: pointer;
+}
+
+.about-window nav a,
+.about-window .about-links a,
+.about-window .about-links button,
+.about-window .about-handles a {
+  text-decoration: none;
+}
+
+.about-window .about-links button {
+  padding: 0;
+  border: 0;
+  background: none;
+}
+
+.about-window nav a:hover,
+.about-window nav a:focus-visible,
+.about-window .about-links a:hover,
+.about-window .about-links a:focus-visible,
+.about-window .about-links button:hover,
+.about-window .about-links button:focus-visible,
+.about-window .about-handles a:hover,
+.about-window .about-handles a:focus-visible {
+  text-decoration: underline;
+}
+
+.about-window a:focus-visible,
+.about-window .about-links button:focus-visible {
+  outline: 2px solid var(--cd-accent);
+  outline-offset: 2px;
+  box-shadow: var(--cd-focus-ring);
+}
+
+@media (prefers-color-scheme: dark) {
+  .about-window a,
+  .about-window .about-links button {
+    color: LinkText;
+  }
 }
 
 .about-window button {
