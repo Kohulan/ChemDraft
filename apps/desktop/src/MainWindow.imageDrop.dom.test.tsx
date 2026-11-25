@@ -435,12 +435,17 @@ describe("dropping picture files on the document window", { timeout: 3 * DROP_WA
       await settle();
       expect(dropSubscriptions()).toEqual([`listen ${DOCUMENT_FILE_DROP_EVENT}`]);
       stubLayout(0);
+      // A drop without a position lands at the visible centre, put here past the original page's
+      // right edge but inside the wide page: a handler kept from mount would clamp it to the old page.
+      const centreX = page.width * 1.5;
+      vi.spyOn(canvas(), "clientWidth", "get").mockReturnValue(centreX * 2);
+      vi.spyOn(canvas(), "clientHeight", "get").mockReturnValue(page.height);
       await act(async () => native.events.get(DOCUMENT_FILE_DROP_EVENT)!({ paths: ["/Users/me/Pictures/mol.png"],
-        position: { x: 300, y: 200 }, units: "css", topInsetRemoved: 0 }));
+        position: null, units: "css", topInsetRemoved: 0 }));
       await eventually(() => expect(status()).toBe("Inserted picture mol.png"));
       expect(snapshot().title).toBe("Wide page");
       expect(pictures()).toHaveLength(1);
-      expect(centre(pictures()[0]!)).toEqual({ x: 300, y: 200 });
+      expect(centre(pictures()[0]!)).toEqual({ x: centreX, y: page.height / 2 });
     });
   });
 });
