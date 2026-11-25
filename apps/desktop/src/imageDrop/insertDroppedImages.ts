@@ -11,34 +11,34 @@ export interface PagePointLike { x: number; y: number }
 export interface DropFrame { x: number; y: number; width: number; height: number; scaled: boolean }
 
 /**
- * Centres along one axis for a cascade of `extents` (each no longer than `pageExtent`). Picture `i`
- * sits `i` steps from `point`, towards whichever side of the page has room (down/right by
- * preference). Each picture is sized against its own room, not the batch's: its step shrinks only
- * when its own whole cascade could not fit, and that cascade is shifted as a unit onto the page. So
- * a picture that fills the page does not pin the small pictures beside it to one spot; every picture
- * keeps a position of its own whenever it has room on the page.
+ * Centres along one axis for a cascade of `extents` (each no longer than `pageExtent`). The first
+ * picture is centred on `point` whenever it fits there, and otherwise moved only as far as it must
+ * to lie on the page. Picture `i` sits `i` steps from that same anchor (its own extent's anchor),
+ * down/right by preference, up/left when only that side has room for the whole cascade, and
+ * otherwise towards the roomier side with the step shrunk to the room there. Each picture is sized
+ * against its own room, not the batch's, so a picture that fills the page does not pin the small
+ * pictures beside it to one spot; every picture keeps a position of its own whenever it has room.
  */
 function cascadeCentres(point: number, extents: readonly number[], pageExtent: number, cascade: number): number[] {
-  const count = extents.length;
-  const layout = (direction: 1 | -1) => extents.map((extent, index) => {
-    const room = Math.max(0, pageExtent - extent);
-    const step = count > 1 ? Math.min(cascade, room / (count - 1)) : 0;
-    const last = point + direction * (count - 1) * step;
-    const low = Math.min(point, last) - extent / 2;
-    const high = Math.max(point, last) + extent / 2;
-    const shift = low < 0 ? -low : high > pageExtent ? pageExtent - high : 0;
-    return { centre: point + direction * index * step + shift, shift: Math.abs(shift) };
+  const steps = Math.max(1, extents.length - 1);
+  return extents.map((extent, index) => {
+    const low = extent / 2;
+    const high = Math.max(low, pageExtent - extent / 2);
+    const anchor = Math.min(Math.max(point, low), high);
+    if (index === 0) return anchor;
+    const forward = high - anchor;
+    const backward = anchor - low;
+    const span = steps * cascade;
+    const direction = forward >= span || forward >= backward ? 1 : -1;
+    const step = Math.min(cascade, (direction === 1 ? forward : backward) / steps);
+    return anchor + direction * index * step;
   });
-  const moved = (centres: ReturnType<typeof layout>) => centres.reduce((total, entry) => total + entry.shift, 0);
-  const forward = layout(1);
-  const backward = layout(-1);
-  return (moved(backward) < moved(forward) ? backward : forward).map(entry => entry.centre);
 }
 
 /**
- * Frames for the pictures of one drop. The first is centred on `point`, the rest cascade from it
- * (see `cascadeCentres`). Each keeps its natural size unless larger than the page, when it shrinks
- * uniformly to fit (never grows), and lies wholly on the page.
+ * Frames for the pictures of one drop. The first is centred on `point` where it fits, the rest
+ * cascade from it (see `cascadeCentres`). Each keeps its natural size unless larger than the page,
+ * when it shrinks uniformly to fit (never grows), and lies wholly on the page.
  */
 export function placeDroppedImages(
   page: { width: number; height: number },

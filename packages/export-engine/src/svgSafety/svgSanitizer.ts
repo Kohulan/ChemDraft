@@ -323,10 +323,25 @@ function wouldFuse(text: CssText, previous: CssToken, next: CssToken): boolean {
 }
 
 /**
+ * Whether `token`'s source ends in a hex escape (`\61`), which would take a whitespace character
+ * written straight after it as its own terminator rather than as a separator.
+ */
+function endsInHexEscape(text: CssText, token: CssToken): boolean {
+  const { css } = text;
+  let index = token.end;
+  while (index > token.start && token.end - index < 7 && /[0-9a-fA-F]/.test(css[index - 1]!)) index -= 1;
+  if (index === token.end || token.end - index > 6) return false;
+  let backslashes = 0;
+  while (index - backslashes > token.start && css[index - backslashes - 1] === "\\") backslashes += 1;
+  return backslashes % 2 === 1;
+}
+
+/**
  * The kept text of tokens `[from, to)`, which have been checked: their source, without blanks at
  * either end, comments dropped (`/**\/` only where the tokens on both sides would otherwise fuse,
- * so `rect/**\/.x` stays one selector) and each `url()` written as its checked fragment. Under the
- * `refuse` policy a fragment that must be quoted refuses the picture: the headless renderer misses it.
+ * so `rect/**\/.x` stays one selector, or where a hex escape would take the blank after it) and
+ * each `url()` written as its checked fragment. Under the `refuse` policy a fragment that must be
+ * quoted refuses the picture: the headless renderer misses it.
  */
 function cssSource(text: CssText, from: number, to: number, state?: SvgSanitizeState): string {
   const { tokens, close } = text;
@@ -339,8 +354,9 @@ function cssSource(text: CssText, from: number, to: number, state?: SvgSanitizeS
     if (token.type === "ws") { space += text.css.slice(token.start, token.end); continue; }
     if (token.type === "comment") { comment = true; continue; }
     if (previous) {
-      if (space) out += space;
-      else if (comment && wouldFuse(text, previous, token)) out += "/**/";
+      // `.\61/**/ rect`: written without the comment, the escape would take the space as its own.
+      if (comment && (space ? endsInHexEscape(text, previous) : wouldFuse(text, previous, token))) out += "/**/";
+      out += space;
     }
     space = "";
     comment = false;
@@ -605,8 +621,13 @@ function scanBounds(source: string): string | undefined {
         else if (character === ">") break;
       }
       if (end >= source.length) return "the SVG is not well-formed XML.";
-      if (source[index + 1] === "/") depth -= 1;
-      else if (source[index + 1] !== "!") {
+      if (source[index + 1] === "/") {
+        // A closing tag ends a node already counted at its start tag.
+        depth -= 1;
+        index = end + 1;
+        continue;
+      }
+      if (source[index + 1] !== "!") {
         elements += 1;
         attributes += quoted;
         if (source[end - 1] !== "/") depth += 1;
@@ -636,50 +657,94 @@ function xmlTools(options: SvgSafetyOptions): XmlTools {
   return { parser, serializer };
 }
 
-/** The index past whitespace, the XML declaration, comments and processing instructions from `index`. */
-function skipProlog(source: string, index: number): number {
-  for (;;) {
-    while (index < source.length && (isAsciiSpace(source.charCodeAt(index)) || source.charCodeAt(index) === 0xfeff)) index += 1;
-    const [open, close] = source.startsWith("<?", index) ? ["<?", "?>"] : ["<!--", "-->"];
-    const end = source.startsWith(open, index) ? source.indexOf(close, index + open.length) : -1;
-    if (end < 0) return index;
-    index = end + close.length;
-  }
-}
+const NOT_WELL_FORMED = "the SVG is not well-formed XML.";
+const INTERNAL_SUBSET = "the SVG has a DOCTYPE with an internal subset, which is not allowed.";
 
 const isDoctypeAt = (source: string, index: number) => source.slice(index, index + 9).toUpperCase() === "<!DOCTYPE";
 
 /**
- * The text without its DOCTYPE declaration (one with entities or an internal subset is refused before
- * this), so no parser is ever handed an external identifier it might fetch. Only the prolog is read:
- * whitespace, the XML declaration, comments and processing instructions before it. A second
- * declaration is not well-formed, and is refused (undefined) rather than handed on.
+ * One forward pass over the prolog: whitespace, the XML declaration, comments, processing
+ * instructions and at most one DOCTYPE, up to the root start tag. Returns the text without its
+ * DOCTYPE, so no parser is ever handed an external identifier it might fetch, and where the root
+ * start tag begins in that text; or the reason to refuse: an internal subset (which could declare
+ * entities) or a second DOCTYPE (not well-formed). Nothing after the root start is read, so a
+ * DOCTYPE in a comment, CDATA section or text of the body is only text, and every character is
+ * visited once.
  */
-function withoutDoctype(source: string): string | undefined {
-  const index = skipProlog(source, 0);
-  if (!isDoctypeAt(source, index)) return source;
-  let quote = "";
-  for (let end = index + 9; end < source.length; end += 1) {
-    const character = source[end];
-    if (quote) { if (character === quote) quote = ""; }
-    else if (character === '"' || character === "'") quote = character;
-    else if (character === "[") return source;
-    else if (character === ">") {
-      const rest = source.slice(0, index) + source.slice(end + 1);
-      return isDoctypeAt(rest, skipProlog(rest, index)) ? undefined : rest;
+function readProlog(source: string): { text: string; root: number } | string {
+  let index = 0;
+  let doctype: { start: number; end: number } | undefined;
+  for (;;) {
+    while (index < source.length && (isAsciiSpace(source.charCodeAt(index)) || source.charCodeAt(index) === 0xfeff)) index += 1;
+    const close = source.startsWith("<?", index) ? "?>" : source.startsWith("<!--", index) ? "-->" : undefined;
+    if (close) {
+      const end = source.indexOf(close, index + (close === "?>" ? 2 : 4));
+      if (end < 0) return NOT_WELL_FORMED;
+      index = end + close.length;
+      continue;
     }
+    if (!isDoctypeAt(source, index)) break;
+    if (doctype) return NOT_WELL_FORMED;
+    let quote = "";
+    let end = index + 9;
+    for (; end < source.length; end += 1) {
+      const character = source[end];
+      if (quote) { if (character === quote) quote = ""; }
+      else if (character === '"' || character === "'") quote = character;
+      else if (character === "[") return INTERNAL_SUBSET;
+      else if (character === ">") break;
+    }
+    if (end >= source.length) return NOT_WELL_FORMED;
+    doctype = { start: index, end: end + 1 };
+    index = end + 1;
   }
-  return source;
+  if (!doctype) return { text: source, root: index };
+  return { text: source.slice(0, doctype.start) + source.slice(doctype.end), root: index - (doctype.end - doctype.start) };
+}
+
+/**
+ * `text` with the SVG namespace on the root start tag at `root`: added, or written into an empty
+ * default declaration (`xmlns=""`), which a second declaration would make not well-formed.
+ * Undefined when the tag there is not a plain `<svg` start tag this can read.
+ */
+function withSvgNamespace(text: string, root: number): string | undefined {
+  if (!text.startsWith("<svg", root) || !/^[\t\n\f\r />]$/.test(text[root + 4] ?? "")) return undefined;
+  const skipSpace = (from: number) => {
+    while (from < text.length && isAsciiSpace(text.charCodeAt(from))) from += 1;
+    return from;
+  };
+  let index = root + 4;
+  for (;;) {
+    index = skipSpace(index);
+    if (index >= text.length) return undefined;
+    if (text[index] === ">" || text[index] === "/") break;
+    const nameStart = index;
+    while (index < text.length && !isAsciiSpace(text.charCodeAt(index)) && !"=/>".includes(text[index]!)) index += 1;
+    const name = text.slice(nameStart, index);
+    index = skipSpace(index);
+    if (text[index] !== "=") return undefined;
+    index = skipSpace(index + 1);
+    const quote = text[index];
+    if (quote !== '"' && quote !== "'") return undefined;
+    const valueEnd = text.indexOf(quote, index + 1);
+    if (valueEnd < 0) return undefined;
+    if (name === "xmlns") return text.slice(0, index + 1) + SVG_NS + text.slice(valueEnd);
+    index = valueEnd + 1;
+  }
+  return `${text.slice(0, root + 4)} xmlns="${SVG_NS}"${text.slice(root + 4)}`;
 }
 
 function parseSvg(source: string, xml: XmlTools): Document | string {
   const parsed = xml.parser.parseFromString(source, "image/svg+xml");
-  if (parsed.getElementsByTagName("parsererror").length) return "the SVG is not well-formed XML.";
+  if (parsed.getElementsByTagName("parsererror").length) return NOT_WELL_FORMED;
   return parsed;
 }
 
 function absoluteLengthPx(value: string | null): number | undefined {
-  const match = value?.trim().match(/^([+]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?)\s*(px|pt|pc|in|mm|cm)?$/i);
+  const text = value?.trim();
+  // No length needs more; a long run of digits would make the pattern below backtrack quadratically.
+  if (!text || text.length > 64) return undefined;
+  const match = text.match(/^([+]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?)\s*(px|pt|pc|in|mm|cm)?$/i);
   if (!match) return undefined;
   const scale: Record<string, number> = { px: 1, pt: 96 / 72, pc: 16, in: 96, mm: 96 / 25.4, cm: 96 / 2.54 };
   const result = Number(match[1]) * scale[(match[2] ?? "px").toLowerCase()]!;
@@ -812,18 +877,18 @@ function sanitizeTree(document: Document, state: SvgSanitizeState): void {
 function sanitizeOnce(source: string, xml: XmlTools, refuseOutside: boolean): SvgSanitizeResult {
   if (source.length > MAX_SVG_SOURCE_CHARS) return { ok: false, error: "the SVG text is too large." };
   if (/<!ENTITY/i.test(source)) return { ok: false, error: "the SVG declares XML entities, which are not allowed." };
-  if (/<!DOCTYPE(?:[^>"'[]|"[^"]*"|'[^']*')*\[/i.test(source)) {
-    return { ok: false, error: "the SVG has a DOCTYPE with an internal subset, which is not allowed." };
-  }
+  const prolog = readProlog(source);
+  if (typeof prolog === "string") return { ok: false, error: prolog };
   const bounds = scanBounds(source);
   if (bounds) return { ok: false, error: bounds };
-  const text = withoutDoctype(source);
-  if (text === undefined) return { ok: false, error: "the SVG is not well-formed XML." };
+  const { text, root: rootStart } = prolog;
   let parsed = parseSvg(text, xml);
   if (typeof parsed === "string") return { ok: false, error: parsed };
   // Hand-written SVG often omits its namespace; a picture viewer would not draw it at all.
   if (parsed.documentElement.namespaceURI === null && parsed.documentElement.nodeName === "svg") {
-    parsed = parseSvg(text.replace(/<svg(?=[\s/>])/, `<svg xmlns="${SVG_NS}"`), xml);
+    const repaired = withSvgNamespace(text, rootStart);
+    if (repaired === undefined) return { ok: false, error: NOT_WELL_FORMED };
+    parsed = parseSvg(repaired, xml);
     if (typeof parsed === "string") return { ok: false, error: parsed };
   }
   const root = parsed.documentElement;

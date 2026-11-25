@@ -69,6 +69,13 @@ describe("GIF header size", () => {
     expect(readGifHeaderSize(broken)).toBeUndefined();
     expect(readGifHeaderSize(text("GIF89a\u0000\u0000\u0000\u0000\u0000\u0000\u0000"))).toBeUndefined();
   });
+
+  it("needs the whole colour table and the whole first image descriptor", () => {
+    // 13-byte header, 6-byte colour table, 8-byte control extension, then the 10-byte descriptor at 27.
+    const gif = gifHeader(10, 10);
+    for (const end of [16, 18, 19, 27, 36]) expect(readGifHeaderSize(gif.subarray(0, end)), `${end} bytes`).toBeUndefined();
+    expect(readGifHeaderSize(gif.subarray(0, 37))).toEqual({ width: 10, height: 10 });
+  });
 });
 
 describe("WebP header size", () => {

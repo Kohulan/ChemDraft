@@ -67,7 +67,11 @@ export function readJpegHeaderSize(bytes: Uint8Array): HeaderPixelSize | undefin
   return undefined;
 }
 
-/** The logical screen, widened by the first frame when that frame reaches past it. */
+/**
+ * The logical screen, widened by the first frame when that frame reaches past it. The global colour
+ * table and the first image descriptor (10 bytes) must both be present: a file that ends before them
+ * has no picture to size.
+ */
 export function readGifHeaderSize(bytes: Uint8Array): HeaderPixelSize | undefined {
   if (bytes.length < 13 || !/^GIF8[79]a$/.test(ascii(bytes, 0, 6))) return undefined;
   const u16 = (offset: number) => bytes[offset]! | (bytes[offset + 1]! << 8);
@@ -75,10 +79,11 @@ export function readGifHeaderSize(bytes: Uint8Array): HeaderPixelSize | undefine
   let height = u16(8);
   const flags = bytes[10]!;
   let offset = 13 + ((flags & 0x80) ? 3 * (1 << ((flags & 7) + 1)) : 0);
-  while (offset < bytes.length) {
+  for (;;) {
+    if (offset >= bytes.length) return undefined;
     const block = bytes[offset]!;
     if (block === 0x2c) {
-      if (offset + 9 > bytes.length) return undefined;
+      if (offset + 10 > bytes.length) return undefined;
       width = Math.max(width, u16(offset + 1) + u16(offset + 5));
       height = Math.max(height, u16(offset + 3) + u16(offset + 7));
       break;

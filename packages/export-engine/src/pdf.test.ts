@@ -1067,6 +1067,31 @@ describe("SVG pictures in PDF export", () => {
     expect(result.warnings).toHaveLength(pictures.length - requests.length);
     for (const warning of result.warnings) expect(warning.message).toContain("too many SVG pictures");
   }, 30_000);
+
+  it("gives a failed raster's pixels back to the budget, once, for the pictures after it", async () => {
+    const svgOf = (label: string) => `<svg xmlns="http://www.w3.org/2000/svg" width="1500" height="1500"><desc>${label}</desc></svg>`;
+    const big = (id: string, label: string) => pictureOf(id, "image/svg+xml", { width: 1500, height: 1500, rotation: 0 }, undefined, svgOf(label));
+    // Six failures that would reserve the whole budget, a duplicate of the first (one cached
+    // failure, no second refund), then seven good pictures: six fill the budget exactly.
+    const pictures = [
+      ...Array.from({ length: 6 }, (_, index) => big(`bad-${index}`, `bad ${index}`)),
+      big("bad-again", "bad 0"),
+      ...Array.from({ length: 7 }, (_, index) => big(`good-${index}`, `good ${index}`))
+    ];
+    const good: SvgPictureRasterRequest[] = [];
+    const result = await pdfOf(documentOf(...pictures), async request => {
+      if (request.svg.includes("bad")) throw new Error("renderer crashed");
+      good.push(request);
+      return redPng();
+    });
+    expect(result.warnings.map(warning => warning.message.includes("renderer crashed"))).toEqual([...Array(7).fill(true), false]);
+    expect(result.warnings[7]!.message).toContain("too many SVG pictures");
+    // Six good pictures draw whole; the seventh has no budget left. A second refund for the
+    // duplicate would have let it through.
+    expect(good).toHaveLength(6);
+    expect(good.every(request => request.pixelWidth === 4096 && request.pixelHeight === 4096)).toBe(true);
+    expect(good.reduce((total, request) => total + request.pixelWidth * request.pixelHeight, 0)).toBeLessThanOrEqual(SVG_PICTURE_MAX_RASTER_PIXELS);
+  }, 30_000);
 });
 
 async function withPdfDom<T>(callback: (domParser: DOMParser) => Promise<T>, useStandardTextMetrics = false): Promise<T> {

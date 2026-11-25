@@ -269,9 +269,10 @@ async function rasterizeSvgPicture(
       pixelWidth = Math.max(1, Math.floor(pixelWidth * shrink));
       pixelHeight = Math.max(1, Math.floor(pixelHeight * shrink));
     }
-    budget.pixels += pixelWidth * pixelHeight;
+    const reserved = pixelWidth * pixelHeight;
+    budget.pixels += reserved;
     const size = { pixelWidth, pixelHeight };
-    pending = (async () => {
+    const render = async () => {
       const bytes = Uint8Array.from(atob(image.dataBase64), (char) => char.charCodeAt(0));
       const result = await rasterize({ svg: new TextDecoder().decode(bytes), width: picture.width, height: picture.height, ...size });
       if (!ArrayBuffer.isView(result)) throw new Error("the rasteriser did not return PNG bytes");
@@ -282,7 +283,13 @@ async function rasterizeSvgPicture(
         throw new Error(`the rasteriser returned a ${info!.pixelWidth} x ${info!.pixelHeight} PNG; the limit is ${SVG_PICTURE_MAX_RASTER_SIDE} pixels on a side`);
       }
       return png;
-    })();
+    };
+    // A picture that fails to rasterise gives its pixels back, once: later duplicates reuse this
+    // rejected promise and so never refund again.
+    pending = render().catch((error: unknown) => {
+      budget.pixels -= reserved;
+      throw error;
+    });
     cache.set(key, pending);
   }
   try {

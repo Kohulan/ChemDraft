@@ -49,6 +49,23 @@ describe("placeDroppedImages", () => {
     const full = placeDroppedImages(page, { x: 400, y: 300 }, [page, page]);
     expect(full.map(frame => [frame.x, frame.y])).toEqual([[0, 0], [0, 0]]);
   });
+
+  it("keeps the first of many pictures centred on the drop point, shrinking later steps instead", () => {
+    const sizes = Array.from({ length: 20 }, () => ({ width: 100, height: 100 }));
+    const frames = placeDroppedImages(page, { x: 400, y: 300 }, sizes);
+    expect(frames[0]).toMatchObject({ x: 350, y: 250 });
+    expect(new Set(frames.map(frame => `${frame.x},${frame.y}`)).size).toBe(20);
+    for (const frame of frames) {
+      expect(frame.x).toBeGreaterThanOrEqual(0);
+      expect(frame.y).toBeGreaterThanOrEqual(0);
+      expect(frame.x + frame.width).toBeLessThanOrEqual(page.width + 1e-9);
+      expect(frame.y + frame.height).toBeLessThanOrEqual(page.height + 1e-9);
+    }
+    // Near the bottom edge with room only above: the first stays put, the rest go up.
+    const low = placeDroppedImages(page, { x: 100, y: 500 }, sizes.slice(0, 6));
+    expect(low[0]).toMatchObject({ x: 50, y: 450 });
+    expect(low[5]).toMatchObject({ x: 50 + 5 * DROP_CASCADE_OFFSET, y: 450 - 5 * DROP_CASCADE_OFFSET });
+  });
 });
 
 describe("placeDroppedImages with mixed sizes", () => {

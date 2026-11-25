@@ -168,6 +168,38 @@ describe("sanitizeSvgPicture attacks", () => {
     const result = clean(`<svg width="4" height="2"><rect width="4" height="2"/></svg>`);
     expect(parsed(result.svg).documentElement.namespaceURI).toBe("http://www.w3.org/2000/svg");
   });
+
+  it("adds the namespace on the real root start tag, or fills in an empty default declaration", () => {
+    for (const source of [
+      `<!-- an <svg> sketch --><svg width="4" height="2"><rect width="4" height="2"/></svg>`,
+      `<?pi <svg?><svg width="4" height="2"><rect width="4" height="2"/></svg>`,
+      `<svg xmlns="" width="4" height="2"><rect width="4" height="2"/></svg>`,
+      `<svg width="4" xmlns = '' height="2"><rect width="4" height="2"/></svg>`
+    ]) {
+      const document = parsed(clean(source).svg);
+      expect(document.documentElement.namespaceURI, source).toBe("http://www.w3.org/2000/svg");
+      expect(document.querySelector("rect")?.namespaceURI, source).toBe("http://www.w3.org/2000/svg");
+    }
+  });
+
+  it("counts closing tags only for depth, not as nodes", () => {
+    // 150,000 elements and 150,000 comments: 300,000 nodes, within the limit, though 450,000 tags.
+    const source = `<svg ${NS}>${"<g></g><!---->".repeat(150_000)}</svg>`;
+    const parse = vi.fn(() => new DOMParser().parseFromString("<parsererror/>", "image/svg+xml"));
+    expect(sanitizeSvgPicture(source, { domParser: { parseFromString: parse } })).toEqual({ ok: false, error: "the SVG is not well-formed XML." });
+    expect(parse).toHaveBeenCalledTimes(1);
+    const over = `<svg ${NS}>${"<!---->".repeat(400_000)}</svg>`;
+    expect(sanitizeSvgPicture(over)).toMatchObject({ ok: false, error: expect.stringContaining("comments and other markup nodes") });
+  });
+
+  it("reads the prolog once: an internal subset or a second DOCTYPE is refused, elsewhere it is text", () => {
+    const subset = "the SVG has a DOCTYPE with an internal subset, which is not allowed.";
+    expect(sanitizeSvgPicture(`<!-- x --><?pi?><!DOCTYPE svg SYSTEM "a[.dtd" [ <!ELEMENT svg ANY> ]><svg ${NS}/>`)).toEqual({ ok: false, error: subset });
+    expect(sanitizeSvgPicture(`<!DOCTYPE svg SYSTEM 'a.dtd'><!-- c --><!DOCTYPE svg [ ]><svg ${NS}/>`))
+      .toEqual({ ok: false, error: "the SVG is not well-formed XML." });
+    // After the root start tag a DOCTYPE with brackets is only text in a comment or CDATA section.
+    expect(clean(`<svg ${NS}><!-- <!DOCTYPE x [ --><text><![CDATA[<!DOCTYPE y [ ]]></text></svg>`).svg).toContain("<!DOCTYPE y [");
+  });
 });
 
 describe("sanitizeSvgPicture keeps benign drawings", () => {
@@ -321,7 +353,14 @@ describe("hostile sizes stay linear", () => {
       `<svg ${NS}><rect width="1" height="1" style="fill:${"\\61".repeat(400_000)};stroke:${"(".repeat(500_000)}"/></svg>`,
       `<svg ${NS}><style>rect{fill:${"url(#a)".repeat(200_000)};stroke:${"'x' ".repeat(300_000)}}</style></svg>`,
       // A data URI whose base64 is whitespace, then one bad character.
-      `<svg ${NS}><image href="data:image/png;base64,${" ".repeat(2_000_000)}!" width="1" height="1"/></svg>`
+      `<svg ${NS}><image href="data:image/png;base64,${" ".repeat(2_000_000)}!" width="1" height="1"/></svg>`,
+      // DOCTYPE openings that never close, plain and quoted, and comment openings in the prolog.
+      "<!DOCTYPE".repeat(400_000),
+      `<!DOCTYPE x "${"<!DOCTYPE".repeat(400_000)}`,
+      `${"<!--<!DOCTYPE".repeat(300_000)}`,
+      // A namespace-less root after a prolog full of `<svg`, and a width of two million digits.
+      `<!--${"<svg ".repeat(500_000)}--><svg width="1" height="1"/>`,
+      `<svg ${NS} width="${"1".repeat(2_000_000)}x" height="1"><rect width="1" height="1"/></svg>`
     ];
     for (const source of sources) {
       const started = performance.now();
@@ -466,6 +505,17 @@ describe("CSS comments are dropped without changing what the CSS means", () => {
     expect(sanitizeSvgStylesheet("#a/**/-b{fill:red}")).toBe("#a/**/-b{fill:red}");
     // Written together, `a(` would become a function.
     expect(sanitizeSvgStylesheet("a/**/(b){fill:red}")).toBe("a/**/(b){fill:red}");
+  });
+
+  it("keeps /**/ where a hex escape would otherwise take the blank after it as its terminator", () => {
+    // `.\61 rect` would read back as the one class `.arect`.
+    expect(sanitizeSvgStylesheet(".\\61/**/ rect{fill:red}")).toBe(".\\61/**/ rect{fill:red}");
+    expect(sanitizeSvgStylesheet(".\\61/* c */\trect{fill:red}")).toBe(".\\61/**/\trect{fill:red}");
+    // A blank the escape already ended with, an escaped backslash and seven hex digits need nothing.
+    expect(sanitizeSvgStylesheet(".\\61 /**/ rect{fill:red}")).toBe(".\\61  rect{fill:red}");
+    expect(sanitizeSvgStylesheet(".a\\\\61/**/ rect{fill:red}")).toBe(".a\\\\61 rect{fill:red}");
+    expect(sanitizeSvgStylesheet(".\\1234567/**/ rect{fill:red}")).toBe(".\\1234567 rect{fill:red}");
+    expect(sanitizeSvgStylesheet("rect/**/ .x{fill:red}")).toBe("rect .x{fill:red}");
   });
 
   it("is idempotent where a separator is kept", () => {
