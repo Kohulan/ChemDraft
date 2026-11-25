@@ -136,6 +136,21 @@ describe("sanitizeSvgPicture attacks", () => {
     }
   });
 
+  it("refuses a second DOCTYPE in the prolog before parsing, but not the text elsewhere", () => {
+    const parse = vi.fn((source: string, type: DOMParserSupportedType) => new DOMParser().parseFromString(source, type));
+    const doctype = '<!DOCTYPE svg SYSTEM "a.dtd">';
+    for (const source of [`${doctype}${doctype}<svg ${NS}/>`, `${doctype}\n<!-- x --><?pi y?> <!doctype svg><svg ${NS}/>`]) {
+      parse.mockClear();
+      expect(sanitizeSvgPicture(source, { domParser: { parseFromString: parse } }), source)
+        .toEqual({ ok: false, error: "the SVG is not well-formed XML." });
+      expect(parse).not.toHaveBeenCalled();
+    }
+    for (const source of [`${doctype}<!-- <!DOCTYPE svg> --><svg ${NS}><![CDATA[<!DOCTYPE x>]]><text>&lt;!DOCTYPE svg></text></svg>`,
+      `${doctype}<svg ${NS}><text><![CDATA[<!DOCTYPE svg>]]></text></svg>`]) {
+      expect(sanitizeSvgPicture(source).ok, source).toBe(true);
+    }
+  });
+
   it("drops a DOCTYPE without an internal subset", () => {
     const result = clean(`<?xml version="1.0"?><!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd"><svg ${NS}><rect width="1" height="1"/></svg>`);
     expect(result.svg).not.toContain("DOCTYPE");
@@ -402,11 +417,19 @@ describe("fragment references resolve within the picture", () => {
     expect(refuse(`<svg ${NS}><path id="atom(1)" d="M0 0"/><image href="#atom(1)" width="1" height="1"/></svg>`).ok).toBe(false);
   });
 
+  it("refuses, under the renderer's policy only, an XML fragment to an id with a space, which the exporter cannot resolve", () => {
+    const source = `<svg ${NS}><path id="a b" d="M0 0h1"/><use href="#a b"/></svg>`;
+    expect(refuse(source)).toEqual({ ok: false, error: "the SVG refers to an id containing a space, which the exporter cannot draw." });
+    expect(parsed(clean(source).svg).querySelector("use")!.getAttribute("href")).toBe("#a b");
+    // A space naming nothing is dropped either way, and draws nothing in any renderer.
+    expect(refuse(`<svg ${NS}><use href="#a b"/></svg>`).ok).toBe(true);
+  });
+
   it("writes a CSS url() to an id an unquoted url cannot hold as a quoted string", () => {
     const source = `<svg ${NS}><linearGradient id="g(1)"/><linearGradient id='q"\\'/><style>rect{stroke:url('#g(1)')}</style>`
       + `<rect width="1" height="1" fill="url(#g\\(1\\))" style="fill:url(&quot;#q\\&quot;\\\\&quot;)"/></svg>`;
-    for (const result of [clean(source), refuse(source)]) {
-      if (!result.ok) throw new Error(result.error);
+    {
+      const result = clean(source);
       const document = parsed(result.svg);
       const rect = document.querySelector("rect")!;
       expect(rect.getAttribute("fill")).toBe('url("#g(1)")');
@@ -414,6 +437,15 @@ describe("fragment references resolve within the picture", () => {
       expect(document.querySelector("style")!.textContent).toBe('rect{stroke:url("#g(1)")}');
       expect(result.removedExternal).toBe(false);
     }
+    // The exporter's renderer draws a quoted fragment black: under its policy each place refuses the picture.
+    const quoted = { ok: false, error: "the SVG's style refers to an id that needs quoting, which the exporter cannot draw." };
+    const g = `<svg ${NS}><linearGradient id="g(1)"/>`;
+    expect(refuse(source)).toEqual(quoted);
+    for (const body of [`<rect width="1" height="1" fill="url(#g\\(1\\))"/>`, `<rect width="1" height="1" style="fill:url('#g(1)')"/>`,
+      `<style>rect{fill:url("#g(1)")}</style>`]) {
+      expect(refuse(`${g}${body}</svg>`), body).toEqual(quoted);
+    }
+    expect(refuse(`<svg ${NS}><linearGradient id="g1"/><rect width="1" height="1" fill="url('#g1')"/></svg>`).ok).toBe(true);
   });
 
   it("writes a CSS url() as its checked fragment, with only ASCII whitespace trimmed", () => {

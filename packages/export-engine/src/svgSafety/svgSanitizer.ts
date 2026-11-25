@@ -90,6 +90,9 @@ export const SVG_PICTURE_FORMAT_LABEL: Readonly<Record<string, string>> = {
 };
 const OUTSIDE = "the SVG refers to a file or address outside the picture.";
 const NESTED = "the SVG nests another SVG picture, which is not drawn.";
+/** The headless renderer resolves neither of these, and would draw the picture wrong. */
+const QUOTED_CSS_REFERENCE = "the SVG's style refers to an id that needs quoting, which the exporter cannot draw.";
+const SPACED_REFERENCE = "the SVG refers to an id containing a space, which the exporter cannot draw.";
 
 /** A bitmap the SVG embeds, admitted by its magic bytes and header size. */
 export interface EmbeddedSvgBitmap {
@@ -176,6 +179,12 @@ const isFragmentReference = (target: string) => CSS_FRAGMENT.test(target);
 /** A checked CSS fragment as `url()` text: bare when it can be, else a quoted CSS string. */
 const cssFragmentUrl = (target: string) => `url(${FRAGMENT.test(target) ? target : `"${target.replace(/["\\]/g, "\\$&")}"`})`;
 
+/** {@link cssFragmentUrl}, noting under the `refuse` policy a fragment that has to be quoted. */
+function checkedCssFragmentUrl(target: string, state: SvgSanitizeState | undefined): string {
+  if (state?.refuseOutside && !FRAGMENT.test(target)) state.error ??= QUOTED_CSS_REFERENCE;
+  return cssFragmentUrl(target);
+}
+
 /**
  * The id an XML `href="#…"` names in every renderer, or undefined when they may disagree. A URL parser
  * strips tabs and newlines anywhere, and browsers percent-decode the fragment before matching an id
@@ -255,7 +264,9 @@ function checkedHref(element: string, raw: string, state: SvgSanitizeState): str
     // A same-document fragment loads nothing. One naming nothing, or not the same id in every
     // renderer, draws nothing either way: dropped without a note.
     const id = xmlFragmentId(value);
-    return id !== undefined && state.ids?.has(id) ? value : undefined;
+    if (id === undefined || !state.ids?.has(id)) return undefined;
+    if (state.refuseOutside && id.includes(" ")) state.error ??= SPACED_REFERENCE;
+    return value;
   }
   const data = picture ? parseRasterDataUri(value) : undefined;
   if (!data) {
@@ -314,9 +325,10 @@ function wouldFuse(text: CssText, previous: CssToken, next: CssToken): boolean {
 /**
  * The kept text of tokens `[from, to)`, which have been checked: their source, without blanks at
  * either end, comments dropped (`/**\/` only where the tokens on both sides would otherwise fuse,
- * so `rect/**\/.x` stays one selector) and each `url()` written as its checked fragment.
+ * so `rect/**\/.x` stays one selector) and each `url()` written as its checked fragment. Under the
+ * `refuse` policy a fragment that must be quoted refuses the picture: the headless renderer misses it.
  */
-function cssSource(text: CssText, from: number, to: number): string {
+function cssSource(text: CssText, from: number, to: number, state?: SvgSanitizeState): string {
   const { tokens, close } = text;
   let out = "";
   let previous: CssToken | undefined;
@@ -333,12 +345,12 @@ function cssSource(text: CssText, from: number, to: number): string {
     space = "";
     comment = false;
     if (token.type === "url") {
-      out += cssFragmentUrl(trimUrlSpace(token.value));
+      out += checkedCssFragmentUrl(trimUrlSpace(token.value), state);
       previous = token;
     } else if (token.type === "function" && token.value === "url") {
       let inner = index + 1;
       while (isBlank(tokens[inner]!)) inner += 1;
-      out += cssFragmentUrl(trimUrlSpace(tokens[inner]!.value));
+      out += checkedCssFragmentUrl(trimUrlSpace(tokens[inner]!.value), state);
       index = close[index]!;
       previous = tokens[index]!;
     } else {
@@ -448,7 +460,7 @@ function sanitizeDeclarations(text: CssText, from: number, to: number, state: Sv
       } else if (verdict !== "safe") {
         noteCss(state, verdict!);
       } else {
-        kept.push(cssSource(text, name, end));
+        kept.push(cssSource(text, name, end, state));
       }
     }
     start = end + 1;
@@ -502,7 +514,7 @@ function sanitizeRules(text: CssText, from: number, to: number, state: SvgSaniti
       if (closer < 0 || closer >= to) { noteRemoved(state, "other"); break; }
       const prelude = cssComponentsVerdict(text, start + 1, stop);
       if (KEPT_AT_RULE_BLOCKS.has(first.value) && depth < 8 && prelude === "safe") {
-        out.push(`${cssSource(text, start, stop)}{${sanitizeRules(text, stop + 1, closer, state, depth + 1)}}`);
+        out.push(`${cssSource(text, start, stop, state)}{${sanitizeRules(text, stop + 1, closer, state, depth + 1)}}`);
       } else if (first.value === "font-face" && prelude !== "loads" && fontFaceLoadsNothing(text, stop + 1, closer)) {
         // Installed fonts only: nothing outside the picture is named. Dropped without a note.
       } else {
@@ -528,7 +540,7 @@ function sanitizeRules(text: CssText, from: number, to: number, state: SvgSaniti
     const verdict = cssComponentsVerdict(text, start, open);
     if (verdict !== "safe") noteCss(state, verdict);
     else {
-      const prelude = cssSource(text, start, open);
+      const prelude = cssSource(text, start, open, state);
       if (prelude) out.push(`${prelude}{${sanitizeDeclarations(text, open + 1, closer, state)}}`);
     }
     start = closer + 1;
@@ -559,7 +571,7 @@ export function sanitizeStyleAttribute(value: string, state: SvgSanitizeState): 
 function sanitizePresentationValue(value: string, state: SvgSanitizeState): string | undefined {
   const text = readCss(value, state);
   const verdict = cssComponentsVerdict(text, 0, text.tokens.length);
-  if (verdict === "safe") return cssSource(text, 0, text.tokens.length);
+  if (verdict === "safe") return cssSource(text, 0, text.tokens.length, state);
   noteCss(state, verdict);
   return undefined;
 }
@@ -624,28 +636,38 @@ function xmlTools(options: SvgSafetyOptions): XmlTools {
   return { parser, serializer };
 }
 
-/**
- * The text without its DOCTYPE declaration (one with entities or an internal subset is refused before
- * this), so no parser is ever handed an external identifier it might fetch. Only the prolog is read:
- * whitespace, the XML declaration, comments and processing instructions before it.
- */
-function withoutDoctype(source: string): string {
-  let index = 0;
+/** The index past whitespace, the XML declaration, comments and processing instructions from `index`. */
+function skipProlog(source: string, index: number): number {
   for (;;) {
     while (index < source.length && (isAsciiSpace(source.charCodeAt(index)) || source.charCodeAt(index) === 0xfeff)) index += 1;
     const [open, close] = source.startsWith("<?", index) ? ["<?", "?>"] : ["<!--", "-->"];
     const end = source.startsWith(open, index) ? source.indexOf(close, index + open.length) : -1;
-    if (end < 0) break;
+    if (end < 0) return index;
     index = end + close.length;
   }
-  if (source.slice(index, index + 9).toUpperCase() !== "<!DOCTYPE") return source;
+}
+
+const isDoctypeAt = (source: string, index: number) => source.slice(index, index + 9).toUpperCase() === "<!DOCTYPE";
+
+/**
+ * The text without its DOCTYPE declaration (one with entities or an internal subset is refused before
+ * this), so no parser is ever handed an external identifier it might fetch. Only the prolog is read:
+ * whitespace, the XML declaration, comments and processing instructions before it. A second
+ * declaration is not well-formed, and is refused (undefined) rather than handed on.
+ */
+function withoutDoctype(source: string): string | undefined {
+  const index = skipProlog(source, 0);
+  if (!isDoctypeAt(source, index)) return source;
   let quote = "";
   for (let end = index + 9; end < source.length; end += 1) {
     const character = source[end];
     if (quote) { if (character === quote) quote = ""; }
     else if (character === '"' || character === "'") quote = character;
     else if (character === "[") return source;
-    else if (character === ">") return source.slice(0, index) + source.slice(end + 1);
+    else if (character === ">") {
+      const rest = source.slice(0, index) + source.slice(end + 1);
+      return isDoctypeAt(rest, skipProlog(rest, index)) ? undefined : rest;
+    }
   }
   return source;
 }
@@ -796,6 +818,7 @@ function sanitizeOnce(source: string, xml: XmlTools, refuseOutside: boolean): Sv
   const bounds = scanBounds(source);
   if (bounds) return { ok: false, error: bounds };
   const text = withoutDoctype(source);
+  if (text === undefined) return { ok: false, error: "the SVG is not well-formed XML." };
   let parsed = parseSvg(text, xml);
   if (typeof parsed === "string") return { ok: false, error: parsed };
   // Hand-written SVG often omits its namespace; a picture viewer would not draw it at all.

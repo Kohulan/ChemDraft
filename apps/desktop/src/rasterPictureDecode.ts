@@ -118,6 +118,8 @@ export async function prepareRasterPictures(
   let remainingBytes = budgetBytes;
   // Slots held by SVG pictures the pre-step took on but that did not become a PNG (rasterising failed).
   let failedSlots = 0;
+  // Whether any href was rewritten: an over-count stand-in can come before any picture is sent.
+  let rewritten = false;
   for (const image of Array.from(parsed.getElementsByTagNameNS(SvgNamespace, "image"))) {
     const admitted = beforeDecode && pictures.length + failedSlots < RasterPictureMaxCount
       ? (await beforeDecode(image, remainingBytes)) === true : false;
@@ -129,6 +131,7 @@ export async function prepareRasterPictures(
     if (pictures.length + failedSlots >= RasterPictureMaxCount) {
       // Counted before decoding: past the limit nothing is decoded or sent.
       href.attribute.value = RasterPictureOverCountHref;
+      rewritten = true;
       continue;
     }
     const id = `${prefix}${pictures.length}`;
@@ -143,8 +146,9 @@ export async function prepareRasterPictures(
       href.attribute.value = rasterPicturePlaceholderHref(outcome.width, outcome.height, id);
     }
     image.setAttribute("id", id);
+    rewritten = true;
   }
-  if (pictures.length === 0) return { svg, pictures };
+  if (!rewritten) return { svg, pictures };
   return { svg: new XMLSerializer().serializeToString(parsed), pictures };
 }
 
