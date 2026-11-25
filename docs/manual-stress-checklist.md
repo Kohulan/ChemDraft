@@ -2054,3 +2054,13 @@ lossy and a lossless WebP, an SVG with gradients and `<use href="#id">`, a BMP, 
   every floating palette, a popover, the Preferences and Export dialogs, and (web build) anywhere
   in the page. The app never replaces itself with the file or URL; text can still be dropped into a
   text field, but a link dropped on a read-only part inside an editable area does not navigate.
+
+## Status line over the rulers (macOS and Windows, 1.2.3)
+
+Status line clear of the rulers: with rulers on, drop a picture (status "Inserted picture …") and
+hold Shift with a selection (hint "⇧: show rotate handles" on macOS, "Shift: show rotate handles" on Windows). The
+status, the hint and a warnings count start right of the vertical ruler, never over its ticks, and
+each sits on a panel-coloured background that reads over the page. Turn rulers off: the status moves
+back to the window's left margin with no gap. Shrink the window to its narrowest: a long status ends
+in an ellipsis inside the window, still right of the ruler and never over the top ruler. With no
+status, no empty chip shows. Check on Windows and both macOS builds, at 100% and 150% display scale.

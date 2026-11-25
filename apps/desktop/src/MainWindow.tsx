@@ -24790,8 +24790,11 @@ export function MainWindow({
         ) : null}
         {/* One row along the bottom of the workspace: the status (its text truncating), the warnings
             count and the modifier hint on the left, the build stamp on the right, giving way first (App.css).
-            Positioned apart, a long status or a branch build's long stamp ran one into the other. */}
-        <div ref={statusRowRef} className="status-row" data-status-row>
+            Positioned apart, a long status or a branch build's long stamp ran one into the other.
+            With rulers on it starts past the vertical ruler (the same RULER_THICKNESS the ruler is drawn at),
+            which it used to cover. */}
+        <div ref={statusRowRef} className="status-row" data-status-row
+          style={rulersVisible ? { paddingLeft: RULER_THICKNESS } : undefined}>
           <div className="status-row-main">
             <span data-status-message role="status" aria-live="polite" className="status-message"
               title={spin3dErrorMessage ?? (interactive3dWorkspace ? interactive3dWorkspaceStatusText({
