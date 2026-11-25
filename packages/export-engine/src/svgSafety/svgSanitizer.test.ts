@@ -200,6 +200,27 @@ describe("sanitizeSvgPicture attacks", () => {
     // After the root start tag a DOCTYPE with brackets is only text in a comment or CDATA section.
     expect(clean(`<svg ${NS}><!-- <!DOCTYPE x [ --><text><![CDATA[<!DOCTYPE y [ ]]></text></svg>`).svg).toContain("<!DOCTYPE y [");
   });
+
+  it("fails closed on a prolog it cannot read: only a start tag may follow it, and XML 1.1 is refused", () => {
+    const parse = vi.fn((source: string, type: DOMParserSupportedType) => new DOMParser().parseFromString(source, type));
+    const subset = '<!DOCTYPE svg [ <!ELEMENT svg ANY> ]>';
+    const notWellFormed = { ok: false, error: "the SVG is not well-formed XML." };
+    // XML 1.1 reads U+0085 and U+2028 as line ends, so a DOCTYPE after one would reach the parser.
+    for (const space of ["\u0085", "\u2028"]) {
+      expect(sanitizeSvgPicture(`<?xml version="1.1"?>${space}${subset}<svg ${NS}/>`, { domParser: { parseFromString: parse } }))
+        .toEqual({ ok: false, error: "the SVG is XML 1.1, which is not supported; save it as XML 1.0." });
+      expect(sanitizeSvgPicture(`<?xml version="1.0"?>${space}${subset}<svg ${NS}/>`, { domParser: { parseFromString: parse } }))
+        .toEqual(notWellFormed);
+    }
+    for (const source of [`<?xml encoding="UTF-8"?><svg ${NS}/>`, `text<svg ${NS}/>`, `<![CDATA[x]]><svg ${NS}/>`, `<!ELEMENT svg ANY><svg ${NS}/>`,
+      `<!DOCTYPE svg SYSTEM "a.dtd"> <1svg ${NS}/>`, "  ", `<!-- x -->`]) {
+      expect(sanitizeSvgPicture(source, { domParser: { parseFromString: parse } }), source).toEqual(notWellFormed);
+    }
+    expect(parse).not.toHaveBeenCalled();
+    // A declaration of 1.0, a style sheet instruction and a name starting past ASCII still read.
+    expect(sanitizeSvgPicture(`<?xml version='1.0' encoding="UTF-8"?><?xml-stylesheet href="a.css"?><svg ${NS}/>`).ok).toBe(true);
+    expect(sanitizeSvgPicture('<\u00e9l/>')).toEqual({ ok: false, error: "the file is not an SVG document (its root element is <\u00e9l>)." });
+  });
 });
 
 describe("sanitizeSvgPicture keeps benign drawings", () => {
@@ -243,6 +264,9 @@ describe("sanitizeSvgPicture keeps benign drawings", () => {
     expect(parsed(clean(`<svg ${NS} width="20" height="10" viewBox="0 0 2 1"/>`).svg).documentElement.getAttribute("viewBox"))
       .toBe("0 0 2 1");
     expect(parsed(clean(`<svg ${NS} width="100%" height="10"/>`).svg).documentElement.hasAttribute("viewBox")).toBe(false);
+    // A valid length is read whatever its length.
+    expect(parsed(clean(`<svg ${NS} width="${"0".repeat(5_000)}20.${"0".repeat(5_000)}" height="${"1".repeat(100)}e-98pt"/>`).svg)
+      .documentElement.getAttribute("viewBox")).toBe("0 0 20 14.8148");
   });
 
   it("is idempotent: sanitizing its own output changes nothing", () => {

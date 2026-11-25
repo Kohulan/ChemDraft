@@ -15,3 +15,4 @@ export {
   type HeaderPixelSize, type RasterHeaderFormat, type SniffedImageFormat
 } from "./imageSniff";
 export { pictureSizeLimitError } from "./pixelLimits";
+export { parseSvgLength } from "./svgLength";

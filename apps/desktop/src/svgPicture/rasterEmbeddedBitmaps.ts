@@ -1,3 +1,4 @@
+import { parseSvgLength } from "@chemdraft/export-engine";
 import type { SvgPictureRasterRequest } from "@chemdraft/export-engine/pdf";
 import { bytesToBase64, RasterPictureMaxSidePx, type RasterPicturePreStep } from "../rasterPictureDecode";
 
@@ -127,8 +128,8 @@ function decodeSvgDataUri(uri: string): string | undefined {
 const LengthUnits: Record<string, number> = { "": 1, px: 1, pt: 96 / 72, pc: 16, in: 96, cm: 96 / 2.54, mm: 96 / 25.4 };
 
 function lengthInPixels(value: string | null): number | undefined {
-  const match = /^\s*([+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?)\s*([a-z]*)\s*$/i.exec(value ?? "");
-  const length = match ? Number(match[1]) * (LengthUnits[match[2].toLowerCase()] ?? NaN) : NaN;
+  const parsed = parseSvgLength(value ?? "");
+  const length = parsed ? parsed.value * (LengthUnits[parsed.unit.toLowerCase()] ?? NaN) : NaN;
   return length > 0 ? length : undefined;
 }
 

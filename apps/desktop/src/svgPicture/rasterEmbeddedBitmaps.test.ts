@@ -74,6 +74,17 @@ describe("embeddedBitmapPictureStep", () => {
     expect(rasterize.mock.calls[0]![0]).toMatchObject({ width: 40, height: 20, pixelWidth: 40 * (4 / 3) * 0.5 * 3, pixelHeight: 20 * (4 / 3) * 0.5 * 3 });
   });
 
+  it("reads the root size in linear time, and a long valid length whole", async () => {
+    const rasterize = rasterizer();
+    const bitmap = picture(dataUri(BITMAP_SVG()), 'x="0" y="0" width="200" height="100"');
+    const started = performance.now();
+    // Fifty thousand digits and a stray character: a backtracking pattern takes seconds here.
+    await prepare(page([bitmap], `width="${"1".repeat(50_000)}!" height="1" viewBox="0 0 200 100"`), { rasterize });
+    expect(performance.now() - started).toBeLessThan(1500);
+    await prepare(page([bitmap], `width="${"0".repeat(5_000)}400" height="200.${"0".repeat(5_000)}" viewBox="0 0 200 100"`), { rasterize });
+    expect(rasterize.mock.calls.at(-1)![0]).toMatchObject({ pixelWidth: 400, pixelHeight: 200 });
+  });
+
   it("applies the longest-side clamp Rust applies, and the picture side limit", async () => {
     const rasterize = rasterizer();
     const svg = page([picture(dataUri(BITMAP_SVG()), 'x="0" y="0" width="200" height="100"')]);
