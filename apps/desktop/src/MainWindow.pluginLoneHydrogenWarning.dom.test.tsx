@@ -201,6 +201,32 @@ describe("a plugin insert whose lone-H cache refresh is declined", () => {
     expect(status().split("Kept the stored chemistry")).toHaveLength(2);
   }, 20_000);
 
+  it.each([
+    ["throws", async () => { throw new Error("boom after insert"); }],
+    ["returns { ok: false }", async () => ({ ok: false, error: { code: "test.failed", message: "boom after insert" } })]
+  ] as const)("keeps a committed write's warning in the failure status when the menu command then %s", async (_how, fail) => {
+    const blank = createEmptyDocument();
+    const port = await mount(blank);
+    const pageId = blank.pages[0]!.id;
+    act(() => captured.runtime!.registerPlugin({ id: "org.chemdraft.loneHydrogenTest", name: "Lone H test", version: "0.1.0",
+      apiVersion: "^0.1.14", entry: "test.js", permissions: ["document.write"], contributes: { commands: [{ id: command, title: "Test" }] }
+    }, { commandHandlers: { [command]: async (context: PluginCommandContext) => {
+      await context.documents.applyPatch!({ reason: "Insert structure", patch: { op: "addObject", pageId, object: declined() } });
+      return fail();
+    } } }));
+    await act(async () => { window.dispatchEvent(new CustomEvent(DOM_COMMAND_EVENT, { detail: { commandId: command } })); });
+    await vi.waitFor(async () => {
+      await act(async () => {});
+      expect(status()).toContain("Plugin command failed: boom after insert");
+    }, { timeout: 15_000 });
+    // The insert committed and stays on the canvas, so its warning stays in the status beside the failure.
+    expect(inserted(port.read("initial")!, "kept")?.chemistry?.stereochemistry).toEqual(["atom 0 (S)"]);
+    expect(status()).toMatch(/^Lone H test: inserted structure\. Kept the stored chemistry of molecule "kept": /);
+    expect(status()).toContain(reason);
+    expect(status().split("Kept the stored chemistry")).toHaveLength(2);
+    expect(status().endsWith("Plugin command failed: boom after insert")).toBe(true);
+  }, 20_000);
+
   it("adds nothing to the status for a lone H it refreshes, written directly or accepted", async () => {
     const blank = createEmptyDocument();
     const port = await mount(blank);

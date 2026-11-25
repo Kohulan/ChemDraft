@@ -406,7 +406,8 @@ export function applyPluginDocumentPatch(
   // for the drawing) is named to the user, and verified as stored below.
   const refresh = rederiveImpliedRadicalChemistryOf(patched, writePatchOps(proposed.patch).flatMap(op =>
     op.op === "addObject" && op.object.type === "molecule" ? [{ pageId: op.pageId, objectId: op.object.id }] : []),
-  { occasion: "on plugin insert" });
+  // The commit's verification (`refreshPluginPatchChemistry`) checks a kept CTAB against the drawing.
+  { occasion: "on plugin insert", storedCtabVerified: true });
   patched = refresh.document;
   const warnings = refresh.declined.map(({ objectId, text }) => `Kept the stored chemistry of molecule "${objectId}": ${text}`);
   // Record each touched object by page and id: the page an insertion names, and the page chem-core's

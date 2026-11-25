@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createEmptyDocument, type MoleculeAtom, type MoleculeBond, type MoleculeObject } from "@chemdraft/chem-core";
+import { createEmptyDocument, moleculeToMolfileV2000, type MoleculeAtom, type MoleculeBond, type MoleculeObject } from "@chemdraft/chem-core";
 import { ProposedDocumentPatchSchema } from "@chemdraft/plugin-api";
 import { rebasePluginPatch } from "@chemdraft/plugin-host";
 import { normalizeCommittedDocument, refreshNativeSingleBondGraph, type ImpliedRadicalRefreshTarget } from "../documentWorkflow";
@@ -275,6 +275,56 @@ describe("verifying a plugin insert of a lone H's cache", () => {
     const kept = document.pages[0]!.objects.find((candidate): candidate is MoleculeObject => candidate.type === "molecule")!;
     expect(kept.chemistry?.stereochemistry).toEqual(["atom 0 (S)"]);
   }, 60_000);
+
+  // Ethane beside a lone H whose stored structure is a V2000 molfile carrying the H's radical as an
+  // `M  RAD` doublet (RDKit reads CC.[H], the drawing), beside today's chemistry record. It already
+  // states the drawing: the refresh leaves it to the verifier, which reads it as the drawing.
+  const radicalCtab = (radicals: string) => {
+    const drawn = ethane("CC.[H]");
+    const molfile = moleculeToMolfileV2000(drawn, { kekuleBondOrders: new Map() }).contents.replace("M  END", `${radicals}\nM  END`);
+    return { ...drawn, ...refreshedAt123(drawn), structureFormat: "molfile-v2000" as const, structure: molfile };
+  };
+
+  it.each([false, true])("keeps an M  RAD doublet molfile that states the drawing, with no warning, and the verifier accepts it (accepted: %s)", async (accepted) => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const stored = radicalCtab("M  RAD  1   3   2");
+    expect(stored.chemistry?.radicalCount).toBe(1);
+    const { applied, inserted, normalized, verified } = verify(stored, accepted);
+    expect(applied.warnings).toEqual([]);
+    expect(cacheOf(inserted())).toEqual(cacheOf(stored));
+    const document = (await verified) ?? normalized;
+    const kept = document.pages[0]!.objects.find((candidate): candidate is MoleculeObject => candidate.type === "molecule")!;
+    expect(kept.structure).toBe(stored.structure);
+    expect(kept.chemistry?.radicalCount).toBe(1);
+    expect(warn).not.toHaveBeenCalled();
+  }, 60_000);
+
+  it.each([
+    ["a doublet on a carbon instead of the H", "M  RAD  1   1   2", /stored structure doesn't match the drawn atoms/],
+    ["a triplet on the H (its spin cannot be checked)", "M  RAD  1   3   3", /stored structure carries annotations that can't be checked/]
+  ])("refuses an M  RAD molfile with %s", async (_what, radicals, refusal) => {
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const { inserted, verified } = verify(radicalCtab(radicals), false);
+    expect(inserted().structure).toContain(radicals);
+    expect(verified).toBeDefined();
+    await expect(verified!).rejects.toThrow(refusal);
+  }, 60_000);
+
+  // (The commit's verification then refuses any dative bond, which a V2000 molfile cannot carry; only
+  // the refresh is checked here.)
+  it.each([false, true])("refreshes a dative Fe–D beside a lone H as the H2 reading stored it ([2HH][Fe].[HH]), with no warning (accepted: %s)", (accepted) => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const stored = moleculeOf("dative", [atom("d", "D", 300), atom("fe", "Fe", 315), atom("lone", "H", 350)],
+      [bond("coord", "d", "fe", { bondStyle: "dashed" })], "[2HH][Fe].[HH]", record("H3DFe", 60.883, 60.97251, 3, 1, { isotopeLabels: ["2H"] }));
+    const before = createEmptyDocument();
+    const applied = (accepted ? applyAcceptedPluginProposal : applyPluginDocumentPatch)(before, insert(before.pages[0]!.id, stored));
+    const inserted = applied.document.pages[0]!.objects.find((candidate): candidate is MoleculeObject => candidate.type === "molecule")!;
+    expect(applied.warnings).toEqual([]);
+    expect(cacheOf(inserted)).toEqual(refreshedAt123(stored));
+    expect(inserted.structure).toBe("[2H][Fe].[H]");
+    expect(inserted.chemistry?.formula).toBe("HDFe");
+    expect(warn).not.toHaveBeenCalled();
+  });
 
   it("names only the kept molecule when it is inserted beside a refreshed one", () => {
     vi.spyOn(console, "warn").mockImplementation(() => undefined);

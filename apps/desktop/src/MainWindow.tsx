@@ -737,6 +737,7 @@ import {
   findForeignNativeMoleculeBondTarget,
   openNativeDocument,
   openedDocumentRenumberedObjectIds,
+  openedDocumentWarnings,
   previewNativeMoleculeBondGrowth,
   nativeBondDragSourceAtomId,
   previewNativeMoleculeFreeformBondGrowth,
@@ -10760,11 +10761,13 @@ export function MainWindow({
     const sourceLabel = typeof contents === "string"
       ? openSourceLabel(resolvedOpen.source, resolvedOpen.statusSourceLabel)
       : openSourceLabel(resolvedOpen.source, resolvedOpen.statusSourceLabel).replaceAll("CDXML", "CDX");
-    const warningsReport = { displayName, sourceLabel, warnings: opened.warnings };
+    // A visible-layer conflict reports only the installed candidate's lone-H warnings.
+    const installedWarnings = openedDocumentWarnings(opened, resolvedOpen.document);
+    const warningsReport = { displayName, sourceLabel, warnings: installedWarnings };
     tabWarningsRef.current = warningsReport;
     setOpenWarningsReport(warningsReport);
     const openStatus = options?.statusOverride
-      ?? formatOpenStatus(displayName, sourceLabel, opened.warnings);
+      ?? formatOpenStatus(displayName, sourceLabel, installedWarnings);
     setStatus(fitRecommendation
       ? `${openStatus}; imported content exceeds ${pageFitPromptLayoutLabel(fitRecommendation.currentPageTitle, fitRecommendation.currentOrientation)}`
       : openStatus);
@@ -11318,6 +11321,9 @@ export function MainWindow({
               const opened = openNativeDocument(session.contents);
               const resolved = await resolveOpenResultDocument(opened);
               if (!resolved) throw new Error(formatOpenFailure(opened.warnings));
+              // Read before the headers below replace the installed document: a visible-layer
+              // conflict reports only the installed candidate's lone-H warnings.
+              const installedWarnings = openedDocumentWarnings(opened, resolved.document);
               // Autosave uses the ordinary feature-based writer, which can legitimately drop a
               // format-only header. Restore the source headers so its notice matches File > Open,
               // including on later relaunches, without changing that writer's compatibility rules.
@@ -11329,7 +11335,7 @@ export function MainWindow({
               ));
               const reports = restoreSessionWarningReports(session, {
                 displayName: session.displayName, sourceLabel: openSourceLabel(resolved.source, resolved.statusSourceLabel),
-                warnings: opened.warnings
+                warnings: installedWarnings
               });
               restored.push({ session, opened, resolved, history, reports, candidateIndex, id: crypto.randomUUID() });
             } catch {
@@ -14525,12 +14531,15 @@ export function MainWindow({
       pluginCommandGenerationsRef.current.set(queueKey, generation);
       const previous = pluginCommandQueuesRef.current.get(queueKey) ?? Promise.resolve();
       setPendingPluginCommands(current => new Set(current).add(queueKey));
+      // Collected per invocation: the status of each write this run commits with a warning. Kept on
+      // failure too, since a committed write stays on the canvas whatever the command does next.
+      const writeWarningStatuses: string[] = [];
+      const failedStatus = (message: string) => [...writeWarningStatuses, `Plugin command failed: ${message}`].join(" ");
       const run = previous
         .catch(() => undefined)
         .then(async () => {
           // Collected per invocation: only this command's own selection reads can add to it.
           const selectionWarnings: string[] = [];
-          const writeWarningStatuses: string[] = [];
           pluginWriteWarningStatusesRef.current.set(commandId, writeWarningStatuses);
           let result: unknown;
           try {
@@ -14545,7 +14554,7 @@ export function MainWindow({
           }
           const failure = pluginCommandFailure(result);
           if (failure) {
-            setStatus(`Plugin command failed: ${failure}`);
+            setStatus(failedStatus(failure));
             if (analyzerOwned && owner) showAnalyzerNotice(owner.id, owner.name, failure);
           } else {
             // A run that went through supersedes whatever this analyzer refused earlier.
@@ -14562,7 +14571,7 @@ export function MainWindow({
             return;
           }
           const message = error instanceof Error ? error.message : String(error);
-          setStatus(`Plugin command failed: ${message}`);
+          setStatus(failedStatus(message));
           if (analyzerOwned && owner) showAnalyzerNotice(owner.id, owner.name, message);
         });
       let tracked: Promise<void>;

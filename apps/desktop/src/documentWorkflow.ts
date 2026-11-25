@@ -107,6 +107,7 @@ import {
   pageLayoutSourceUnit,
   flattenPerspectiveFrom3D,
   atomImpliedRadicalCount,
+  atomStatedHydrogenCount,
   isDativeBond,
   isEngineDocument,
   isMetalSymbol,
@@ -8398,11 +8399,15 @@ export interface ImpliedRadicalCacheDecline {
  * the caller can attribute each warning to its molecule; each is also logged, like every refresh.
  * A target that is not a molecule, or not on that page, is ignored. The document comes back as the
  * same instance when nothing was refreshed.
+ *
+ * `storedCtabVerified`: the caller verifies each target's stored CTAB against its drawing before it
+ * commits (a plugin insert: `refreshPluginPatchChemistry`), so a CTAB beside a chemistry record that
+ * already states today's reading is left to that check, with no warning (`statesTodaysReading`).
  */
 export function rederiveImpliedRadicalChemistryOf(
   document: ChemDraftDocument,
   targets: Iterable<ImpliedRadicalRefreshTarget>,
-  options: { occasion?: string } = {}
+  options: { occasion?: string; storedCtabVerified?: boolean } = {}
 ): { document: ChemDraftDocument; declined: ImpliedRadicalCacheDecline[] } {
   const idsByPage = new Map<string, Set<string>>();
   for (const { pageId, objectId } of targets) {
@@ -8419,7 +8424,8 @@ export function rederiveImpliedRadicalChemistryOf(
       return ids ? (objectId) => ids.has(objectId) : undefined;
     },
     options.occasion ?? "on plugin insert",
-    (pageId, objectId, text) => { declined.push({ pageId, objectId, text }); }
+    (pageId, objectId, text) => { declined.push({ pageId, objectId, text }); },
+    options.storedCtabVerified === true
   );
   return { document: refreshed, declined };
 }
@@ -8427,12 +8433,14 @@ export function rederiveImpliedRadicalChemistryOf(
 /**
  * The refresh itself. `select(pageId)` names which objects of that page to consider (undefined: skip
  * the page unvisited); `onDeclined` hears each molecule kept as stored, after its console warning.
+ * `storedCtabVerified` as in `rederiveImpliedRadicalChemistryOf`.
  */
 function rederiveImpliedRadicalCaches(
   document: ChemDraftDocument,
   select: (pageId: string) => ((objectId: string) => boolean) | undefined,
   occasion: string,
-  onDeclined: (pageId: string, objectId: string, text: string) => void
+  onDeclined: (pageId: string, objectId: string, text: string) => void,
+  storedCtabVerified = false
 ): ChemDraftDocument {
   let changed = false;
   const pages = document.pages.map((page) => {
@@ -8442,7 +8450,7 @@ function rederiveImpliedRadicalCaches(
     const objects = page.objects.map((object) => {
       if (object.type !== "molecule" || !selected(object.id)) return object;
       try {
-        const refresh = impliedRadicalCacheRefresh(object);
+        const refresh = impliedRadicalCacheRefresh(object, storedCtabVerified);
         if (refresh.kind === "unchanged") return object;
         if (refresh.kind === "declined") {
           // Kept exactly as stored, and said so: never a partly refreshed, contradictory cache.
@@ -8491,29 +8499,58 @@ type ImpliedRadicalCacheRefresh =
  * What re-deriving `object`'s lone-H cache does. Nothing stored is parsed; stored values are only
  * compared, string for string, with what the native writer writes:
  * 1. no lone H (`atomImpliedRadicalCount`), or a cache the native derivation (`derived`) already
- *    reproduces (structure, format and chemistry record, compared as release/1.2.3 compares them):
+ *    reproduces (structure, format, chemistry record, compared as release/1.2.3 compares them, and
+ *    a cached SMILES copy `compatibility.unknown.smiles`, absent, empty or today's structure):
  *    unchanged;
- * 2. a cache that is ChemDraft's own output for this drawing under an earlier lone-H reading
- *    (`earlierLoneHydrogenReadings`; `storedCacheIs`: every field the refresh would write equals that
- *    reading's, a field absent in storage counting as equal): refreshed to the derivation's structure,
- *    format and chemistry record, and a cached SMILES copy (`compatibility.unknown.smiles`) to its
- *    structure. The stored record was the native writer's own non-isomeric output, so nothing is lost;
- * 3. anything else (stereo, a molfile, other chemistry, a record the native writer would not have
- *    written): declined, so the molecule keeps its whole stored cache and the caller warns.
+ * 2. a cache that is ChemDraft's own output for this drawing under ONE earlier lone-H reading
+ *    (`earlierLoneHydrogenReadings`, each reading applied to every hydrogen atom it read differently;
+ *    `storedCacheIs`: every field the refresh would write equals that reading's, a field absent in
+ *    storage counting as equal): refreshed to the derivation's structure, format and chemistry
+ *    record, and a cached SMILES copy to its structure. The stored record was the native writer's own
+ *    non-isomeric output, so nothing is lost;
+ * 3. a cache that already states today's reading (`statesTodaysReading`): unchanged, kept as stored
+ *    with no warning. With `storedCtabVerified` (a plugin insert, whose verifier checks a stored
+ *    CTAB against the drawing before it commits) that includes a stored CTAB beside a record stating
+ *    today's reading;
+ * 4. anything else (stereo, other chemistry, a mix of readings, a record the native writer would not
+ *    have written): declined, so the molecule keeps its whole stored cache and the caller warns.
  * May throw (the derivation).
  */
-function impliedRadicalCacheRefresh(object: MoleculeObject): ImpliedRadicalCacheRefresh {
+function impliedRadicalCacheRefresh(object: MoleculeObject, storedCtabVerified = false): ImpliedRadicalCacheRefresh {
   if (!object.atoms.some((atom) => atomImpliedRadicalCount(atom, object.bonds) > 0)) return { kind: "unchanged" };
   const derived = refreshNativeSingleBondGraph(object, object.atoms, object.bonds);
+  const copy: unknown = object.compatibility?.unknown.smiles;
   if (derived.structure === object.structure && derived.structureFormat === object.structureFormat &&
-      JSON.stringify(derived.chemistry) === JSON.stringify(object.chemistry)) return { kind: "unchanged" };
-  if (!earlierLoneHydrogenReadings(derived).some((reading) => storedCacheIs(object, reading))) return { kind: "declined" };
+      JSON.stringify(derived.chemistry) === JSON.stringify(object.chemistry) &&
+      (copy === undefined || copy === "" || copy === derived.structure)) return { kind: "unchanged" };
+  if (!earlierLoneHydrogenReadings(derived).some((reading) => storedCacheIs(object, reading))) {
+    return statesTodaysReading(object, derived, storedCtabVerified) ? { kind: "unchanged" } : { kind: "declined" };
+  }
   const cache = { structureFormat: derived.structureFormat, structure: derived.structure, chemistry: derived.chemistry };
   const compatibility = object.compatibility;
-  const copy = compatibility?.unknown.smiles;
   // `storedCacheIs` proved a present copy to be the earlier reading's structure: it takes today's.
   if (!compatibility || typeof copy !== "string" || copy === "" || copy === derived.structure) return { kind: "refreshed", cache };
   return { kind: "refreshed", cache: { ...cache, compatibility: { ...compatibility, unknown: { ...compatibility.unknown, smiles: derived.structure } } } };
+}
+
+/**
+ * Step 3 of `impliedRadicalCacheRefresh`: whether `object`'s stored cache already states today's
+ * reading of its drawing, so there is nothing to refresh and nothing to warn about: every stored
+ * field the refresh compares equals today's derivation (`storedCacheIs`; an empty structure or copy
+ * and an absent record field count as equal). Nothing stored is parsed.
+ *
+ * A stored CTAB (molfile V2000 or V3000) cannot be compared: the native writer writes SMILES only,
+ * so the refresh never wrote that CTAB and never replaces it. Only where the caller verifies it
+ * against the drawing before committing (`storedCtabVerified`: a plugin insert, whose verifier
+ * reads it with RDKit and refuses it unless it reads as the drawing) is it left to that check, and
+ * only beside a chemistry record that states the radical count, so the record itself reads the
+ * lone H as H•. Anywhere else (open, restore, paste: nothing verifies it) such a molecule is
+ * declined, so the user is told its cache was kept.
+ */
+function statesTodaysReading(object: MoleculeObject, derived: MoleculeObject, storedCtabVerified: boolean): boolean {
+  const ctab = object.structure !== "" && (object.structureFormat === "molfile-v2000" || object.structureFormat === "molfile-v3000");
+  if (ctab && (!storedCtabVerified || object.chemistry?.radicalCount === undefined)) return false;
+  return storedCacheIs(ctab ? { ...object, structure: "" } : object, derived);
 }
 
 /**
@@ -8538,13 +8575,17 @@ function storedCacheIs(object: MoleculeObject, reading: LoneHydrogenCache): bool
 
 /**
  * The caches ChemDraft's native derivation wrote for this drawing under the earlier readings of a
- * lone H, D or T, computed by today's writer from `derived` (`refreshNativeSingleBondGraph`'s
- * result: its atoms are the ones the derivation read, its structure and chemistry today's H• reading):
- * - H2 (863c8f229 until e7ef3bc68): each lone hydrogen atom carried one hydrogen of its own, as RDKit
- *   read the molfile's lone H without a valence field: SMILES [HH], [2HH], [3HH]; formula H2, DH, TH;
- *   no radical (`h2ReadingCache`);
+ * hydrogen atom, computed by today's writer from `derived` (`refreshNativeSingleBondGraph`'s result:
+ * its atoms are the ones the derivation read, its structure and chemistry today's H• reading). Each
+ * reading is applied to EVERY hydrogen atom it read differently from today, all at once, so a stored
+ * cache matches a reading only when it is one era's output throughout; a mix of eras matches none:
+ * - H2 (863c8f229 until e7ef3bc68): each H, D or T atom with no covalent bond (a lone one, or one
+ *   bonded only datively, a dative bond costing it nothing) carried one hydrogen of its own, as RDKit
+ *   read the molfile's H without a valence field (`h2ReadingHydrogenCarrier`): SMILES [HH], [2HH],
+ *   [3HH] (a dative Fe–D beside a lone H: [2HH][Fe].[HH], H3DFe); no radical (`h2ReadingCache`);
  * - the bare atom with no radical (release 1.2.2 and earlier, and e7ef3bc68 until 95783e713): today's
- *   structure and record, with the radicals counting no lone hydrogen atom.
+ *   structure and record, with the radicals counting no lone hydrogen atom. A datively bonded H, D or
+ *   T read then as it does today (the single atom, no radical), so only the lone ones differ.
  * Every other part of the cache is today's derivation's: neither reading is isomeric, and neither
  * ever wrote stereo.
  */
@@ -8555,18 +8596,34 @@ function earlierLoneHydrogenReadings(derived: MoleculeObject): LoneHydrogenCache
     structureFormat: derived.structureFormat, structure: derived.structure,
     chemistry: chemistry && { ...chemistry, radicalCount: (chemistry.radicalCount ?? 0) - lone.length }
   };
-  const h2 = h2ReadingCache(derived, new Set(lone.map((atom) => atom.id)));
+  const carriers = derived.atoms.filter((atom) => h2ReadingHydrogenCarrier(atom, derived.bonds));
+  const h2 = h2ReadingCache(derived, new Set(carriers.map((atom) => atom.id)));
   return h2 ? [h2, bare] : [bare];
 }
 
 /**
- * The H2 reading's cache (`earlierLoneHydrogenReadings`) for `derived`'s lone hydrogen atoms
- * (`loneIds`), or undefined when it cannot be written exactly. Computed by today's native writer
- * from the drawing alone:
- * - the chemistry record from the drawing with each lone atom bonded to a hydrogen atom of its own,
+ * Whether the H2 reading (863c8f229 until e7ef3bc68) gave `atom` a hydrogen of its own: an H, D or T
+ * that is not a typed literal, neutral, carries no radical mark and states no count of its own
+ * (`atomStatedHydrogenCount`), with no covalent bond: its bonds, if any, are all dative, which cost
+ * it no valence (layout-engine's `nativeBondValenceContribution`). Its derived count was then
+ * hydrogen's valence of 1. Every lone hydrogen atom (`atomImpliedRadicalCount`) is one.
+ */
+function h2ReadingHydrogenCarrier(atom: MoleculeAtom, bonds: readonly MoleculeBond[]): boolean {
+  if (atom.element !== "H" && atom.element !== "D" && atom.element !== "T") return false;
+  if (atom.labelLiteral === true || atom.formalCharge !== 0 || (atom.markRadicals ?? 0) !== 0) return false;
+  if (atomStatedHydrogenCount(atom, bonds) !== undefined) return false;
+  return bonds.every((bond) => (bond.fromAtomId !== atom.id && bond.toAtomId !== atom.id) || isDativeBond(bond));
+}
+
+/**
+ * The H2 reading's cache (`earlierLoneHydrogenReadings`) for `derived`'s hydrogen atoms that reading
+ * gave a hydrogen of their own (`loneIds`: `h2ReadingHydrogenCarrier`, lone and dative-only alike),
+ * or undefined when it cannot be written exactly. Computed by today's native writer from the drawing
+ * alone:
+ * - the chemistry record from the drawing with each such atom bonded to a hydrogen atom of its own,
  *   listed right after it, so the formula and masses count that hydrogen where the H2 reading
  *   counted it and the atom carries no radical; the atom and bond counts are the drawing's;
- * - the structure from the drawing with each lone atom written as a hydrogen atom of an isotope no
+ * - the structure from the drawing with each such atom written as a hydrogen atom of an isotope no
  *   atom of the molecule has, a token the writer writes for nothing else, which then becomes the H2
  *   reading's token for that atom. Components and their order follow the bonds, which are the
  *   drawing's, so every other character is today's writer's.
@@ -8606,7 +8663,7 @@ function h2ReadingCache(derived: MoleculeObject, loneIds: ReadonlySet<string>): 
   if (structure !== "") {
     for (const [sentinel, token] of tokens) {
       const parts = structure.split(sentinel);
-      // Each lone atom is a component of its own, written once.
+      // Each such atom is written once.
       if (parts.length !== 2) return undefined;
       structure = parts.join(token);
     }
@@ -21323,23 +21380,46 @@ export function openNativeDocument(contents: string | Uint8Array): ChemDraftOpen
   return notRefreshed.length ? { ...result, warnings: [...result.warnings, ...notRefreshed] } : result;
 }
 
+/** What begins the lone-H warnings of each candidate of a visible-layer conflict (`openedLoneHydrogenCacheWarnings`). */
+const embeddedCandidateSource = "Embedded ChemDraft document";
+const visibleCandidateSource = "Edited visible CDXML subset";
+
 /**
- * The lone-H refresh warnings for every document this open may install. The caller reports
- * `result.warnings` whichever document it installs, and a visible-layer conflict is resolved only
- * after this (MainWindow's `resolveOpenResultDocument` asks the user to restore the embedded
- * document or import the edited visible CDXML), so a conflict names the declined molecules of both
- * candidates, each message saying which one it is about: the embedded document's, so Restore
- * Embedded reports what its refresh keeps stale, and the visible subset's, so an import does.
+ * The lone-H refresh warnings for every document this open may install. A visible-layer conflict is
+ * resolved only after this (MainWindow's `resolveOpenResultDocument` asks the user to restore the
+ * embedded document or import the edited visible CDXML), so a conflict names the declined molecules
+ * of both candidates, each message saying which one it is about. The caller reports only the
+ * installed candidate's (`openedDocumentWarnings`).
  */
 function openedLoneHydrogenCacheWarnings(result: ChemDraftOpenResult): ReturnType<typeof impliedRadicalCacheNotRefreshedWarnings> {
   if (result.document) return impliedRadicalCacheNotRefreshedWarnings(result.document);
   if (!result.conflict) return [];
   return [
-    ...impliedRadicalCacheNotRefreshedWarnings(result.conflict.embeddedDocument, "Embedded ChemDraft document"),
+    ...impliedRadicalCacheNotRefreshedWarnings(result.conflict.embeddedDocument, embeddedCandidateSource),
     ...(result.conflict.visibleDocument
-      ? impliedRadicalCacheNotRefreshedWarnings(result.conflict.visibleDocument, "Edited visible CDXML subset")
+      ? impliedRadicalCacheNotRefreshedWarnings(result.conflict.visibleDocument, visibleCandidateSource)
       : [])
   ];
+}
+
+/**
+ * The open report for the document installed from `result` (`installed`: what MainWindow's
+ * `resolveOpenResultDocument` chose, before anything else is done to it): `result.warnings`, less a
+ * visible-layer conflict's lone-H warnings about the candidate the user did not install. Restore
+ * Embedded reports only the embedded document's kept molecules and Import Visible CDXML only the
+ * visible subset's, never a cache in the payload it discarded. Any other open reports
+ * `result.warnings` as it is.
+ */
+export function openedDocumentWarnings(result: ChemDraftOpenResult, installed: ChemDraftDocument): ChemDraftOpenResult["warnings"] {
+  const conflict = result.conflict;
+  if (!conflict) return result.warnings;
+  const discarded = installed === conflict.embeddedDocument ? visibleCandidateSource
+    : conflict.visibleDocument !== undefined && installed === conflict.visibleDocument ? embeddedCandidateSource
+      : undefined;
+  if (discarded === undefined) return result.warnings;
+  const warnings = result.warnings.filter((warning) =>
+    warning.code !== IMPLIED_RADICAL_CACHE_NOT_REFRESHED_CODE || !warning.message.startsWith(`${discarded}: `));
+  return warnings.length === result.warnings.length ? result.warnings : warnings;
 }
 
 const duplicateObjectIdsRenumberedCode: NativeDocumentWarningCode = "NATIVE_DUPLICATE_OBJECT_IDS_RENUMBERED";

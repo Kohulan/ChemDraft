@@ -121,6 +121,15 @@ const cyclopropaneAtoms = [atom("r1", "C", 0), atom("r2", "C", 14, 8), atom("r3"
 const cyclopropaneBonds = [bond("k1", "r1", "r2"), bond("k2", "r2", "r3"), bond("k3", "r3", "r1")];
 const cyclopropaneH2 = record("C3H8", 44.097, 44.0626, 4, 3);
 
+// A D bonded only datively to Fe (a dashed bond) beside a lone H. Native (H•): "[2H][Fe].[H]", HDFe.
+// The H2 reading gave EVERY hydrogen atom with no covalent bond a hydrogen of its own, the dative D
+// included (a dative bond cost it nothing): "[2HH][Fe].[HH]", H3DFe, no radical (863c8f229's writer).
+const dativeAtoms = [atom("d", "D", 0), atom("fe", "Fe", 15), atom("lone", "H", 50)];
+const dativeBonds = [bond("coord", "d", "fe", "single", { bondStyle: "dashed" })];
+const dativeH2 = record("H3DFe", 60.883, 60.97251, 3, 1, { isotopeLabels: ["2H"] });
+const dative = (id: string, structure: string, chemistry: MoleculeObject["chemistry"]) =>
+  moleculeOf(id, dativeAtoms, dativeBonds, "smiles", structure, chemistry);
+
 /** A V2000 molfile of C, F, Cl, Br and a lone H, as RDKit writes one (the lone H with no valence field: H2). */
 const haloV2000 = [
   "", "     RDKit          2D", "",
@@ -154,6 +163,17 @@ const haloV3000 = [
   "M  V30 3 1 1 4",
   "M  V30 END BOND",
   "M  V30 END CTAB",
+  "M  END", ""
+].join("\n");
+/** Ethane beside a lone H as a V2000 molfile carrying the H's radical as an `M  RAD` doublet (RDKit: CC.[H]). */
+const ethaneRadicalV2000 = [
+  "", "     RDKit          2D", "",
+  "  3  1  0  0  0  0  0  0  0  0999 V2000",
+  "    0.0000    0.0000    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0",
+  "    0.7000   -0.4000    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0",
+  "    2.0000    0.0000    0.0000 H   0  0  0  0  0  0  0  0  0  0  0  0",
+  "  1  2  1  0",
+  "M  RAD  1   3   2",
   "M  END", ""
 ].join("\n");
 /** A CXSMILES whose stereo is only its extension: coordinates and a wedge (wU), no "@", "/" or "\\". */
@@ -234,6 +254,34 @@ describe("a lone H's stale cache that is ChemDraft's own earlier output is refre
     expect(warn).not.toHaveBeenCalled();
   });
 
+  it("refreshes a dative Fe–D beside a lone H as the H2 reading stored it ([2HH][Fe].[HH], H3DFe): both atoms' readings at once", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const stored = dative("dative", "[2HH][Fe].[HH]", dativeH2);
+    const expected = refreshedAt123(stored);
+    expect(expected.structure).toBe("[2H][Fe].[H]");
+    expect(expected.chemistry?.formula).toBe("HDFe");
+    expect(expected.chemistry?.radicalCount).toBe(1);
+    for (const [occasion, read] of [["open", openRead], ["session restore", restoreRead]] as const) {
+      const result = read([stored]);
+      expect(declinedOf(result.warnings), occasion).toEqual([]);
+      expect(cacheOf(molecules(committed(result))[0]!), occasion).toBe(cacheOf(expected));
+    }
+    const warningsOut: string[] = [];
+    expect(cacheOf(molecules(pasted([stored], warningsOut))[0]!)).toBe(cacheOf(expected));
+    expect(warningsOut).toEqual([]);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("refreshes the same dative drawing under the bare-atom reading ([2H][Fe].[H], no radical): the dative D read then as now", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const today = refreshedAt123(dative("bare", "", undefined));
+    const stored = { ...today, chemistry: { ...today.chemistry!, radicalCount: 0 } };
+    const result = openRead([stored]);
+    expect(declinedOf(result.warnings)).toEqual([]);
+    expect(cacheOf(molecules(committed(result))[0]!)).toBe(cacheOf(today));
+    expect(warn).not.toHaveBeenCalled();
+  });
+
   it("refreshes the same halo drawing stored without stereo (BrC(F)Cl.[HH], wedge drawn or not): native output carries none", () => {
     vi.spyOn(console, "warn").mockImplementation(() => undefined);
     for (const wedge of [false, true]) {
@@ -273,6 +321,20 @@ describe("a lone H's cache that is not ChemDraft's own earlier output is kept as
       () => ethane("respelled", "CC.[HH]", ethaneH2, { warnings: [], unknown: { smiles: "[HH].CC" } })],
     ["C(-1)CC1.[HH] stored for a cyclopropane drawing",
       () => moleculeOf("ring", cyclopropaneAtoms, cyclopropaneBonds, "smiles", "C(-1)CC1.[HH]", cyclopropaneH2)],
+    // The lone H in the H2 reading but the dative D in today's: a mix no writer ever emitted (H2DFe).
+    ["a mixed-era dative cache ([2H][Fe].[HH], H2DFe): the lone H read as H2, the dative D as today", () => {
+      const partnered = workflow.refreshNativeSingleBondGraph(dative("p", "", undefined), [...dativeAtoms, atom("partner", "H", 65)],
+        [...dativeBonds, bond("pair", "lone", "partner")]);
+      expect(partnered.chemistry?.formula).toBe("H2DFe");
+      return dative("mixed", "[2H][Fe].[HH]", { ...partnered.chemistry!, atomCount: 3, bondCount: 1 });
+    }],
+    // Today's structure and record, but a cached copy of other chemistry: not a no-op, and no era's output.
+    ["a cached copy of other chemistry (COC.[HH]) beside today's structure and record",
+      () => ({ ...refreshedAt123(ethane("copy")), compatibility: { warnings: [], unknown: { smiles: "COC.[HH]" } } })],
+    // Nothing verifies a stored CTAB on open, restore or paste, so a CTAB beside today's record is kept
+    // and named there (a plugin insert's verifier checks it instead: applyPluginDocumentPatch.loneHydrogen).
+    ["a V2000 molfile with an M  RAD doublet on the lone H, beside today's record",
+      () => ({ ...refreshedAt123(ethane("radctab")), structureFormat: "molfile-v2000" as const, structure: ethaneRadicalV2000 })],
     ["a chemistry record whose warnings the native writer never wrote (an engine's record)",
       () => ({ ...ethane("engine"), chemistry: { ...ethaneH2, warnings: [{ code: "rdkit.sanitize", message: "Read by RDKit." }] } })]
   ];
@@ -304,6 +366,18 @@ describe("a lone H's cache that is not ChemDraft's own earlier output is kept as
     }, 30_000);
   }
 
+  it("says nothing and changes nothing when the stored record already is today's and no structure is stored", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const stored = { ...refreshedAt123(ethane("recordOnly")), structure: "" };
+    expect(stored.chemistry?.radicalCount).toBe(1);
+    for (const read of [openRead, restoreRead]) {
+      const result = read([stored]);
+      expect(declinedOf(result.warnings)).toEqual([]);
+      expect(cacheOf(molecules(committed(result))[0]!)).toBe(cacheOf(stored));
+    }
+    expect(warn).not.toHaveBeenCalled();
+  });
+
   it("says nothing and changes nothing when the stored cache already is the native derivation ([H].CC)", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     // The H's id sorts first, so the native writer writes its component first.
@@ -331,7 +405,7 @@ describe("the open report names a kept lone-H cache after Restore Embedded and b
   afterEach(() => { vi.restoreAllMocks(); });
   const kept = () => halo("wedged", { wedge: true, structure: "F[C@@H](Cl)Br.[HH]", stereochemistry: ["atom 0 (S)"] });
 
-  it("names the embedded document's kept molecule when the visible CDXML was edited outside ChemDraft", () => {
+  it("names the embedded document's kept molecule after Restore Embedded, and only the visible subset's after Import Visible CDXML", () => {
     vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const stored = kept();
     const saved = workflow.createNativeSavePayload(admitParsedDocument(documentOf([stored]))).contents;
@@ -340,20 +414,47 @@ describe("the open report names a kept lone-H cache after Restore Embedded and b
     const opened = workflow.openNativeDocument(edited);
     expect(opened.document).toBeUndefined();
     const embedded = opened.conflict!.embeddedDocument;
-    // Restore Embedded installs `embeddedDocument` and reports `opened.warnings` (MainWindow's
-    // resolveOpenResultDocument): the warning is there, naming the molecule and the embedded document.
+    const visible = opened.conflict!.visibleDocument!;
+    // The read names both candidates' kept molecules, each message saying which candidate it is about.
     const embeddedWarnings = declinedOf(opened.warnings).filter((warning) => warning.message.startsWith("Embedded ChemDraft document: "));
+    const visibleWarnings = declinedOf(opened.warnings).filter((warning) => warning.message.startsWith("Edited visible CDXML subset: "));
     expect(embeddedWarnings).toHaveLength(1);
     expect(embeddedWarnings[0]!.sourceObjectId).toBe(stored.id);
-    expect(cacheOf(molecules(committed(embedded))[0]!)).toBe(cacheOf(stored));
-    // Import Visible CDXML installs the visible subset: its own declined molecules are named, and only those.
-    const visibleDeclined: string[] = [];
-    workflow.withImpliedRadicalChemistryRederived(admitParsedDocument(opened.conflict!.visibleDocument!), {
-      warningsOut: visibleDeclined
-    });
-    const visibleWarnings = declinedOf(opened.warnings).filter((warning) => warning.message.startsWith("Edited visible CDXML subset: "));
-    expect(visibleWarnings).toHaveLength(visibleDeclined.length);
     expect(declinedOf(opened.warnings)).toHaveLength(embeddedWarnings.length + visibleWarnings.length);
+    // Restore Embedded installs `embeddedDocument` (MainWindow's resolveOpenResultDocument) and reports
+    // `openedDocumentWarnings` for it: the embedded molecule's warning, and none of the discarded subset's.
+    const restoredReport = workflow.openedDocumentWarnings(opened, embedded);
+    expect(declinedOf(restoredReport)).toEqual(embeddedWarnings);
+    expect(restoredReport.filter((warning) => !declinedOf([warning]).length))
+      .toEqual(opened.warnings.filter((warning) => !declinedOf([warning]).length));
+    expect(cacheOf(molecules(committed(embedded))[0]!)).toBe(cacheOf(stored));
+    // Import Visible CDXML installs the visible subset: its own declined molecules are named, and never
+    // the embedded payload's, which it discarded.
+    const visibleDeclined: string[] = [];
+    workflow.withImpliedRadicalChemistryRederived(admitParsedDocument(visible), { warningsOut: visibleDeclined });
+    const importedReport = workflow.openedDocumentWarnings(opened, visible);
+    expect(declinedOf(importedReport)).toEqual(visibleWarnings);
+    expect(declinedOf(importedReport)).toHaveLength(visibleDeclined.length);
+    expect(importedReport.some((warning) => warning.message.startsWith("Embedded ChemDraft document: "))).toBe(false);
+    expect(importedReport.filter((warning) => !declinedOf([warning]).length))
+      .toEqual(opened.warnings.filter((warning) => !declinedOf([warning]).length));
+  });
+
+  it("names the visible subset's kept molecule after Import Visible CDXML, and not after Restore Embedded", () => {
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    // A read whose visible subset holds the kept molecule and whose embedded document does not.
+    const visible = admitParsedDocument(documentOf([kept()]));
+    const embedded = admitParsedDocument(documentOf([ethane("fresh")]));
+    const visibleWarning = { code: workflow.IMPLIED_RADICAL_CACHE_NOT_REFRESHED_CODE,
+      message: `Edited visible CDXML subset: ${workflow.impliedRadicalCacheNotRefreshedText()}`, sourceObjectId: "wedged" };
+    const other = { code: "cdxml.table_approximated", message: "Table written as text and lines." };
+    const opened = { source: "native-payload", warnings: [other, visibleWarning],
+      conflict: { embeddedDocument: embedded, visibleDocument: visible } } as unknown as ReturnType<typeof workflow.openNativeDocument>;
+    expect(workflow.openedDocumentWarnings(opened, visible)).toEqual([other, visibleWarning]);
+    expect(workflow.openedDocumentWarnings(opened, embedded)).toEqual([other]);
+    // An open with no conflict reports its warnings as they are, the same array.
+    const plain = openRead([kept()]);
+    expect(workflow.openedDocumentWarnings(plain, plain.document!)).toBe(plain.warnings);
   });
 
   it("keeps the restore's lone-H warning when the session saved a save report and no open report", () => {

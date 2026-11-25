@@ -34,22 +34,45 @@ const retainedCompatibility = (molecule: MoleculeObject) => {
   return stableRecord({ ...molecule.compatibility, unknown });
 };
 
-function hasExtraCtabFields(structure: string, format: "molfile-v2000" | "molfile-v3000") {
+/**
+ * What a stored CTAB carries beyond what the verifier's graph writer reproduces:
+ * - "none": nothing;
+ * - "doublets": only radical doublets (V2000 `M  RAD` entries of value 2, V3000 `RAD=2`). A doublet is
+ *   exactly one unpaired electron on its atom, which RDKit's atom-ordered reading (`orderedIdentity`,
+ *   each atom's radical electrons in CTAB order) states losslessly, so `verifyStoredSources` accepts
+ *   it only when that reading equals the drawing's;
+ * - "other": anything else. Alias lines, other radical multiplicities (a singlet and a triplet both
+ *   read as two electrons, so the spin is lost), S-groups and unknown records have no lossless
+ *   representation in the verifier's graph writer.
+ */
+function extraCtabFields(structure: string, format: "molfile-v2000" | "molfile-v3000"): "none" | "doublets" | "other" {
   const lines = structure.split(/\r?\n/);
+  let doublets = false;
   if (format === "molfile-v2000") {
     const counts = lines[3]!;
     const afterBonds = 4 + Number(counts.slice(0, 3)) + Number(counts.slice(3, 6));
-    // Alias lines, M RAD (including its spin multiplicity), S-groups and unknown records
-    // have no lossless representation in the verifier's graph writer.
-    return lines.slice(afterBonds).some(line => line.trim() && !/^M  (?:CHG|ISO|END)\b/.test(line));
+    for (const line of lines.slice(afterBonds)) {
+      if (!line.trim() || /^M  (?:CHG|ISO|END)\b/.test(line)) continue;
+      if (!/^M  RAD/.test(line)) return "other";
+      const fields = line.slice(6).trim().split(/\s+/);
+      const entries = Number(fields[0]);
+      if (!Number.isInteger(entries) || entries < 1 || fields.length !== 1 + 2 * entries ||
+          fields.some((field, index) => index > 0 && index % 2 === 0 && field !== "2")) return "other";
+      doublets = true;
+    }
+    return doublets ? "doublets" : "none";
   }
   const supportedAttributes = new Set(["CHG", "MASS", "CFG", "VAL"]);
-  return lines.slice(4).some(line => {
+  for (const line of lines.slice(4)) {
     if (!line.trim() || /^M  END\s*$/.test(line) ||
-        /^M  V30 (BEGIN|END) (CTAB|ATOM|BOND)\s*$/.test(line) || /^M  V30 COUNTS \d+ \d+ 0 0 [01]\s*$/.test(line)) return false;
-    if (!/^M  V30 \d+\s/.test(line) || line.trimEnd().endsWith("-")) return true;
-    return [...line.matchAll(/(\w+)=/g)].some(match => !supportedAttributes.has(match[1]!));
-  });
+        /^M  V30 (BEGIN|END) (CTAB|ATOM|BOND)\s*$/.test(line) || /^M  V30 COUNTS \d+ \d+ 0 0 [01]\s*$/.test(line)) continue;
+    if (!/^M  V30 \d+\s/.test(line) || line.trimEnd().endsWith("-")) return "other";
+    for (const [, name, value] of line.matchAll(/(\w+)=(\S*)/g)) {
+      if (name === "RAD" && value === "2") doublets = true;
+      else if (!supportedAttributes.has(name!)) return "other";
+    }
+  }
+  return doublets ? "doublets" : "none";
 }
 
 const CLAIM_LABELS = { stereochemistry: "stereo", isotopeLabels: "isotope labels", radicalCount: "radical count",
@@ -74,12 +97,15 @@ export async function verifyStoredSources(context: StructureInspectionContext, m
   }
   const check = async (format: Exclude<MoleculeObject["structureFormat"], "unknown">, value: string) => {
     validateInspectionSource({ format, structure: value });
-    if (replacementIdentity !== undefined && (format === "smiles" ? value.includes("|") : hasExtraCtabFields(value, format))) {
+    const extra = format === "smiles" ? (value.includes("|") ? "other" : "none") : extraCtabFields(value, format);
+    // Radical doublets are checked against the drawing's own atom-ordered reading, so only with one.
+    if (replacementIdentity !== undefined && (extra === "other" || extra === "doublets" && !graph?.orderedIdentity)) {
       throw new ChemistryRefusal("the stored structure carries annotations that can't be checked against the drawn atoms", `The stored ${format} of "${molecule.id}" contains annotations the graph writer cannot verify.`);
     }
     const result = await context.chemistry.inspectStructure(format === "smiles" ? "smiles" : "molfile", value);
     if (!result.valid || !result.orderedIdentity ||
-        replacementIdentity !== undefined && (result.hasStoredGroups !== false || result.identitySmiles !== replacementIdentity)) {
+        replacementIdentity !== undefined && (result.hasStoredGroups !== false || result.identitySmiles !== replacementIdentity ||
+          extra === "doublets" && result.orderedIdentity !== graph?.orderedIdentity)) {
       throw new ChemistryRefusal("the stored structure doesn't match the drawn atoms", `The stored ${format} of "${molecule.id}" has chemistry the editable graph cannot verify.`);
     }
     if (format !== "smiles" && graph) {
