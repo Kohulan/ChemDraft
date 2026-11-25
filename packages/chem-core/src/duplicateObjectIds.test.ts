@@ -136,6 +136,44 @@ describe("native open renumbers duplicate object ids on the same page", () => {
       .toEqual([[note("superatom object", "S")], [note("superatom object", "S_003")], [note("r-group label", "R")], [note("r-group label", "R_004")]]);
   });
 
+  describe("a renamed copy never captures a dangling reference equal to its would-be new id", () => {
+    // Objects X, X and one referrer: two distinct ids, so the shared scheme's first candidate is X_003.
+    // The referrer names X_003, which no object holds; were the copy renamed X_003 it would silently
+    // become that reference's target (a reaction product, a group member, an annotation's anchor).
+    const base = { x: 0, y: 0, width: 10, height: 10, rotation: 0, style: {} };
+    const referrers: [string, DocumentObject, (object: DocumentObject) => unknown][] = [
+      ["a reaction product", { ...base, id: "rxn", type: "reaction", components: [{ role: "reactant", objectId: "X" }, { role: "product", objectId: "X_003" }],
+        conditionsTextObjectIds: [], mappingState: "unknown" } as DocumentObject,
+        object => object.type === "reaction" ? object.components : undefined],
+      ["a group child", { ...base, id: "g", type: "group", childObjectIds: ["X_003"] } as DocumentObject,
+        object => object.type === "group" ? object.childObjectIds : undefined],
+      ["an annotation anchor", { ...base, id: "mark", type: "electron-mark", markKind: "radical-dot", anchor: { kind: "object", objectId: "X_003" } } as DocumentObject,
+        object => object.type === "electron-mark" ? object.anchor : undefined]
+    ];
+
+    it.each(referrers)("%s", (_name, referrer, reference) => {
+      vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      const source = file([molecule("X", 0), molecule("X", 100), referrer]);
+      const read = readSerializedDocument(source);
+      const objects = read.document.pages[0]!.objects;
+      // The copy skips X_003 and takes the next index; numbering otherwise follows the shared scheme.
+      expect(objects.map(object => object.id)).toEqual(["X", "X_004", referrer.id]);
+      // The dangling reference is untouched and still dangles: no object took its id.
+      const original = parseDocument(JSON.parse(source)).pages[0]!.objects;
+      expect(reference(objects[2]!)).toEqual(reference(original[2]!));
+      expect(objects[2]).toEqual(original[2]);
+      expect(objects.some(object => object.id === "X_003")).toBe(false);
+      // Chemistry of both copies is unchanged, and the single warning is the usual one.
+      expect(objects[0]).toEqual(original[0]);
+      expect(chemistry(objects[1]!)).toEqual(chemistry(original[1]!));
+      expect(read.warnings.filter(warning => warning.code === "NATIVE_DUPLICATE_OBJECT_IDS_RENUMBERED")).toEqual([{
+        code: "NATIVE_DUPLICATE_OBJECT_IDS_RENUMBERED", path: ["pages"],
+        originalValue: [{ pageIndex: 0, objectIndex: 1, from: "X", to: "X_004" }],
+        message: "This file had 2 objects sharing an id on page 1; ChemDraft gave the duplicates new ids. Save to keep the fix."
+      }]);
+    });
+  });
+
   it("allocates with the shared nextObjectId scheme", () => {
     const document = parseDocument(JSON.parse(file([molecule("mol_001", 0), molecule("mol_002", 10)])));
     expect(nextObjectId(document, "mol")).toBe("mol_003");

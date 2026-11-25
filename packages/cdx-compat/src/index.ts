@@ -4962,7 +4962,7 @@ function importFragment(
   }
   warnings.push(...keepStatedHydrogens(ordinaryStatedAtoms, atoms, normalizedBonds,
     statedHydrogensByAtomId, atomIdByCdxmlId, context.sourceFormat, objectId));
-  warnings.push(...notCountedStatedHydrogens(atoms, atomIdByCdxmlId, context.sourceFormat, objectId));
+  warnings.push(...notCountedStatedHydrogens(atoms, normalizedBonds, atomIdByCdxmlId, context.sourceFormat, objectId));
   const atomStereochemistry = Object.entries(cdxmlAtomStereochemistryByAtomId).map(
     ([atomId, stereo]) => `${atomId}:${stereo.assignment}`
   );
@@ -6899,19 +6899,22 @@ function keepStatedHydrogens(
  * counted, in chem-core's `statedHydrogenCountNotCountedText` wording (AGENTS.md §7). A stated 0 is
  * what such an atom counts anyway, and is not reported. A hydrogen atom's count other than 0 is not
  * kept on an ordinary atom (`keepStatedHydrogens` reports it); one a literal label kept is named here.
+ * `bonds` are the fragment's kept bonds: a typed "Ac", "Pr" or "Ts" on a bond is the group the label
+ * grammar reads (acetyl, n-propyl, tosyl), an abbreviation, so a count it states is named too.
  */
 function notCountedStatedHydrogens(
   atoms: readonly MoleculeAtom[],
+  bonds: readonly MoleculeBond[],
   atomIdByCdxmlId: ReadonlyMap<string, string>,
   sourceFormat: string,
   objectId: string
 ): CompatibilityConversionWarning[] {
-  const notCounted = atoms.filter(atomIgnoresStatedHydrogenCount);
+  const notCounted = atoms.filter((atom) => atomIgnoresStatedHydrogenCount(atom, bonds));
   if (notCounted.length === 0) return [];
   const cdxmlIdByAtomId = new Map([...atomIdByCdxmlId].map(([cdxmlId, atomId]) => [atomId, cdxmlId]));
   return [{
     code: "cdxml.atom_hydrogen_count_not_counted",
-    message: `${sourceFormat} import: ${statedHydrogenCountNotCountedText(notCounted, (atom) => cdxmlIdByAtomId.get(atom.id) ?? atom.id)}`,
+    message: `${sourceFormat} import: ${statedHydrogenCountNotCountedText(notCounted, (atom) => cdxmlIdByAtomId.get(atom.id) ?? atom.id, bonds)}`,
     sourceObjectId: objectId,
     atomIds: notCounted.map((atom) => atom.id)
   }];

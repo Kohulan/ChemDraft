@@ -343,7 +343,8 @@ function nativeStatedHydrogenDiagnostic(
   atoms: readonly MoleculeAtom[],
   resolution: NativeBondOrderResolution
 ): NativeAtomValidationState | undefined {
-  if (atomIgnoresStatedHydrogenCount(atom)) {
+  // `bonds` decide whether a typed "Ac", "Pr" or "Ts" is the group the grammar reads on a bond.
+  if (atomIgnoresStatedHydrogenCount(atom, bonds)) {
     const element = nativeElementFromAtomLabel(atom.element) ?? (atom.element === "D" || atom.element === "T" ? "H" : atom.element);
     const derived = atomDerivedHydrogenCount({ ...atom, formalCharge: effectiveFormalCharge }, bonds, atoms, resolution) ?? 0;
     const count = atom.hydrogenCount!;
@@ -355,10 +356,10 @@ function nativeStatedHydrogenDiagnostic(
       valid: false,
       statedHydrogens: { stated: count, derived },
       hydrogenCountNotCounted: true,
-      invalidReason: statedHydrogenCountNotCountedReason(atom),
+      invalidReason: statedHydrogenCountNotCountedReason(atom, bonds),
       // An abbreviation's label, formula and SMILES count the hydrogens of what it stands for.
-      invalidDetail: `${hydrogenCountNotCountedText([atom])} The label, formula and SMILES count ${
-        ignoredHydrogenCountAtomKind(atom) === "an abbreviation" ? `what ${atom.element} stands for` : derived}.`
+      invalidDetail: `${hydrogenCountNotCountedText([atom], bonds)} The label, formula and SMILES count ${
+        ignoredHydrogenCountAtomKind(atom, bonds) === "an abbreviation" ? `what ${atom.element} stands for` : derived}.`
     };
   }
   const stated = atomStatedHydrogenCount(atom, bonds);
@@ -384,10 +385,11 @@ function nativeStatedHydrogenDiagnostic(
  * The native report for atoms a document stores a hydrogen count on that nothing counts (chem-core
  * `atomIgnoresStatedHydrogenCount`: an H, D or T atom, a label naming no element — the unknown
  * atom "*", a generic label such as A or R1 — or an abbreviation such as OMe, stating a count other than 0): chem-core's `statedHydrogenCountNotCountedText`, the one wording the CDXML importer also
- * uses. The document keeps the count as stored, so this says it is not counted.
+ * uses. The document keeps the count as stored, so this says it is not counted. `bonds` are the
+ * molecule's: on a bond, a typed "Ac", "Pr" or "Ts" is named as the abbreviation the grammar reads.
  */
-export function hydrogenCountNotCountedText(atoms: readonly MoleculeAtom[]): string {
-  return statedHydrogenCountNotCountedText(atoms);
+export function hydrogenCountNotCountedText(atoms: readonly MoleculeAtom[], bonds: readonly MoleculeBond[] = []): string {
+  return statedHydrogenCountNotCountedText(atoms, undefined, bonds);
 }
 
 function nativeAtomDiagnostic(
