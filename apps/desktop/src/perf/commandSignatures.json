@@ -1,6 +1,14 @@
 [
   {
     "file": "appimage_dialogs.rs",
+    "name": "message",
+    "async": true,
+    "generics": "<R: Runtime>",
+    "parameters": "window: Window<R>, title: Option<String>, message: String, kind: Option<MessageDialogKind>, buttons: Option<MessageDialogButtons>,",
+    "returnType": "MessageDialogResult"
+  },
+  {
+    "file": "appimage_dialogs.rs",
     "name": "open",
     "async": true,
     "generics": "<R: Runtime>",
