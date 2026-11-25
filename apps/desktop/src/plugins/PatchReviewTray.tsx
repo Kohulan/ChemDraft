@@ -345,18 +345,21 @@ function proposalHydrogenCountWarnings(
  * The status line after the user accepts a proposal. A proposal is accepted as written even when an
  * H, D or T atom states a hydrogen count it cannot carry, so the message names each such atom that
  * `committed` (the document the accept produced from `before`) still holds, rather than reporting a
- * plain success.
+ * plain success. `warnings` (the accept's own application's, e.g. a lone-H cache it kept as stored)
+ * follow, each a whole sentence.
  */
 export function acceptedProposalMessage(
   pluginName: string, proposal: QueuedProposedPatch,
-  options: { recognized: boolean; screenCapture: boolean; before: ChemDraftDocument; committed: ChemDraftDocument }
+  options: { recognized: boolean; screenCapture: boolean; before: ChemDraftDocument; committed: ChemDraftDocument;
+    warnings?: readonly string[] }
 ): string {
   const inserted = options.recognized ? `${pluginName}: inserted recognized structure` : `${pluginName}: applied proposal`;
   const message = options.screenCapture
     ? `${inserted}; its screen capture stays saved (Add or Remove Plugins › Show saved screen captures)`
     : inserted;
   const notCounted = proposedHydrogenCountNotCountedWarnings(options.before, options.committed, proposal.proposal.patch, "Accepted change");
-  return notCounted.length ? `${message}. ${notCounted.map((warning) => warning.message).join(" ")}` : message;
+  const sentences = [...notCounted.map((warning) => warning.message), ...(options.warnings ?? [])];
+  return sentences.length ? `${message}. ${sentences.join(" ")}` : message;
 }
 
 function capitalize(value: string): string {
