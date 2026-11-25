@@ -1,9 +1,9 @@
 /**
  * The one SVG safety check, shared by the desktop drop path and the headless renderer. An SVG picture
  * is untrusted. It is parsed into an inert XML document (never a live DOM), kept to an allow-list of
- * drawing elements, stripped of script, embedded HTML, animation, event handlers and every external
- * reference, and serialized again. The DOMParser and XMLSerializer are injected (the webview's own,
- * or jsdom's in Node), so the code is pure.
+ * drawing elements, stripped of script, embedded HTML, animation (SMIL and CSS), event handlers and
+ * every external reference, and serialized again. The DOMParser and XMLSerializer are injected (the
+ * webview's own, or jsdom's in Node), so the code is pure.
  *
  * Kept references: a `#fragment` naming an element of the same document (gradients, clip paths,
  * `<use href="#id">`), never on `<image>` or `<feImage>`, where a renderer could read it as a file
@@ -66,13 +66,26 @@ const ACTIVE_ELEMENTS = new Set([
 ]);
 /** Elements whose `href` loads a picture: only checked inline bitmap data, never a fragment. */
 const PICTURE_ELEMENTS = new Set(["image", "feImage"]);
-const KEPT_AT_RULE_BLOCKS = new Set(["media", "supports", "container", "layer", "keyframes", "-webkit-keyframes"]);
+const KEPT_AT_RULE_BLOCKS = new Set(["media", "supports", "container", "layer"]);
 /** CSS functions that load or construct a picture or resource, or read one from an attribute. */
 const UNSAFE_CSS_FUNCTIONS = new Set([
   "image", "image-set", "-webkit-image-set", "cross-fade", "-webkit-cross-fade", "element", "-moz-element",
   "src", "expression", "paint", "attr", "-webkit-canvas"
 ]);
 const UNSAFE_CSS_PROPERTIES = new Set(["behavior", "-moz-binding"]);
+/** A vendor prefix (`-webkit-`, `-moz-`), which CSS animation names and properties may carry. */
+const VENDOR_PREFIX = /^-[a-z0-9]+-/;
+/**
+ * CSS animation, removed like SMIL animation: a picture is drawn as its un-animated rules give it.
+ * Names are decoded and lower-cased by the tokenizer, and checked without a vendor prefix. `offset-*`
+ * stays: `offset-path` places an element even when nothing animates it.
+ */
+const isAnimationAtRule = (name: string) => name.replace(VENDOR_PREFIX, "") === "keyframes";
+function isAnimationProperty(name: string): boolean {
+  const bare = name.replace(VENDOR_PREFIX, "");
+  return /^(animation|transition)(-|$)/.test(bare) || bare.startsWith("view-transition-")
+    || /^(scroll|view)-timeline(-|$)/.test(bare) || bare === "timeline-scope";
+}
 /**
  * Presentation attributes whose value can hold a `url()` or another CSS reference. Only these (and
  * `style`) are read as CSS; any other attribute is plain text to a renderer and is kept as it is.
@@ -474,6 +487,8 @@ function sanitizeDeclarations(text: CssText, from: number, to: number, state: Sv
         }
       } else if (UNSAFE_CSS_PROPERTIES.has(property.value)) {
         noteRemoved(state, "load");
+      } else if (isAnimationProperty(property.value)) {
+        state.removedActive = true;
       } else if (verdict !== "safe") {
         noteCss(state, verdict!);
       } else {
@@ -530,7 +545,9 @@ function sanitizeRules(text: CssText, from: number, to: number, state: SvgSaniti
       const closer = close[stop]!;
       if (closer < 0 || closer >= to) { noteRemoved(state, "other"); break; }
       const prelude = cssComponentsVerdict(text, start + 1, stop);
-      if (KEPT_AT_RULE_BLOCKS.has(first.value) && depth < 8 && prelude === "safe") {
+      if (isAnimationAtRule(first.value)) {
+        state.removedActive = true;
+      } else if (KEPT_AT_RULE_BLOCKS.has(first.value) && depth < 8 && prelude === "safe") {
         out.push(`${cssSource(text, start, stop, state)}{${sanitizeRules(text, stop + 1, closer, state, depth + 1)}}`);
       } else if (first.value === "font-face" && prelude !== "loads" && fontFaceLoadsNothing(text, stop + 1, closer)) {
         // Installed fonts only: nothing outside the picture is named. Dropped without a note.

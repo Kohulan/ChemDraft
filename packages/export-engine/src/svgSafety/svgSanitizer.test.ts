@@ -276,11 +276,52 @@ describe("sanitizeSvgPicture keeps benign drawings", () => {
 });
 
 describe("sanitizeSvgStylesheet", () => {
-  it("keeps keyframes and supports blocks, drops unknown at-rules", () => {
+  it("keeps supports blocks, drops unknown at-rules", () => {
     const state = { removedExternal: false, removedActive: false };
-    expect(sanitizeSvgStylesheet("@keyframes k{from{opacity:0}to{opacity:1}} @supports (fill:red){rect{fill:red}} @namespace x url(y);", state))
-      .toBe("@keyframes k{from{opacity:0}\nto{opacity:1}}\n@supports (fill:red){rect{fill:red}}");
+    expect(sanitizeSvgStylesheet("@supports (fill:red){rect{fill:red}} @namespace x url(y);", state))
+      .toBe("@supports (fill:red){rect{fill:red}}");
     expect(state.removedExternal).toBe(true);
+  });
+});
+
+describe("CSS animation is removed like SMIL animation", () => {
+  const state = () => ({ removedExternal: false, removedActive: false });
+
+  it("drops @keyframes in any case, vendor prefix or escape, and in nested at-rules", () => {
+    for (const css of ["@keyframes k{from{opacity:0}to{opacity:1}}", "@KeyFrames k{to{opacity:1}}",
+      "@-webkit-keyframes k{to{opacity:1}}", "@-MOZ-keyframes k{to{opacity:1}}", "@\\6b eyframes k{to{opacity:1}}",
+      "@media screen{@keyframes k{to{opacity:1}}}", "@supports (fill:red){@layer a{@-o-keyframes k{to{opacity:1}}}}"]) {
+      const removed = state();
+      const kept = sanitizeSvgStylesheet(`${css} rect{fill:red}`, removed);
+      expect(kept, css).not.toMatch(/keyframes|opacity/i);
+      expect(kept, css).toContain("rect{fill:red}");
+      expect(removed, css).toMatchObject({ removedExternal: false, removedActive: true });
+    }
+  });
+
+  it("drops animation, transition and timeline properties, keeping the rest of the rule", () => {
+    const removed = state();
+    const css = "rect{fill:red;animation:spin 1s infinite;ANIMATION-NAME:spin;-webkit-animation:spin 1s;-moz-animation-duration:1s;"
+      + "anim\\61tion-iteration-count:infinite;transition:fill 1s;transition-delay:1s;-webkit-transition:fill 1s;"
+      + "view-transition-name:a;scroll-timeline:--t;view-timeline-name:--v;animation-timeline:--t;timeline-scope:--t;"
+      + "offset-path:path('M0 0H9');stroke:blue}"
+      + "@media screen{circle{animation:spin 1s;opacity:.5}}";
+    expect(sanitizeSvgStylesheet(css, removed))
+      .toBe("rect{fill:red;offset-path:path('M0 0H9');stroke:blue}\n@media screen{circle{opacity:.5}}");
+    expect(removed).toMatchObject({ removedExternal: false, removedActive: true });
+  });
+
+  it("removes it from a drawing's style sheet and style attributes and reports it, without refusing", () => {
+    const source = `<svg ${NS} width="2" height="2"><style>@keyframes k{to{fill:blue}} rect{fill:red;animation:k 1s infinite}</style>`
+      + `<rect width="1" height="1" style="opacity:.5;transition:opacity 1s;-webkit-animation:k 1s"/></svg>`;
+    for (const result of [sanitizeSvgPicture(source), sanitizeSvgPicture(source, { outsideReferences: "refuse" })]) {
+      expect(result).toMatchObject({ ok: true, removedActive: true, removedExternal: false });
+      if (!result.ok) continue;
+      expect(result.svg).not.toMatch(/keyframes|animation|transition/i);
+      expect(result.svg).toContain("rect{fill:red}");
+      expect(result.svg).toContain('style="opacity:.5"');
+      expect(clean(result.svg).svg).toBe(result.svg);
+    }
   });
 });
 

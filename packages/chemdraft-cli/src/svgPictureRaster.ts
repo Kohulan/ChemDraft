@@ -178,12 +178,16 @@ export async function flattenSvgPictures(svg: string, pixelsPerUnit: number, war
       pixelWidth *= fitSide;
       pixelHeight *= fitSide;
       const fitBudget = Math.min(1, Math.sqrt(Math.max(remainingPixels, 0) / (pixelWidth * pixelHeight)));
-      if (fitBudget < 1 && Math.max(pixelWidth, pixelHeight) * fitBudget < FLATTEN_MIN_SIDE) {
-        throw new Error("the document has too many SVG pictures to draw within the memory limit");
-      }
       pixelWidth = Math.min(FLATTEN_MAX_SIDE, Math.max(1, Math.floor(pixelWidth * fitBudget)));
       pixelHeight = Math.min(FLATTEN_MAX_SIDE, Math.max(1, Math.floor(pixelHeight * fitBudget)));
-      if (pixelWidth * pixelHeight > remainingPixels) throw new Error("the document has too many SVG pictures to draw within the memory limit");
+      // A short side raised to its one-pixel minimum leaves the long side only what the budget has left.
+      if (pixelWidth * pixelHeight > remainingPixels) {
+        if (pixelWidth <= pixelHeight) pixelHeight = Math.floor(remainingPixels / pixelWidth);
+        else pixelWidth = Math.floor(remainingPixels / pixelHeight);
+      }
+      if (pixelWidth < 1 || pixelHeight < 1 || (fitBudget < 1 && Math.max(pixelWidth, pixelHeight) < FLATTEN_MIN_SIDE)) {
+        throw new Error("the document has too many SVG pictures to draw within the memory limit");
+      }
       // The final PNG decodes every picture on its own, so each one is charged, shared raster or not.
       charged = pixelWidth * pixelHeight;
       remainingPixels -= charged;
