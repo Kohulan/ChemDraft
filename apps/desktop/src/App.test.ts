@@ -1884,12 +1884,13 @@ describe("ChemDraft desktop shell", () => {
     expect(mainWindowSource).toContain("async function writeNativeExportResult(");
     expect(mainWindowSource).toContain("const result = await createDialogExportResult(source, { ...options, busy: false }, false, title)");
     expect(mainWindowSource).toContain("nativePathJoin(lastExportDirectoryRef.current, options.filename)");
-    expect(mainWindowSource).toContain("await pickNativeExportPath(defaultPath, descriptor.menuLabel, descriptor.extensions, dialogCoordinatorRef.current?.exportSessionId(tabId))");
-    expect(mainWindowSource).toContain("await writeNativeExportResult(path, result)");
+    expect(mainWindowSource).toContain("await pickNativeExportTarget(defaultPath, descriptor.menuLabel, descriptor.extensions, dialogCoordinatorRef.current?.exportSessionId(tabId), shortcutPlatform)");
+    expect(mainWindowSource).toContain("await writeNativeSavePanelGrant(exportGrantsRef.current, tabId, path, async (target, { createNew }) => {");
+    expect(mainWindowSource).toContain("await writeNativeExportResult(target, result, createNew)");
     expect(mainWindowSource).toContain("downloadExportResult(filename, result)");
     expect(mainWindowSource).toContain("rasterizeSvgNative(svgResult.contents, rasterFormat");
-    expect(mainWindowSource).toContain("await writeNativeTextFile(path, result.contents)");
-    expect(mainWindowSource).toContain("await writeNativeBinaryFile(path, result.bytes)");
+    expect(mainWindowSource).toContain("await writeNativeTextFile(path, result.contents, createNew)");
+    expect(mainWindowSource).toContain("await writeNativeBinaryFile(path, result.bytes, createNew)");
     expect(mainWindowSource).toContain('if (result.kind === "text")');
     expect(mainWindowSource).toContain("descriptor.menuLabel");
     expect(mainWindowSource).toContain("setStatus(`Command failed: ${message}`)");
