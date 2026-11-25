@@ -283,6 +283,18 @@ describe("dropping picture files on the document window", { timeout: 3 * DROP_WA
     expect(pictures()).toHaveLength(1);
   });
 
+  it("names every refused file in the status and its tooltip, the sixth included", async () => {
+    await mount();
+    const scans = ["a", "b", "c", "d", "e"].map(name => dropFile(`${name}.bmp`, new Uint8Array(30)));
+    await browserDrop([...scans, dropFile("fake.png", new TextEncoder().encode("not a picture"))], { x: 100, y: 100 });
+    const last = "Couldn't drop \"fake.png\": its contents are not a PNG, JPEG, GIF, WebP or SVG picture.";
+    await eventually(() => expect(status()?.endsWith(last)).toBe(true));
+    const title = container.querySelector("[data-status-message]")!.getAttribute("title")!;
+    expect(title.endsWith(last)).toBe(true);
+    expect(title).toContain("Couldn't drop \"a.bmp\"");
+    expect(title).not.toMatch(/more files/);
+  });
+
   it("still opens a dropped document exactly as before, and does both for a mixed drop", async () => {
     await mount();
     await browserDrop([documentFile("Only document")]);
