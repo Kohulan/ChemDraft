@@ -55,6 +55,8 @@ export interface DocumentOpenResult {
   displayName: string;
   /** Absent when the open finished, including keeping the page after a resize prompt. */
   error?: unknown;
+  /** A finished open's own status line ("Opened …", or that the file was already open). */
+  status?: string;
 }
 
 function openFailureReason(error: unknown): string {
@@ -76,4 +78,14 @@ export function formatDocumentOpenBatchStatus(results: readonly DocumentOpenResu
   if (!first) return undefined;
   const failure = formatDocumentOpenFailure(failures.map(result => openFileName(result.displayName)).join(", "), first.error);
   return results.length === 1 ? failure : `Opened ${results.length - failures.length} of ${results.length} files. ${failure}`;
+}
+
+/**
+ * What a drop's outcome says of its documents: every one that opened, by its own status line, then
+ * the batch summary, which names the failures. Undefined for no documents.
+ */
+export function formatDocumentOpenDropOutcome(results: readonly DocumentOpenResult[]): string | undefined {
+  const opened = results.flatMap(result => "error" in result ? [] : [result.status ?? `Opened ${openFileName(result.displayName)}`]);
+  const parts = [...opened, formatDocumentOpenBatchStatus(results)].filter((part): part is string => !!part);
+  return parts.length ? parts.join("; ") : undefined;
 }

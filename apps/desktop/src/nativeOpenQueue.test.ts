@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { formatDocumentOpenBatchStatus, formatDocumentOpenFailure, listenAndDrainNativeOpenQueue } from "./nativeOpenQueue";
+import { formatDocumentOpenBatchStatus, formatDocumentOpenDropOutcome, formatDocumentOpenFailure, listenAndDrainNativeOpenQueue } from "./nativeOpenQueue";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -27,6 +27,19 @@ describe("document open status", () => {
     expect(formatDocumentOpenBatchStatus([
       { displayName: "a.chemdraft" }, { displayName: "notes.txt", error: "it is not JSON." }, { displayName: "c.cdxml" }
     ])).toBe("Opened 2 of 3 files. Could not open notes.txt: it is not JSON.");
+  });
+
+  it("names every document in a drop's outcome, by its own status line, then the failures", () => {
+    expect(formatDocumentOpenDropOutcome([])).toBeUndefined();
+    expect(formatDocumentOpenDropOutcome([{ displayName: "a.cdxml", status: "Opened a.cdxml as external CDXML subset with 2 warnings" }]))
+      .toBe("Opened a.cdxml as external CDXML subset with 2 warnings");
+    expect(formatDocumentOpenDropOutcome([
+      { displayName: "/drawings/a.chemdraft", status: "a.chemdraft was already open" },
+      { displayName: "notes.txt", error: "it is not JSON." },
+      { displayName: "C:\\Drawings\\c.cdxml" }
+    ])).toBe("a.chemdraft was already open; Opened c.cdxml; Opened 2 of 3 files. Could not open notes.txt: it is not JSON.");
+    expect(formatDocumentOpenDropOutcome([{ displayName: "notes.txt", error: "it is not JSON." }]))
+      .toBe("Could not open notes.txt: it is not JSON.");
   });
 
   it("lists several failed files on one line with the first reason", () => {

@@ -2002,7 +2002,12 @@ lossy and a lossless WebP, an SVG with gradients and `<use href="#id">`, a BMP, 
   cascade up and to the left, none on top of another. Drop fifty small pictures: every one has its
   own position on the page.
 - Mixed: drop a PNG and a `.cdxml` together. The picture lands in the current tab and the document
-  opens in its own tab; the status reports both. Drop only a `.cdxml`: it opens as before.
+  opens in its own tab; that tab's status names both files, "Inserted picture mixed.png; Opened
+  mixed.cdxml as …", worded as the open itself words it (with its warnings count, if any, and no
+  "imported content exceeds" once the page-size question is answered). Drop a picture and two
+  documents: each document is named. Drop a picture with a document already open in another tab:
+  the status says that document was already open. Drop a picture with a document that cannot be
+  opened: the failure is named. Drop only a `.cdxml`: it opens and its status reads as before.
 - Mixed drop status on both tabs: drop five pictures, a BMP and a `.cdxml` on a tab holding a
   drawing. The new tab's status names the inserted pictures and the BMP refusal. Switch back to the
   receiving tab: its status shows the pictures' result, never "Reading 5 dropped pictures…". Drop a
@@ -2012,9 +2017,13 @@ lossy and a lossless WebP, an SVG with gradients and `<use href="#id">`, a BMP, 
   Drop 13 files with 6 refused: the status and its tooltip name every refused file (no "more files").
 - Refusals: the BMP, TIFF, HEIC, `.svgz`, `.ai` and 20 MB+ files are refused by name with a specific
   reason, immediately (no read of the large file); the `.ai` reason names the extension only. A
-  `.png` renamed from a text file is refused as not a picture. A PNG whose chunks are intact but
-  whose image data is damaged is refused as "could not be decoded". A drop of a refused file and a
-  good one inserts the good one.
+  `.png` renamed from a text file is refused as not a picture. A PNG whose chunks and CRCs are intact
+  but whose image data is damaged is refused by name as "the PNG could not be decoded: its image data
+  is damaged", both kinds: data that cannot be inflated at all (`r8-damaged.png`, which the webview
+  would insert as an invisible picture) and data corrupted mid-stream (`r9-midcorrupt.png`, which it
+  would insert half black). The same PNGs embedded in an SVG refuse the SVG ("an embedded PNG
+  picture could not be decoded"). Large valid PNGs (interlaced, 16-bit, palette) still insert
+  without a visible pause. A drop of a refused file and a good one inserts the good one.
 - Document size: on a document already near 60 MB, drop several large pictures. Those that fit are
   inserted; the rest are refused by name ("it would make the document larger than 64.0 MB, the most
   ChemDraft can open"). Save, close and reopen the document: it opens.

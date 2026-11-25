@@ -1,4 +1,5 @@
 // @vitest-environment jsdom
+import { readFileSync } from "node:fs";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -7,7 +8,9 @@ import { MainWindow, objectResizeStretches } from "./MainWindow";
 import { createPhase4Document } from "./documentWorkflow";
 import { DOCUMENT_FILE_DROP_EVENT } from "./imageDrop/dropPosition";
 import { browserDecodeCheck, browserRasterToPng } from "./imageDrop/rasterDecode";
+import { damagedDropFixture } from "./imageDrop/pngTestImages";
 import { jpegHeader, pngBytes, svgBytes } from "./imageDrop/testFixtures";
+import { setNativePromptProvider } from "./nativePrompt";
 import { picturePngBase64 } from "./testSupport/imageFixture";
 import { MemoryStorage } from "./testSupport/memoryStorage";
 
@@ -303,10 +306,10 @@ describe("dropping picture files on the document window", { timeout: 3 * DROP_WA
 
     await browserDrop([dropFile("mixed.png", pngBytes()), dropFile("scan.bmp", new Uint8Array(30)), documentFile("Mixed document")], { x: 200, y: 200 });
     // The picture went into the tab under the drop; the document then opened in a tab of its own,
-    // which shows the whole outcome (one document opened adds no summary of its own).
+    // which shows the whole outcome, naming the document as its own open would.
     const pictureStatus = "Inserted picture mixed.png; Couldn't drop \"scan.bmp\": BMP and TIFF pictures can't be dropped yet; save it as PNG or JPEG first.";
     await eventually(() => expect(snapshot().title).toBe("Mixed document"));
-    await eventually(() => expect(status()).toBe(pictureStatus));
+    await eventually(() => expect(status()).toBe(`${pictureStatus.replace(/\.$/, "")}; Opened Mixed document.chemdraft as legacy ChemDraft JSON`));
     expect(tabs()).toHaveLength(2);
     // The receiving tab keeps the pictures' own result, never "Reading…".
     await act(async () => { tabs()[0]!.click(); });
@@ -392,6 +395,114 @@ describe("dropping picture files on the document window", { timeout: 3 * DROP_WA
     await eventually(() => expect(snapshot().title).toBe("From the tab strip"));
   });
 
+  it("refuses PNGs whose image data is damaged, by name, and inserts a good one dropped with them", async () => {
+    await mount();
+    const damaged = "the PNG could not be decoded: its image data is damaged";
+    await browserDrop([dropFile("r8-damaged.png", damagedDropFixture("r8-damaged.png")),
+      dropFile("r9-midcorrupt.png", damagedDropFixture("r9-midcorrupt.png"))], { x: 100, y: 100 });
+    await eventually(() => expect(status()).toBe(`No pictures were inserted; Couldn't drop "r8-damaged.png": ${damaged}; `
+      + `Couldn't drop "r9-midcorrupt.png": ${damaged}.`));
+    expect(pictures()).toHaveLength(0);
+    await browserDrop([dropFile("r8-damaged.png", damagedDropFixture("r8-damaged.png")), dropFile("ok.png", pngBytes()),
+      dropFile("r9-midcorrupt.png", damagedDropFixture("r9-midcorrupt.png"))], { x: 100, y: 100 });
+    await eventually(() => expect(status()).toBe(`Inserted picture ok.png; Couldn't drop "r8-damaged.png": ${damaged}; `
+      + `Couldn't drop "r9-midcorrupt.png": ${damaged}.`));
+    expect(pictures().map(picture => picture.data.image!.dataBase64)).toEqual([btoa(String.fromCharCode(...pngBytes()))]);
+  });
+
+  describe("a mixed drop names the picture and every document", () => {
+    const cdxml = (atoms = '<n id="10" Element="6" p="20 30"/><n id="11" Element="8" p="40 30"/>') =>
+      `<?xml version="1.0" encoding="UTF-8"?><CDXML><page id="1" BoundingBox="0 0 612 792"><fragment id="2">${atoms}`
+      + '<b id="20" B="10" E="11" Order="1"/></fragment></page></CDXML>';
+    // The second atom lies past the declared Letter page, so opening it asks about the page size.
+    const oversized = cdxml('<n id="10" Element="6" p="75 75"/><n id="11" Element="6" p="975 75"/>');
+    const cdxmlFile = (name: string, source = cdxml()) => dropFile(name, new TextEncoder().encode(source));
+    // `cdxml()` names no atom labels the import keeps, so its open reports two warnings.
+    const opened = (name: string, warnings = " with 2 warnings") => `Opened ${name} as external CDXML subset${warnings}`;
+    const warningButton = () => container.querySelector("[data-open-warnings-button]");
+    /** The tab in front, by its title (a CDXML document's own title is not its file name). */
+    const front = () => container.querySelector('[role="tab"][aria-selected="true"]')?.textContent;
+
+    it("names both on the browser route, and the receiving tab keeps the picture's own status", async () => {
+      await mount();
+      await browserDrop([dropFile("mixed.png", pngBytes()), cdxmlFile("mixed.cdxml")], { x: 100, y: 100 });
+      await eventually(() => expect(front()).toBe("mixed.cdxml"));
+      await eventually(() => expect(status()).toBe(`Inserted picture mixed.png; ${opened("mixed.cdxml")}`));
+      await act(async () => { tabs()[0]!.click(); });
+      await eventually(() => expect(status()).toBe("Inserted picture mixed.png"));
+      expect(pictures()).toHaveLength(1);
+    });
+
+    it("names both on the native route", async () => {
+      native.desktop = true;
+      native.files.set("/Users/me/Drops/mixed.png", pngBytes());
+      native.files.set("/Users/me/Drops/mixed.cdxml", new TextEncoder().encode(cdxml()));
+      native.stat.mockImplementation(async path => ({ size: native.files.get(path)?.length ?? 0 }));
+      await mount(createPhase4Document("Desktop"), "windows");
+      await eventually(() => expect(native.events.has(DOCUMENT_FILE_DROP_EVENT)).toBe(true));
+      await act(async () => native.events.get(DOCUMENT_FILE_DROP_EVENT)!({ paths: ["/Users/me/Drops/mixed.png", "/Users/me/Drops/mixed.cdxml"],
+        position: { x: 10, y: 10 }, units: "physical", topInsetRemoved: 0 }));
+      await eventually(() => expect(status()).toBe(`Inserted picture mixed.png; ${opened("mixed.cdxml")}`));
+      expect(front()).toBe("mixed.cdxml");
+    });
+
+    it("names each of two documents with its own status, warnings included, and leaves the warnings on the tab", async () => {
+      await mount();
+      const metals = readFileSync("packages/fixtures/cdxml/ten-metals.cdxml", "utf8");
+      await browserDrop([cdxmlFile("plain.cdxml"), dropFile("one.png", pngBytes()), cdxmlFile("metals.cdxml", metals)], { x: 100, y: 100 });
+      await eventually(() => expect(front()).toBe("metals.cdxml"));
+      await eventually(() => expect(status()).toBe(`Inserted picture one.png; ${opened("plain.cdxml")}; ${opened("metals.cdxml", " with 11 warnings")}`));
+      expect(warningButton()?.textContent).toContain("11 warnings");
+      expect(tabs()).toHaveLength(3);
+    });
+
+    it("names a document that was already open as such", async () => {
+      await mount();
+      await browserDrop([documentFile("Kept")]);
+      await eventually(() => expect(snapshot().title).toBe("Kept"));
+      await command("document.new");
+      await eventually(() => expect(tabs()).toHaveLength(2));
+      await browserDrop([dropFile("again.png", pngBytes()), documentFile("Kept")], { x: 100, y: 100 });
+      await eventually(() => expect(status()).toBe("Inserted picture again.png; Kept.chemdraft was already open"));
+      expect(snapshot().title).toBe("Kept");
+      expect(tabs()).toHaveLength(2);
+    });
+
+    it("leaves out the page-size clause once its prompt has been answered", async () => {
+      const prompts: string[] = [];
+      const restore = setNativePromptProvider(async prompt => {
+        prompts.push(prompt.title);
+        return "keep";
+      });
+      try {
+        await mount();
+        await browserDrop([dropFile("wide.png", pngBytes()), cdxmlFile("wide.cdxml", oversized)], { x: 100, y: 100 });
+        await eventually(() => expect(status()).toBe(`Inserted picture wide.png; ${opened("wide.cdxml")}`));
+        expect(front()).toBe("wide.cdxml");
+        expect(prompts).toEqual(["Imported Content Exceeds Page"]);
+      } finally { restore(); }
+    });
+
+    it("names a document that fails, and the one that opened beside it", async () => {
+      await mount();
+      await browserDrop([dropFile("p.png", pngBytes()), cdxmlFile("broken.cdxml", "not a document")], { x: 100, y: 100 });
+      await eventually(() => expect(status()).toMatch(/^Inserted picture p\.png; Could not open broken\.cdxml: ./));
+      await browserDrop([dropFile("q.png", pngBytes()), cdxmlFile("good.cdxml"), cdxmlFile("broken.cdxml", "not a document")], { x: 100, y: 100 });
+      await eventually(() => expect(status()).toMatch(
+        new RegExp(`^Inserted picture q\\.png; ${opened("good.cdxml").replaceAll(".", "\\.")}; Opened 1 of 2 files\\. Could not open broken\\.cdxml: .`)));
+    });
+
+    it("leaves a drop of documents alone showing what it showed before", async () => {
+      await mount();
+      await browserDrop([cdxmlFile("only.cdxml")]);
+      await eventually(() => expect(front()).toBe("only.cdxml"));
+      await eventually(() => expect(status()).toBe(opened("only.cdxml")));
+      await browserDrop([cdxmlFile("a.cdxml"), cdxmlFile("b.cdxml")]);
+      await eventually(() => expect(front()).toBe("b.cdxml"));
+      await eventually(() => expect(status()).toBe(opened("b.cdxml")));
+    });
+  });
+
   describe("desktop document file drop event", () => {
     it.each([
       // macOS: Rust has already taken the 28-point title-bar inset off y; it is not taken off again.
@@ -422,7 +533,8 @@ describe("dropping picture files on the document window", { timeout: 3 * DROP_WA
       await eventually(() => expect(native.events.has(DOCUMENT_FILE_DROP_EVENT)).toBe(true));
       await act(async () => native.events.get(DOCUMENT_FILE_DROP_EVENT)!({ paths: ["C:\\Pictures\\big.png", "C:\\Drawings\\doc.chemdraft"],
         position: { x: 10, y: 10 }, units: "physical", topInsetRemoved: 0 }));
-      await eventually(() => expect(status()).toBe("No pictures were inserted; Couldn't drop \"big.png\": it is 21.0 MB; a dropped picture can be at most 20.0 MB."));
+      await eventually(() => expect(status()).toBe("No pictures were inserted; Couldn't drop \"big.png\": it is 21.0 MB; a dropped picture can be at most 20.0 MB; "
+        + "Opened doc.chemdraft as legacy ChemDraft JSON"));
       expect(snapshot().title).toBe("Native document");
     });
 

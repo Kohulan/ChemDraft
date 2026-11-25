@@ -215,7 +215,10 @@ export type DroppedImageInsertion =
 export interface DroppedFilesHandler<T> {
   nameOf(file: T): string;
   imageSource(file: T): DroppedImageSource;
-  /** The existing document-open path, unchanged; resolves to its own summary status, if any. */
+  /**
+   * The existing document-open path, unchanged; resolves to what the outcome says of the documents
+   * (each by name, then any failures), if anything. Ignored for a drop of documents alone.
+   */
   openDocuments(files: T[]): Promise<string | undefined>;
   /** Why the drop's target cannot take pictures now (the edit guards), asked at drop time. */
   insertRefusal?(): string | undefined;

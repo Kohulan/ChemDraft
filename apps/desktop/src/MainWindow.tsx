@@ -65,7 +65,9 @@ import { loadAskToSaveBeforeQuit } from "./quitSettings";
 import { loadStartWithFreshDocument } from "./startupSettings";
 import { nativePrompt, useNativePrompt } from "./nativePrompt";
 import { notifyNativeDocumentCompatibility } from "./nativeDocumentNotice";
-import { formatDocumentOpenBatchStatus, formatDocumentOpenFailure, listenAndDrainNativeOpenQueue, type DocumentOpenResult } from "./nativeOpenQueue";
+import {
+  formatDocumentOpenBatchStatus, formatDocumentOpenDropOutcome, formatDocumentOpenFailure, listenAndDrainNativeOpenQueue, type DocumentOpenResult
+} from "./nativeOpenQueue";
 import { useInAppModalUtilitySuspension } from "./useInAppModalUtilitySuspension";
 import { Icon } from "./icons";
 import { snapRotationDegrees } from "./rotationSnap";
@@ -1540,6 +1542,12 @@ type OpenDocumentContentsOptions = {
   dirty?: boolean;
   /** Replaces the "Opened …" status line (e.g. "Restored last session — …"). */
   statusOverride?: string;
+  /**
+   * The open's own status line once its tab is in front, for a drop's outcome: the "Opened …" line
+   * (or `statusOverride`) without the page-size clause, which is stale once the prompt is answered,
+   * or that the file was already open.
+   */
+  onStatus?: (status: string) => void;
 };
 export type NativeMoleculeSelectionPart =
   | { objectId: string; kind: "atom"; atomId: string }
@@ -1900,7 +1908,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.25.05.59-opus";
+const CURRENT_BUILD_STAMP = "11.25.06.31-opus";
 
 /**
  * Sets `target` to `markIds`. A commit updater fills its policy's `IndependentMarkMoves` this way:
@@ -10779,7 +10787,10 @@ export function MainWindow({
         browserFileKeysRef.current.get(tab.id) === browserKey);
     if (existing) {
       activateDocumentTab(existing.id, options?.onRefused);
-      if (activeDocumentTabIdRef.current === existing.id) options?.onOpened?.();
+      if (activeDocumentTabIdRef.current === existing.id) {
+        options?.onStatus?.(`${displayName} was already open`);
+        options?.onOpened?.();
+      }
       perfHook(() => reportOutcome?.("already-open"));
       return;
     }
@@ -10827,6 +10838,7 @@ export function MainWindow({
     setStatus(fitRecommendation
       ? `${openStatus}; imported content exceeds ${pageFitPromptLayoutLabel(fitRecommendation.currentPageTitle, fitRecommendation.currentOrientation)}`
       : openStatus);
+    options?.onStatus?.(openStatus);
     options?.onOpened?.();
     perfHook(() => reportOutcome?.("installed"));
     await pageFitSettled;
@@ -10869,13 +10881,16 @@ export function MainWindow({
     return run;
   }, []);
 
-  // Resolves to the batch's summary status (also shown here), so a drop can add its pictures to it.
+  // Shows the batch's summary (its failures) as before. Resolves to what a drop's outcome says of the
+  // documents: each one opened by its own status line, then that summary. Only a drop with pictures
+  // shows it; every other open ignores it.
   const openDocumentBatch = useCallback((requests: readonly DocumentOpenRequest[]): Promise<string | undefined> => {
     const results = requests.map(({ contents, displayName, path, receipt }) => {
       // Confirm at tab installation, before optional page-fit and compatibility dialogs.
       // A rejected parse or an early return (e.g. unfinished table edit) fails the receipt.
       let opened = false;
       let refusal: string | undefined;
+      let status: string | undefined;
       const confirm = (installed: boolean) => {
         if (!receipt) return;
         void confirmNativeOpen(receipt, installed).catch(error =>
@@ -10883,10 +10898,11 @@ export function MainWindow({
       };
       const options: OpenDocumentContentsOptions = {
         onOpened: () => { opened = true; confirm(true); },
-        onRefused: message => { refusal = message; }
+        onRefused: message => { refusal = message; },
+        onStatus: message => { status = message; }
       };
       return openDocumentContents(contents, displayName, path, options).then(
-        (): DocumentOpenResult => opened ? { displayName }
+        (): DocumentOpenResult => opened ? { displayName, ...(status ? { status } : {}) }
           : { displayName, error: refusal ?? "Finish or cancel the current edit and try again." },
         (error: unknown): DocumentOpenResult => ({ displayName, error })
       ).finally(() => { if (!opened) confirm(false); });
@@ -10894,12 +10910,13 @@ export function MainWindow({
     // Reserve the summary's place before any later batch. Each open includes its page-fit and
     // compatibility prompts, so keeping an imported page finishes successfully before we count it.
     const finished = documentOpenQueueRef.current.then(async () => {
-      const summary = formatDocumentOpenBatchStatus(await Promise.all(results));
+      const settled = await Promise.all(results);
+      const summary = formatDocumentOpenBatchStatus(settled);
       if (summary) {
         setStatus(summary);
         if (!documentSessionHydratedRef.current) shellOpenFailureRef.current = summary;
       }
-      return summary || undefined;
+      return formatDocumentOpenDropOutcome(settled);
     });
     documentOpenQueueRef.current = finished.catch(() => undefined);
     return finished;
