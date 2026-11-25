@@ -455,8 +455,8 @@ describe("PluginPanelWindow (unified renderer, ADR-0030)", () => {
   it("restores an enlarged panel on ChemDraft's own hides, keeps it on app hide, and never activates under a modal", () => {
     const nativePath = join(dirname(fileURLToPath(import.meta.url)), "../../src-tauri/src");
     const source = readFileSync(join(nativePath, "lib.rs"), "utf8");
-    // Utility suspension (file pickers) and screen capture restore before their own hides.
-    expect(source).toMatch(/panel_window::end_for_hide\(window\.app_handle\(\), window\.label\(\)\);\s*panel_full_size::before_hide\(&window\);\s*if let Err\(error\) = window\.hide\(\)/);
+    // Utility suspension (file pickers) and screen capture restore before their own hides (suspension then records a pinned palette position before hiding).
+    expect(source).toMatch(/panel_window::end_for_hide\(window\.app_handle\(\), window\.label\(\)\);\s*panel_full_size::before_hide\(&window\);[\s\S]*?palette_position_to_keep[\s\S]*?if let Err\(error\) = window\.hide\(\)/);
     const capture = readFileSync(join(nativePath, "screen_capture.rs"), "utf8");
     // Screen capture restores and hides together on the main thread (the restore requires it).
     expect(capture).toMatch(/run_on_main_thread_blocking\(app, move \|\| hide_visible_windows\(&on_main\)\)/);

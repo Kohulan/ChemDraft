@@ -3270,11 +3270,12 @@ describe("documents in one window", () => {
     await expectPristineUntitled();
   });
 
-  async function mountForShortcutPlatform(platform: "macos" | "windows") {
-    vi.spyOn(window.navigator, "platform", "get").mockReturnValue(platform === "macos" ? "MacIntel" : "Win32");
+  async function mountForShortcutPlatform(platform: "macos" | "windows" | "linux") {
+    vi.spyOn(window.navigator, "platform", "get").mockReturnValue(
+      platform === "macos" ? "MacIntel" : platform === "windows" ? "Win32" : "Linux x86_64");
     await remount();
   }
-  async function closeWithShortcut(platform: "macos" | "windows") {
+  async function closeWithShortcut(platform: "macos" | "windows" | "linux") {
     await mountForShortcutPlatform(platform);
     const event = new KeyboardEvent("keydown", {
       key: "w", [platform === "macos" ? "metaKey" : "ctrlKey"]: true,
@@ -3297,6 +3298,30 @@ describe("documents in one window", () => {
   it("Ctrl+W prompts for the only dirty Windows drawing; Cancel retains it and Don't Save replaces it", async () => {
     await closeWithShortcut("windows");
     await paste("Windows drawing to close");
+    const before = bridge().snapshot().document;
+    const closedTab = tabs()[0];
+
+    const cancelEvent = new KeyboardEvent("keydown", { key: "w", ctrlKey: true, bubbles: true, cancelable: true });
+    await act(async () => window.dispatchEvent(cancelEvent));
+    expect(cancelEvent.defaultPrevented).toBe(true);
+    expect(pendingPrompt?.prompt.message).toContain("Save the changes to Untitled?");
+    await modalButton("Cancel");
+    expect(tabs()[0]).toBe(closedTab);
+    expect(bridge().snapshot().document).toEqual(before);
+    expect(bridge().snapshot().file.dirty).toBe(true);
+
+    const discardEvent = new KeyboardEvent("keydown", { key: "w", ctrlKey: true, bubbles: true, cancelable: true });
+    await act(async () => window.dispatchEvent(discardEvent));
+    expect(discardEvent.defaultPrevented).toBe(true);
+    await modalButton("Don't Save");
+    expect(tabs()[0]).not.toBe(closedTab);
+    await expectPristineUntitled();
+  });
+
+  it("Ctrl+W prompts for the only dirty Linux drawing; Cancel retains it and Don't Save replaces it", async () => {
+    // Linux has no Ctrl+W menu accelerator: the webview's own binding is the only route.
+    await closeWithShortcut("linux");
+    await paste("Linux drawing to close");
     const before = bridge().snapshot().document;
     const closedTab = tabs()[0];
 

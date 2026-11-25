@@ -174,7 +174,7 @@ describe("palette work-area sizing", () => {
     const nativeSource = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../../src-tauri/src/lib.rs"), "utf8");
     const open = nativeSource.split("fn ensure_toolset_window<")[1]!.split("fn install_toolset_input_focus<")[0]!;
     expect(open).toMatch(
-      /recover_offscreen_toolset_window\(app, &window, resizable\);(?:\s*\/\/[^\n]*)*\s*if !palette_first_paint::reopened\(&label\) \{\s*window\.show\(/,
+      /let moved_to = recover_offscreen_toolset_window\(app, &window, resizable, "reopen"\);(?:\s*\/\/[^\n]*)*\s*if !palette_first_paint::reopened\(&label\) \{(?:\s*\/\/[^\n]*)*\s*if hidden \{\s*pin_palette_for_map\(app, &window, resizable, moved_to, [^)]*\);\s*\}\s*window\.show\(/,
     );
     expect(open).toMatch(/let \(position, width, height, adjusted\) =\s*clamp_toolset_frame\([\s\S]*?\.inner_size\(width, height\)/);
     // Windows: clamp, build hidden through palette_first_paint, place, then the reveal is armed.

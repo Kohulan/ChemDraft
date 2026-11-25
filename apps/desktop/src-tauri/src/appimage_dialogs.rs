@@ -1,18 +1,30 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use tauri::{
     ipc::Invoke,
     plugin::{Plugin, TauriPlugin},
     AppHandle, Manager, Runtime, Window,
 };
-use tauri_plugin_dialog::{DialogExt, FileDialogBuilder, FilePath};
+use tauri_plugin_dialog::{
+    DialogExt, FileDialogBuilder, FilePath, MessageDialogBuilder, MessageDialogButtons,
+    MessageDialogKind, MessageDialogResult,
+};
 use tauri_plugin_fs::FsExt;
 
-pub(super) struct AppImageDialogs<R: Runtime>(pub(super) TauriPlugin<R>);
+/// The dialog plugin as every Linux build registers it. AppImage builds take over the file pickers
+/// (default folders, scope grants); every build shows its message prompts through [`prompt`].
+pub(super) struct AppImageDialogs<R: Runtime> {
+    pub(super) inner: TauriPlugin<R>,
+    pub(super) appimage: bool,
+}
 
 impl<R: Runtime> Plugin<R> for AppImageDialogs<R> {
     fn name(&self) -> &'static str {
-        self.0.name()
+        self.inner.name()
     }
 
     fn initialize(
@@ -20,24 +32,329 @@ impl<R: Runtime> Plugin<R> for AppImageDialogs<R> {
         app: &AppHandle<R>,
         config: serde_json::Value,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        self.0.initialize(app, config)
+        self.inner.initialize(app, config)
     }
 
     fn initialization_script(&self) -> Option<String> {
-        self.0.initialization_script()
+        self.inner.initialization_script()
     }
 
     fn extend_api(&mut self, invoke: Invoke<R>) -> bool {
         // Keep the existing dialog command names and Tauri ACL. Use its native builder, and
         // continue to grant access only to the picked paths in both filesystem scopes.
         match invoke.message.command() {
-            "open" | "save" => {
+            "open" | "save" if self.appimage => {
                 let handler: fn(Invoke<R>) -> bool =
                     tauri::generate_handler![#![plugin(dialog)] open, save];
                 handler(invoke)
             }
-            _ => self.0.extend_api(invoke),
+            "message" => {
+                let handler: fn(Invoke<R>) -> bool =
+                    tauri::generate_handler![#![plugin(dialog)] message];
+                handler(invoke)
+            }
+            _ => self.inner.extend_api(invoke),
         }
+    }
+}
+
+/// The dialog plugin's `message` command, shown through [`prompt`]: same arguments, same result.
+#[tauri::command]
+async fn message<R: Runtime>(
+    window: Window<R>,
+    title: Option<String>,
+    message: String,
+    kind: Option<MessageDialogKind>,
+    buttons: Option<MessageDialogButtons>,
+) -> MessageDialogResult {
+    let mut dialog = prompt(
+        window.app_handle(),
+        Some(&window),
+        title.as_deref(),
+        &message,
+    );
+    if let Some(buttons) = buttons {
+        dialog = dialog.buttons(gtk_buttons(buttons));
+    }
+    if let Some(kind) = kind {
+        dialog = dialog.kind(kind);
+    }
+    dialog.blocking_show_with_result()
+}
+
+/// A message prompt from [`prompt`]. Showing it through here tells the parenting poll when it was
+/// answered, so a prompt answered before any poll saw it does not keep the poll running.
+pub(super) struct Prompt<R: Runtime> {
+    builder: MessageDialogBuilder<R>,
+    answered: Arc<AtomicBool>,
+}
+
+impl<R: Runtime> Prompt<R> {
+    pub(super) fn kind(mut self, kind: MessageDialogKind) -> Self {
+        self.builder = self.builder.kind(kind);
+        self
+    }
+
+    fn buttons(mut self, buttons: MessageDialogButtons) -> Self {
+        self.builder = self.builder.buttons(buttons);
+        self
+    }
+
+    /// Show the prompt without waiting for it; `on_answer` gets the plugin's result.
+    pub(super) fn show(self, on_answer: impl FnOnce(bool) + Send + 'static) {
+        let answered = self.answered;
+        self.builder.show(move |result| {
+            answered.store(true, Ordering::Release);
+            on_answer(result);
+        });
+    }
+
+    fn blocking_show_with_result(self) -> MessageDialogResult {
+        let result = self.builder.blocking_show_with_result();
+        self.answered.store(true, Ordering::Release);
+        result
+    }
+}
+
+/// A message prompt that is safe to hand to rfd's GTK backend, made transient for the document
+/// window once it appears. Every Linux prompt goes through here: the webview's `message` command,
+/// the update notice and the shell-open error alike.
+///
+/// rfd 0.16 passes the message to `gtk_message_dialog_format_secondary_text` as the printf FORMAT,
+/// so a '%' in it (a document named "100%s.chemdraft" in "Save changes to …?") read a missing
+/// vararg and could crash the app; it also builds a `CString` from the title, the message and
+/// custom button labels with `unwrap`, so an embedded NUL panicked.
+pub(super) fn prompt<R: Runtime>(
+    app: &AppHandle<R>,
+    caller: Option<&Window<R>>,
+    title: Option<&str>,
+    message: &str,
+) -> Prompt<R> {
+    let text = PromptText::new(title, message);
+    // tauri-plugin-dialog titles an untitled prompt with the package name, and rfd sets it as the
+    // GTK window title.
+    let shown = ShownPrompt {
+        title: text
+            .title
+            .clone()
+            .unwrap_or_else(|| app.package_info().name.clone()),
+        body: text.shown,
+    };
+    let mut builder = app.dialog().message(text.format);
+    if let Some(title) = text.title {
+        builder = builder.title(title);
+    }
+    match caller {
+        Some(window) => builder = builder.parent(window),
+        None => {
+            if let Some(main) = app.get_webview_window(super::MAIN_WINDOW_LABEL) {
+                builder = builder.parent(&main);
+            }
+        }
+    }
+    let answered = Arc::new(AtomicBool::new(false));
+    parent_message_dialog(app, caller.cloned(), shown, Arc::clone(&answered));
+    Prompt { builder, answered }
+}
+
+/// The text of one prompt as rfd's GTK backend needs it.
+#[derive(Debug, PartialEq, Eq)]
+struct PromptText {
+    /// The title, without NULs. rfd shows it through a "%s" format, so '%' is left alone.
+    title: Option<String>,
+    /// The message as a printf format whose output is `shown`: NULs removed, '%' doubled.
+    format: String,
+    /// The message as GTK will display it; the dialog is recognised by it.
+    shown: String,
+}
+
+impl PromptText {
+    fn new(title: Option<&str>, message: &str) -> Self {
+        let shown = without_nul(message);
+        Self {
+            title: title.map(without_nul),
+            format: shown.replace('%', "%%"),
+            shown,
+        }
+    }
+}
+
+/// `CString::new` rejects an interior NUL, and rfd unwraps it. Nothing a person reads is lost.
+fn without_nul(text: &str) -> String {
+    text.replace('\0', "")
+}
+
+/// What GTK will show for one prompt; its dialog is recognised by both.
+#[derive(Debug, PartialEq, Eq)]
+struct ShownPrompt {
+    /// The window title rfd sets.
+    title: String,
+    /// The secondary text: the message after printf formatting.
+    body: String,
+}
+
+/// Whether a GTK message dialog is this prompt's: it did not exist when the prompt started, has no
+/// parent yet, and shows this prompt's title and message. A dialog that matches only by message
+/// (another prompt with the same text opened meanwhile) is not ours.
+fn is_this_prompt(
+    existed_at_snapshot: bool,
+    has_parent: bool,
+    title: Option<&str>,
+    body: Option<&str>,
+    expected: &ShownPrompt,
+) -> bool {
+    !existed_at_snapshot
+        && !has_parent
+        && title.unwrap_or_default() == expected.title
+        && body == Some(expected.body.as_str())
+}
+
+/// Custom button labels become `CString`s in rfd too (they are not formats).
+fn gtk_buttons(buttons: MessageDialogButtons) -> MessageDialogButtons {
+    match buttons {
+        MessageDialogButtons::OkCustom(ok) => MessageDialogButtons::OkCustom(without_nul(&ok)),
+        MessageDialogButtons::OkCancelCustom(ok, cancel) => {
+            MessageDialogButtons::OkCancelCustom(without_nul(&ok), without_nul(&cancel))
+        }
+        MessageDialogButtons::YesNoCancelCustom(yes, no, cancel) => {
+            MessageDialogButtons::YesNoCancelCustom(
+                without_nul(&yes),
+                without_nul(&no),
+                without_nul(&cancel),
+            )
+        }
+        other => other,
+    }
+}
+
+/// Make this prompt's GTK message dialog transient for the document window.
+///
+/// tauri-plugin-dialog passes the calling window as the parent, but rfd's GTK backend builds its
+/// message box with `gtk_message_dialog_new(NULL, …)` and drops it. Without WM_TRANSIENT_FOR, KWin
+/// does not keep the modal box above the document: any click that raises the document window
+/// (a menu, the canvas) buried "Save changes before closing?" behind it, while the palettes stayed
+/// hidden for the prompt and the menus stayed blocked, so ChemDraft looked frozen with its
+/// toolbars gone. The box is created after this is queued, so poll for it on GTK's main thread
+/// (nested `gtk_dialog_run` loops still dispatch timeouts) and give up after five seconds, or a
+/// minute while there is no owner yet. A prompt answered before it could be parented ends the poll
+/// at once, whether or not a poll ever saw it (`answered`, set when its response arrives).
+///
+/// Only this prompt's dialog is parented: one that did not exist when the prompt started, still
+/// has no parent, and shows this prompt's title and message ([`is_this_prompt`]). Another
+/// parentless message box that was already open (or opened by someone else meanwhile) is left
+/// alone, and the poll does not stop on it.
+///
+/// The owner is looked up on every poll. A prompt raised while the document window is still
+/// hidden, such as "ChemDraft Could Not Open a Document" for a launch argument (setup runs before
+/// the document window's first paint shows it), waits for that window instead of staying
+/// parentless, where one click on the document buried it ([`parent_poll_step`]).
+fn parent_message_dialog<R: Runtime>(
+    app: &AppHandle<R>,
+    caller: Option<Window<R>>,
+    shown: ShownPrompt,
+    answered: Arc<AtomicBool>,
+) {
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        use gtk::prelude::{Cast, GtkWindowExt, MessageDialogExt, WidgetExt};
+
+        // Prefer the document window: palettes are hidden while a prompt is up.
+        let owner = move || {
+            handle
+                .get_webview_window(super::MAIN_WINDOW_LABEL)
+                .and_then(|main| main.gtk_window().ok())
+                .filter(|main| main.is_visible())
+                .or_else(|| caller.as_ref().and_then(|caller| caller.gtk_window().ok()))
+        };
+        let message_dialogs = || {
+            gtk::Window::list_toplevels()
+                .into_iter()
+                .filter_map(|widget| widget.downcast::<gtk::MessageDialog>().ok())
+        };
+        let earlier = message_dialogs().collect::<Vec<_>>();
+        let started = std::time::Instant::now();
+        let mut seen = false;
+        let _ = gtk::glib::timeout_add_local(PARENT_POLL_INTERVAL, move || {
+            let ours = message_dialogs().find(|dialog| {
+                is_this_prompt(
+                    earlier.contains(dialog),
+                    dialog.transient_for().is_some(),
+                    dialog.title().as_deref(),
+                    dialog.secondary_text().as_deref(),
+                    &shown,
+                )
+            });
+            let parent = owner();
+            // Answered: destroyed (no longer found), or only hidden once it had been shown.
+            let showing = ours.as_ref().is_some_and(|dialog| dialog.is_visible());
+            let found = ours.is_some() && (showing || !seen);
+            let step = parent_poll_step(
+                found,
+                parent.is_some(),
+                seen,
+                answered.load(Ordering::Acquire),
+                started.elapsed(),
+            );
+            seen |= showing;
+            match step {
+                PollStep::Parent => {
+                    if let (Some(dialog), Some(parent)) = (ours, parent) {
+                        dialog.set_transient_for(Some(parent.upcast_ref::<gtk::Window>()));
+                    }
+                    gtk::glib::ControlFlow::Break
+                }
+                PollStep::Wait => gtk::glib::ControlFlow::Continue,
+                PollStep::GiveUp => gtk::glib::ControlFlow::Break,
+            }
+        });
+    });
+}
+
+/// How often [`parent_message_dialog`] looks for its dialog and owner.
+const PARENT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
+/// Five seconds for the dialog to appear while an owner is there to take it.
+const DIALOG_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// A minute for the document window to appear: a slow first launch still shows it in time.
+const OWNER_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// What one poll of [`parent_message_dialog`] does.
+#[derive(Debug, PartialEq, Eq)]
+enum PollStep {
+    /// Make the dialog transient for the owner, and stop.
+    Parent,
+    Wait,
+    /// Stop without parenting: the time is up, or the prompt was answered before it could be.
+    GiveUp,
+}
+
+/// A prompt whose response has arrived (`answered`) is done: stop, even if no poll ever saw its
+/// dialog (answered within the first interval). Otherwise parent as soon as both this prompt's
+/// dialog and a visible owner exist. A dialog that was shown on an earlier poll (`seen`) and is
+/// gone now was answered: stop. Otherwise waiting on the dialog
+/// alone stops [`DIALOG_WAIT`] after the poll started; while there is no owner yet the poll waits up
+/// to [`OWNER_WAIT`], so a prompt from setup still ends up above the document window. Bounded by
+/// time, not by callbacks, which a busy main loop delivers late.
+fn parent_poll_step(
+    found: bool,
+    owner: bool,
+    seen: bool,
+    answered: bool,
+    elapsed: std::time::Duration,
+) -> PollStep {
+    if answered {
+        return PollStep::GiveUp;
+    }
+    if found && owner {
+        return PollStep::Parent;
+    }
+    if seen && !found {
+        return PollStep::GiveUp;
+    }
+    let limit = if owner { DIALOG_WAIT } else { OWNER_WAIT };
+    if elapsed < limit {
+        PollStep::Wait
+    } else {
+        PollStep::GiveUp
     }
 }
 
@@ -156,4 +473,203 @@ fn grant_path<R: Runtime>(
         scope.allow_file(&path)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What a printf-family function prints for a format with no conversions but "%%".
+    fn printf_output(format: &str) -> Option<String> {
+        let mut out = String::new();
+        let mut chars = format.chars();
+        while let Some(character) = chars.next() {
+            // Anything but "%%" would read a vararg rfd never passes.
+            if character == '%' && chars.next() != Some('%') {
+                return None;
+            }
+            out.push(character);
+        }
+        Some(out)
+    }
+
+    #[test]
+    fn a_percent_in_the_message_is_a_literal_for_gtk() {
+        for message in [
+            "Save changes to \"100%s.chemdraft\" before closing?",
+            "Yield 92% after %n %d %x %p %%",
+            "%",
+            "trailing %",
+            "no conversions at all",
+            "",
+        ] {
+            let text = PromptText::new(None, message);
+            assert_eq!(text.shown, message);
+            assert_eq!(
+                printf_output(&text.format).as_deref(),
+                Some(message),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn nul_characters_never_reach_cstring() {
+        let text = PromptText::new(Some("Close\0 100%s"), "Save \"a\0b%s\"?\0");
+        // The title goes through rfd's own "%s", so its '%' stays single.
+        assert_eq!(text.title.as_deref(), Some("Close 100%s"));
+        assert_eq!(text.shown, "Save \"ab%s\"?");
+        assert_eq!(text.format, "Save \"ab%%s\"?");
+        for text in [text.title.unwrap(), text.shown, text.format] {
+            assert!(std::ffi::CString::new(text).is_ok());
+        }
+        assert_eq!(PromptText::new(None, "x").title, None);
+    }
+
+    #[test]
+    fn only_a_new_parentless_dialog_with_this_title_and_message_is_ours() {
+        let shown = ShownPrompt {
+            title: "ChemDraft".into(),
+            body: "Save changes to \"100%s.chemdraft\" before closing?".into(),
+        };
+        let ours = |existed: bool, parented: bool, title: Option<&str>, body: Option<&str>| {
+            is_this_prompt(existed, parented, title, body, &shown)
+        };
+        let body = Some(shown.body.as_str());
+        assert!(ours(false, false, Some("ChemDraft"), body));
+        // Already open when the prompt started, or already parented.
+        assert!(!ours(true, false, Some("ChemDraft"), body));
+        assert!(!ours(false, true, Some("ChemDraft"), body));
+        // Same message under another title: someone else's prompt.
+        assert!(!ours(false, false, Some("Other App"), body));
+        assert!(!ours(false, false, None, body));
+        // Same title, other message, or no message.
+        assert!(!ours(false, false, Some("ChemDraft"), Some("Save?")));
+        assert!(!ours(false, false, Some("ChemDraft"), None));
+
+        // An empty title matches a window GTK reports as untitled.
+        let untitled = ShownPrompt {
+            title: String::new(),
+            body: "x".into(),
+        };
+        assert!(is_this_prompt(false, false, None, Some("x"), &untitled));
+        assert!(is_this_prompt(false, false, Some(""), Some("x"), &untitled));
+    }
+
+    #[test]
+    fn a_startup_prompt_waits_for_the_document_window_before_parenting() {
+        let ms = std::time::Duration::from_millis;
+        // The usual case: the document is up and the box appears within a few polls.
+        assert_eq!(
+            parent_poll_step(false, true, false, false, ms(25)),
+            PollStep::Wait
+        );
+        assert_eq!(
+            parent_poll_step(true, true, false, false, ms(75)),
+            PollStep::Parent
+        );
+        // A launch-argument error: setup raises it before the document window is shown. The box
+        // is found but must wait, well past the five seconds a missing box is given.
+        assert_eq!(
+            parent_poll_step(true, false, false, false, ms(25)),
+            PollStep::Wait
+        );
+        assert_eq!(
+            parent_poll_step(true, false, true, false, DIALOG_WAIT + ms(25)),
+            PollStep::Wait
+        );
+        assert_eq!(
+            parent_poll_step(true, true, true, false, DIALOG_WAIT + ms(25)),
+            PollStep::Parent
+        );
+        assert_eq!(
+            parent_poll_step(true, false, true, false, OWNER_WAIT),
+            PollStep::GiveUp
+        );
+        // A box that never appears is given up after five seconds once the owner is there.
+        assert_eq!(
+            parent_poll_step(false, true, false, false, DIALOG_WAIT),
+            PollStep::GiveUp
+        );
+        assert_eq!(
+            parent_poll_step(false, false, false, false, DIALOG_WAIT),
+            PollStep::Wait
+        );
+    }
+
+    #[test]
+    fn a_startup_prompt_answered_before_its_owner_appears_ends_the_poll() {
+        let ms = std::time::Duration::from_millis;
+        // Found, no owner yet: wait.
+        assert_eq!(
+            parent_poll_step(true, false, false, false, ms(25)),
+            PollStep::Wait
+        );
+        // The user answered it: the dialog is gone, so stop at once, owner or not.
+        assert_eq!(
+            parent_poll_step(false, false, true, false, ms(50)),
+            PollStep::GiveUp
+        );
+        assert_eq!(
+            parent_poll_step(false, true, true, false, ms(50)),
+            PollStep::GiveUp
+        );
+    }
+
+    #[test]
+    fn a_prompt_answered_before_any_poll_saw_it_ends_the_poll() {
+        let ms = std::time::Duration::from_millis;
+        // Answered within the first 25 ms: never seen, no owner yet. Without the answer the poll
+        // would wait for the owner for a minute.
+        assert_eq!(
+            parent_poll_step(false, false, false, false, ms(25)),
+            PollStep::Wait
+        );
+        assert_eq!(
+            parent_poll_step(false, false, false, true, ms(25)),
+            PollStep::GiveUp
+        );
+        // Still listed while GTK tears it down, owner or not: nothing left to parent.
+        assert_eq!(
+            parent_poll_step(true, true, false, true, ms(25)),
+            PollStep::GiveUp
+        );
+        assert_eq!(
+            parent_poll_step(true, false, true, true, ms(25)),
+            PollStep::GiveUp
+        );
+    }
+
+    #[test]
+    fn custom_button_labels_lose_their_nul_characters() {
+        let labels = |buttons: MessageDialogButtons| match buttons {
+            MessageDialogButtons::OkCustom(ok) => vec![ok],
+            MessageDialogButtons::OkCancelCustom(ok, cancel) => vec![ok, cancel],
+            MessageDialogButtons::YesNoCancelCustom(yes, no, cancel) => vec![yes, no, cancel],
+            _ => Vec::new(),
+        };
+        assert_eq!(
+            labels(gtk_buttons(MessageDialogButtons::OkCustom("O\0K".into()))),
+            ["OK"]
+        );
+        assert_eq!(
+            labels(gtk_buttons(MessageDialogButtons::OkCancelCustom(
+                "Save 100%".into(),
+                "Can\0cel".into()
+            ))),
+            ["Save 100%", "Cancel"]
+        );
+        assert_eq!(
+            labels(gtk_buttons(MessageDialogButtons::YesNoCancelCustom(
+                "\0Save".into(),
+                "Don't Save".into(),
+                "Cancel\0".into()
+            ))),
+            ["Save", "Don't Save", "Cancel"]
+        );
+        assert!(matches!(
+            gtk_buttons(MessageDialogButtons::YesNo),
+            MessageDialogButtons::YesNo
+        ));
+    }
 }

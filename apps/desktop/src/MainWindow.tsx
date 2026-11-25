@@ -946,7 +946,7 @@ import {
   createMainWindowShortcutCommands,
   defaultClipboardShortcut,
   detectDesktopShortcutPlatform,
-  enableWindowsLastDocumentCloseAction
+  enableLastDocumentCloseAction
 } from "./keyboardShortcuts";
 import { installBrowserReloadGuard, wasBrowserReloadPrevented } from "./browserReloadGuard";
 import { assertDocumentSize, decodeNativeDocumentContents, documentContentsKey, readBrowserDocumentFile, readNativeDocumentFile, type DocumentContents } from "./documentText";
@@ -1899,7 +1899,7 @@ function guardedClipboardPasteDecision(read: ClipboardReadPayload): GuardedClipb
   return { kind: "decided", payload, decision: tableClipboardDecisionBeforePicture(payload) };
 }
 
-const CURRENT_BUILD_STAMP = "11.24.21.14-opus";
+const CURRENT_BUILD_STAMP = "11.24.21.26-opus";
 
 /**
  * Sets `target` to `markIds`. A commit updater fills its policy's `IndependentMarkMoves` this way:
@@ -3640,7 +3640,7 @@ export function MainWindow({
   const canUndo = documentHistory.past.length > 0;
   const canRedo = documentHistory.future.length > 0;
   const quickActions = useMemo(
-    () => enableWindowsLastDocumentCloseAction(createQuickActions(document, selectedMolecule, {
+    () => enableLastDocumentCloseAction(createQuickActions(document, selectedMolecule, {
       canUndo,
       canRedo,
       hasMultipleTabs: documentTabs.length > 1,
