@@ -49,8 +49,42 @@ function zeroPng(width: number, height: number, extra = 0, change = (stream: Uin
   return writeTestPng([{ type: "IHDR", data: header }, { type: "IDAT", data: stream }, { type: "IEND", data: new Uint8Array() }]);
 }
 
+/**
+ * A check pauses at every chance it gives, however fast the machine: a turn is always due. Each
+ * chance is a 1 MiB CRC piece or 32 KiB of output, so a small picture gives a known number of them.
+ * Returns the spy, whose calls are the chances asked about.
+ */
+const pauseAtEveryChance = () => vi.spyOn(EventLoopTurns.prototype, "due").mockReturnValue(true);
+
+/**
+ * A clock that moves 20 ms at every read: longer than a timer turn waits for its timer (16 ms), so
+ * every pause posts exactly one message, on any machine, and the count of messages is the count of pauses.
+ */
+function steppingClock() {
+  let now = 0;
+  return vi.spyOn(performance, "now").mockImplementation(() => (now += 20));
+}
+
+/**
+ * Aborts `controller` during the pause that posts message number `at`, once that pause is waiting.
+ * Unless `deliver`, that message never comes, as in a hidden window: only the abort can settle it.
+ * Returns the spy, whose instances are the ports that posted.
+ */
+function abortDuringPause(controller: AbortController, reason: Error, at: number, deliver = true) {
+  const post = MessagePort.prototype.postMessage;
+  let posted = 0;
+  return vi.spyOn(MessagePort.prototype, "postMessage").mockImplementation(function (this: MessagePort, message: unknown) {
+    if (++posted === at) {
+      queueMicrotask(() => controller.abort(reason));
+      if (!deliver) return;
+    }
+    post.call(this, message);
+  });
+}
+
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
 });
 
 describe("the dropped PNGs from the hands-on pass", () => {
@@ -185,26 +219,35 @@ describe("pngImageDataError refuses damaged image data", () => {
   });
 
   it("stops inflating far too much image data rather than reading it all", async () => {
-    // 2 GiB of zeros behind a 10 × 10 picture: inflating it all would take seconds.
-    const png = zeroPng(10, 10, 2 * 1024 * 1024 * 1024);
-    const started = performance.now();
-    expect(await pngImageDataError(png)).toBe(DAMAGED_PNG_IMAGE_DATA);
-    expect(performance.now() - started).toBeLessThan(1000);
+    // 64 MiB of zeros behind a 10 × 10 picture. Counted in chances to pause (one per 32 KiB of
+    // output), not in time: reading it all would be 2048 of them; the check stops within 64 KiB of the picture.
+    const chances = pauseAtEveryChance();
+    expect(await pngImageDataError(zeroPng(10, 10, 64 * 1024 * 1024))).toBe(DAMAGED_PNG_IMAGE_DATA);
+    expect(chances.mock.calls.length).toBeLessThanOrEqual(3);
     expect(await pngImageDataError(zeroPng(10, 10, PNG_SURPLUS_IMAGE_DATA_BYTES))).toBeUndefined();
   });
 });
 
 describe("pngImageDataError keeps the window responsive and honours the file's deadline", () => {
   it("lets a timer run during a large check, and makes a small one wait for none", async () => {
-    const large = zeroPng(3000, 3000);
+    // Large enough to pause: 16 chances, every one taken, the first a timer turn. The clock stands
+    // still, so that turn waits until a timer has run rather than giving up after 16 ms of a busy machine.
+    const chances = pauseAtEveryChance();
+    const clock = vi.spyOn(performance, "now").mockReturnValue(0);
     let fired = false;
     setTimeout(() => { fired = true; }, 0);
-    expect(await pngImageDataError(large)).toBeUndefined();
+    expect(await pngImageDataError(zeroPng(512, 256))).toBeUndefined();
+    expect(chances.mock.calls.length).toBeGreaterThanOrEqual(16);
     expect(fired).toBe(true);
+    // 16 KiB of output and one 16 KiB chunk: no chance to pause at all, so no turn however slow the machine.
+    chances.mockClear();
+    clock.mockRestore();
     const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
+    const posts = vi.spyOn(MessagePort.prototype, "postMessage");
     expect(await pngImageDataError(testPng({ width: 64, height: 64, colourType: 6 }))).toBeUndefined();
+    expect(chances).not.toHaveBeenCalled();
     expect(setTimeoutSpy).not.toHaveBeenCalled();
-    setTimeoutSpy.mockRestore();
+    expect(posts).not.toHaveBeenCalled();
   });
 
   it("rejects with the abort reason when the deadline passes mid-check", async () => {
@@ -223,25 +266,25 @@ describe("pngImageDataError keeps the window responsive and honours the file's d
     await expect(prepareDroppedImage("late.png", testPng({ width: 4, height: 4 }), decoders, { signal: controller.signal })).rejects.toBe(reason);
   });
 
-  it("is not slowed by a hidden window's throttled timers: each setTimeout one second late", async () => {
+  it("is not held up by a hidden window's throttled timers: none fires while the check runs", async () => {
+    pauseAtEveryChance();
     const realSetTimeout = globalThis.setTimeout;
-    const throttled = vi.fn((callback: () => void, ms?: number) => realSetTimeout(callback, Math.max(ms ?? 0, 1000)));
+    // So late that none fires before the check ends: a timer turn that waited for its timer would never end.
+    const throttled = vi.fn((callback: () => void, ms?: number) => realSetTimeout(callback, Math.max(ms ?? 0, 60_000)));
     vi.stubGlobal("setTimeout", throttled);
-    const started = performance.now();
-    expect(await pngImageDataError(zeroPng(8000, 8000))).toBeUndefined();
-    const elapsed = performance.now() - started;
+    expect(await pngImageDataError(zeroPng(512, 256))).toBeUndefined();
     vi.unstubAllGlobals();
-    // A setTimeout(0) per ~12 ms turn would take minutes; timer turns give up after 16 ms.
-    expect(elapsed).toBeLessThan(15_000);
-    expect(throttled).toHaveBeenCalled();
+    // Timer turns did run (the first pause is one); each gave up after 16 ms.
+    expect(throttled.mock.calls.filter(call => call[1] === 0).length).toBeGreaterThanOrEqual(1);
   });
 
   it("falls back to setTimeout(0) turns where there is no MessageChannel", async () => {
     vi.stubGlobal("MessageChannel", undefined);
+    const chances = pauseAtEveryChance();
     const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
-    expect(await pngImageDataError(zeroPng(3000, 3000))).toBeUndefined();
-    expect(setTimeoutSpy.mock.calls.filter(call => call[1] === 0).length).toBeGreaterThan(1);
-    setTimeoutSpy.mockRestore();
+    expect(await pngImageDataError(zeroPng(512, 256))).toBeUndefined();
+    expect(chances.mock.calls.length).toBeGreaterThanOrEqual(16);
+    expect(setTimeoutSpy.mock.calls.filter(call => call[1] === 0).length).toBeGreaterThanOrEqual(chances.mock.calls.length);
   });
 
   it("lets the real deadline timer fire during a long check, with the deadline's wording", async () => {
@@ -258,34 +301,39 @@ describe("pngImageDataError keeps the window responsive and honours the file's d
     const reason = new Error("reading it took longer than 30 seconds.");
     const turns = new EventLoopTurns(controller.signal);
     await turns.pause();
+    // From here the messages never come, as in a hidden window: only the abort can settle the pause.
+    const posts = vi.spyOn(MessagePort.prototype, "postMessage").mockImplementation(() => undefined);
     const paused = turns.pause();
     controller.abort(reason);
     await expect(paused).rejects.toBe(reason);
+    expect(posts).toHaveBeenCalledTimes(1);
     await expect(turns.pause()).rejects.toBe(reason);
     turns.close();
     expect(closeSpy).toHaveBeenCalledTimes(2);
-    closeSpy.mockRestore();
   });
 
   it("closes its channel at the end of every check: passed, refused, aborted", async () => {
+    pauseAtEveryChance();
     const closeSpy = vi.spyOn(MessagePort.prototype, "close");
-    const large = zeroPng(3000, 3000);
+    const large = zeroPng(512, 256);
     expect(await pngImageDataError(large)).toBeUndefined();
     expect(closeSpy).toHaveBeenCalledTimes(2);
-    const damaged = zeroPng(3000, 3000, 0, swapLastAdler);
+    const damaged = zeroPng(512, 256, 0, swapLastAdler);
     expect(await pngImageDataError(damaged)).toBe(DAMAGED_PNG_IMAGE_DATA);
     expect(closeSpy).toHaveBeenCalledTimes(4);
     const controller = new AbortController();
     const reason = new Error("reading it took longer than 30 seconds.");
-    setTimeout(() => controller.abort(reason), 5);
+    abortDuringPause(controller, reason, 3, false);
     await expect(pngImageDataError(large, { signal: controller.signal })).rejects.toBe(reason);
     expect(closeSpy).toHaveBeenCalledTimes(6);
-    closeSpy.mockRestore();
   });
 
   it("runs several checks at once, each on its own channel", async () => {
-    const results = await Promise.all([zeroPng(2000, 2000), zeroPng(1500, 2500), zeroPng(2000, 1000, 0, swapLastAdler)].map(png => pngImageDataError(png)));
+    pauseAtEveryChance();
+    const posts = vi.spyOn(MessagePort.prototype, "postMessage");
+    const results = await Promise.all([zeroPng(512, 256), zeroPng(256, 512), zeroPng(512, 128, 0, swapLastAdler)].map(png => pngImageDataError(png)));
     expect(results).toEqual([undefined, undefined, DAMAGED_PNG_IMAGE_DATA]);
+    expect(new Set(posts.mock.instances).size).toBe(3);
   });
 
   it("reports an abort as the deadline wherever it lands, never as damage", async () => {
@@ -295,24 +343,45 @@ describe("pngImageDataError keeps the window responsive and honours the file's d
     const smallCheck = pngImageDataError(testPng({ width: 64, height: 64, colourType: 6 }), { signal: small.signal });
     small.abort(reason);
     await expect(smallCheck).rejects.toBe(reason);
-    // Mid-CRC (64 MiB of IDAT, its IEND CRC bad) and mid-inflate (a bad Adler-32 at the end): the
-    // abort lands during the first, third or tenth turn, and the reason is the deadline's every time.
-    const badCrc = zeroPng(2000, 2000, 0, stream => concat(stream, new Uint8Array(64 * 1024 * 1024)));
+    // Mid-CRC (4 MiB of IDAT, CRC'd in 1 MiB pieces, then a bad IEND CRC) and mid-inflate (512 KiB of
+    // output, 32 KiB at a time, then a bad Adler-32). Each check pauses at every chance, so the
+    // abort is put at every one of them in turn, counted rather than timed: whatever the machine's speed.
+    const badCrc = zeroPng(64, 64, 0, stream => concat(stream, new Uint8Array(4 * 1024 * 1024)));
     badCrc[badCrc.length - 1] ^= 1;
-    const badAdler = zeroPng(8000, 8000, 0, swapLastAdler);
-    for (const [label, png] of [["bad CRC", badCrc], ["bad Adler-32", badAdler]] as const) {
+    const badAdler = zeroPng(512, 256, 0, swapLastAdler);
+    for (const [label, png, least] of [["bad CRC", badCrc, 4], ["bad Adler-32", badAdler, 16]] as const) {
+      steppingClock();
+      const asked = pauseAtEveryChance();
+      const posted = vi.spyOn(MessagePort.prototype, "postMessage");
       expect(await pngImageDataError(png), label).toBe(DAMAGED_PNG_IMAGE_DATA);
-      for (const turn of [1, 3, 10]) {
-        const controller = new AbortController();
-        let posted = 0;
-        const post = MessagePort.prototype.postMessage;
-        const spy = vi.spyOn(MessagePort.prototype, "postMessage").mockImplementation(function (this: MessagePort, message: unknown) {
-          if (++posted === turn) controller.abort(reason);
-          post.call(this, message);
+      const chances = asked.mock.calls.length;
+      expect(chances, `${label}: chances to pause`).toBeGreaterThanOrEqual(least);
+      expect(posted, `${label}: a pause at each`).toHaveBeenCalledTimes(chances);
+      vi.restoreAllMocks();
+      for (let at = 1; at <= chances; at += 1) {
+        // Between turns: the deadline passes as chance `at` is asked about, and no turn is due then.
+        // The next pause must refuse to start; after the last chance, nothing pauses again, and the
+        // finished check must still report the deadline rather than the damage it found.
+        steppingClock();
+        const between = new AbortController();
+        let asks = 0;
+        vi.spyOn(EventLoopTurns.prototype, "due").mockImplementation(() => {
+          if (++asks !== at) return true;
+          between.abort(reason);
+          return false;
         });
-        await expect(pngImageDataError(png, { signal: controller.signal }), `${label}, abort at turn ${turn}`).rejects.toBe(reason);
-        expect(posted, `${label}: turn ${turn} reached`).toBe(turn);
-        spy.mockRestore();
+        const betweenPosts = vi.spyOn(MessagePort.prototype, "postMessage");
+        await expect(pngImageDataError(png, { signal: between.signal }), `${label}, abort at chance ${at}`).rejects.toBe(reason);
+        expect(betweenPosts, `${label}, abort at chance ${at}: no pause after it`).toHaveBeenCalledTimes(at - 1);
+        vi.restoreAllMocks();
+        // During pause `at`, whose message never comes: the abort alone must settle it.
+        steppingClock();
+        pauseAtEveryChance();
+        const during = new AbortController();
+        const duringPosts = abortDuringPause(during, reason, at, false);
+        await expect(pngImageDataError(png, { signal: during.signal }), `${label}, abort in pause ${at}`).rejects.toBe(reason);
+        expect(duringPosts, `${label}, abort in pause ${at}: none after it`).toHaveBeenCalledTimes(at);
+        vi.restoreAllMocks();
       }
     }
   });

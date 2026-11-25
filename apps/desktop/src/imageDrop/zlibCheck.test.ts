@@ -5,6 +5,12 @@ import {
   BitWriter, adler32, adlerBytes, fixedLiteral, fixedMatch, writeDynamicHeader, zlibOfZeros, ZLIB_HEADER, type DynamicHeader
 } from "./zlibTestStreams";
 
+/**
+ * For the tests that inflate megabytes or run thousands of cases: pure work that scales with the
+ * machine's speed (about a second each here, idle), so a busy or slow runner gets room rather than vitest's 5 s.
+ */
+const HEAVY_TIMEOUT_MS = 30_000;
+
 /** A seeded generator, so a failure names a case that can be run again. */
 function random(seed: number): () => number {
   let state = seed >>> 0;
@@ -92,7 +98,7 @@ describe("checkZlibStream agrees with node's zlib on valid streams", () => {
         await expectSameAsNode(`${name} level ${level}`, deflateSync(data, { level }));
       }
     }
-  });
+  }, HEAVY_TIMEOUT_MS);
 
   it("inflates every strategy and window size", async () => {
     const strategies: Array<[string, ZlibOptions]> = [
@@ -107,7 +113,7 @@ describe("checkZlibStream agrees with node's zlib on valid streams", () => {
         await expectSameAsNode(`${name} window ${windowBits}`, deflateSync(data, { windowBits, level: 9 }));
       }
     }
-  });
+  }, HEAVY_TIMEOUT_MS);
 
   it("gives the same result wherever the input is split", async () => {
     const small = deflateSync(new TextEncoder().encode("abracadabra, abracadabra! ".repeat(20)), { level: 9 });
@@ -369,7 +375,7 @@ describe("checkZlibStream under hostile input", () => {
         expect(result.ok, label).toBe(false);
       }
     }
-  });
+  }, HEAVY_TIMEOUT_MS);
 
   it("stops a bomb at the cap, with fixed memory", async () => {
     const bomb = zlibOfZeros(200 * 1024 * 1024);
@@ -391,7 +397,7 @@ describe("checkZlibStream under hostile input", () => {
     });
     expect(big).toMatchObject({ ok: true, outputBytes: 64 * 1024 * 1024 });
     expect(most).toBeLessThan(4 * 1024 * 1024);
-  });
+  }, HEAVY_TIMEOUT_MS);
 
   it("stops when the caller refuses a block", async () => {
     const stream = deflateSync(new Uint8Array(100_000));
