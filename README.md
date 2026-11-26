@@ -59,11 +59,16 @@ To install the Linux beta:
    some releases have them, often marked Pre-release. The Download link at the top of this page
    opens the newest macOS and Windows release, which may have no Linux files.
 2. Download the `.deb` or the AppImage, and `SHA256SUMS-linux.txt`. To check the download, run
-   `sha256sum --ignore-missing -c SHA256SUMS-linux.txt` in the same folder.
+   `sha256sum --ignore-missing -c SHA256SUMS-linux.txt` in the same folder, and make sure the
+   `OK` line names the file you are about to install. If your browser renamed the download (for
+   example `ChemDraft_1.2.2_amd64(1).deb`), the check skips it; give it its original name first.
 3. Install it. Use the name of the file you downloaded; the examples are for 1.2.2.
    - `.deb`: `sudo apt install ./ChemDraft_1.2.2_amd64.deb`, then start ChemDraft from your app
      menu or with `chemdraft`. To remove it: `sudo apt remove chem-draft`.
    - AppImage: `chmod +x ChemDraft_1.2.2_amd64.AppImage`, then `./ChemDraft_1.2.2_amd64.AppImage`.
+     If it stops with "Cannot mount AppImage, please check your FUSE setup", run
+     `./ChemDraft_1.2.2_amd64.AppImage --appimage-extract-and-run` instead, or install your
+     distribution's FUSE 2 package (`libfuse2t64` on Ubuntu 24.04, `libfuse2` on Ubuntu 22.04).
 
 If something goes wrong, [open an issue](https://github.com/jgassens/ChemDraft/issues). Say which
 distribution and desktop you use (for example Ubuntu 24.04 with GNOME), whether it runs on X11 or
