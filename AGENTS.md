@@ -50,6 +50,13 @@ Every code change must work on all three. A change that works on only one build 
   See `docs/releasing/`. The Windows installer is
   built only by `.github/workflows/windows-release.yml` on a GitHub-hosted runner (owner rule,
   2026-10-22), never on a local machine or VM; the Windows session tests the installer CI built.
+- **Linux is not part of the joint release (owner rule, 2026-11-25).** The Linux `.deb` and AppImage
+  are a beta that ships only when the owner says so, on its own schedule. A macOS or Windows release
+  never waits for Linux, never includes it by default, and is never held or changed to suit it. No
+  session starts, schedules or holds a Linux release on its own initiative. Linux has no assigned
+  maintainer; the owner would like someone to take it on. Code changes still keep Linux building and
+  CI's Linux checks green. Attach Linux packages to a release draft only when the owner asks: the
+  release tools include whatever Linux files are attached. See `docs/releasing/linux.md`.
 
 ## 2. Orientation
 
