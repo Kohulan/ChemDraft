@@ -55,7 +55,8 @@ Every code change must work on all three. A change that works on only one build 
   never waits for Linux, never includes it by default, and is never held or changed to suit it. No
   session starts, schedules or holds a Linux release on its own initiative. Linux has no assigned
   maintainer; the owner would like someone to take it on. Code changes still keep Linux building and
-  CI's Linux checks green. See `docs/releasing/linux.md`.
+  CI's Linux checks green. Attach Linux packages to a release draft only when the owner asks: the
+  release tools include whatever Linux files are attached. See `docs/releasing/linux.md`.
 
 ## 2. Orientation
 

@@ -3,7 +3,10 @@
 Linux is an optional, community-tested beta indefinitely. It is released only when the owner
 decides to, on its own schedule, and is not tied to the macOS and Windows releases (owner rule,
 2026-11-25): those never wait on Linux and never include it by default. Linux has no assigned
-maintainer; a contributor who wants to take it on is welcome. When Linux packages are included, both packages
+maintainer; a contributor who wants to take it on is welcome. Run the workflow below with
+`upload_to_release` only when the owner has asked for Linux on that release: the release tools
+validate any Linux files attached to the draft, and add the `## Linux` section whenever a
+verified `.deb` is there, so attaching them is what includes Linux. When Linux packages are included, both packages
 and their `.build.json` records must be attached. The release checker validates their names,
 version, hashes, sizes and commit against the same release tag as the macOS DMGs and Windows
 installer. The GitHub-hosted Ubuntu 22.04 runner builds both packages in `linux-release.yml`.
